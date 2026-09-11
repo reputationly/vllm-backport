@@ -88,6 +88,18 @@ RUN set -eux; \
     apt-get update -y; \
     rm -rf /var/lib/apt/lists/*
 
+# pypi.org 在隔离网内不通,而 docker/Dockerfile 的 vllm-runtime-base 阶段有
+# 裸的 `RUN python3 -m pip install uv` —— 那一步没有 PIP_INDEX_URL 这个 ARG
+# 可传(该 ARG 只在 vllm-base 等阶段声明),裸 pip 会去 pypi.org 然后报
+# "No matching distribution found for uv"。
+#
+# 所以把索引写成基座的 ENV:pip 和 uv 都读各自的 *_INDEX_URL 环境变量,
+# 而 Docker 里同名时 ENV 优先于 ARG,所以这对显式传参的阶段也是安全的。
+# 副作用:索引地址会留在最终镜像里 —— 对隔离网内的机器反而是想要的
+# (容器里 pip 直接可用),但这意味着该镜像不适合发到公网。
+ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+ENV UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+
 # get-pip.py 的替身。
 #
 # Dockerfile 的 vllm-runtime-base 阶段固定执行
