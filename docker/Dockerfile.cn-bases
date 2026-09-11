@@ -100,6 +100,17 @@ RUN set -eux; \
 ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 ENV UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 
+# wheelhouse 在这里也要放一份:docker/Dockerfile 除了在 base 阶段
+# (FROM BUILD_BASE_IMAGE)装依赖,还会在运行时侧的 vllm-base 阶段
+# (FROM FINAL_BASE_IMAGE)再把 requirements/cuda.txt 装进系统 Python。
+# 那一步同样会去 GitHub 取 flashinfer,只在 builder-cn 里放不够。
+#
+# 代价:最终镜像会多带这些 wheel(约 1.5GB)。因为 flashinfer-cubin
+# 本身安装后也是这个量级,等于重复一份。想省掉的话可以改成让
+# UV_FIND_LINKS 指向宿主机上的 HTTP 服务,但那会让构建依赖一个常驻进程。
+COPY docker/cn/wheelhouse/ /opt/wheelhouse/
+ENV UV_FIND_LINKS=/opt/wheelhouse
+
 # get-pip.py 的替身。
 #
 # Dockerfile 的 vllm-runtime-base 阶段固定执行
