@@ -72,3 +72,30 @@ RUN set -eux; \
         /etc/apt/sources.list.d/ubuntu.sources; \
     apt-get update -y; \
     rm -rf /var/lib/apt/lists/*
+
+# get-pip.py 的替身。
+#
+# Dockerfile 的 vllm-runtime-base 阶段固定执行
+#   curl -sS ${GET_PIP_URL} | python3.12
+# 而:
+#   - bootstrap.pypa.io 在隔离网内不通;
+#   - 唯一能拉到的 mirrors.aliyun.com/pypi/get-pip.py 是旧版,内嵌的 pip
+#     还 import distutils,Python 3.12 已经删掉该模块,跑起来直接
+#     ModuleNotFoundError: No module named 'distutils';
+#   - Ubuntu 把 ensurepip 的 _bundled wheel 剥掉了,ensurepip 这条也走不通。
+# 所以放一个本地脚本,内容是"用 apt 装 python3-pip"(noble 的 python3-pip
+# 正是给 3.12 的,实测装出 pip 24.0 / python 3.12)。配合
+#   GET_PIP_URL=file:///opt/get-pip-cn.py
+# 使用 —— curl 支持 file://,那一步的语义(执行完 python3 -m pip 可用)
+# 保持不变。之后 Dockerfile 自己还会从阿里云 PyPI 源把 pip 升级上去。
+RUN set -eux; \
+    printf '%s\n' \
+      'import subprocess' \
+      'subprocess.check_call(' \
+      '    "apt-get update -y && apt-get install -y --no-install-recommends python3-pip",' \
+      '    shell=True,' \
+      ')' \
+      > /opt/get-pip-cn.py; \
+    # 这一层里还没有 python3(nvidia/cuda 基座不带),所以只做存在性检查,
+    # 语法在真正被执行的那一步才生效。
+    test -s /opt/get-pip-cn.py
