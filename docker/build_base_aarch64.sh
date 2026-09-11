@@ -43,6 +43,16 @@ INSTALL_LMCACHE="${INSTALL_LMCACHE:-true}"
 #   本来就是上游在构建的组合,不是我们在开荒。
 BUILD_BASE_IMAGE="${BUILD_BASE_IMAGE:-pytorch/manylinuxaarch64-builder:cuda13.0-b8b5f17a7d9ccfc25bbc5cf17b3fcea12964a042}"
 
+# 隔离网(gpu4x / mgr 都不通 Docker Hub 和 pypi.org)需要把这三样换掉。
+# 实测可达:mirrors.aliyun.com/pypi、download.pytorch.org、ACR(匿名可拉)。
+# 用 mirror-build-base-to-acr.yml 把两个基座搬进 ACR 后:
+#   BUILD_BASE_IMAGE=<ACR>/reputationly/manylinuxaarch64-builder:cuda13.0-b8b5f17a \
+#   FINAL_BASE_IMAGE=<ACR>/reputationly/nvidia-cuda:13.0.3-base-ubuntu24.04 \
+#   PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ ./docker/build_base_aarch64.sh
+# FINAL_BASE_IMAGE 留空则用 Dockerfile 的默认 nvidia/cuda:${CUDA_VERSION}-base-...
+FINAL_BASE_IMAGE="${FINAL_BASE_IMAGE:-}"
+PIP_INDEX_URL="${PIP_INDEX_URL:-}"
+
 # 上游 arm64 CI 用 max_jobs=16 / nvcc_threads=4;fork 自己的 docker-publish.yml
 # 用 nvcc_threads=1 配按内存算出的 max_jobs。默认跟 fork,内存富裕可调到 2~4。
 NVCC_THREADS="${NVCC_THREADS:-1}"
@@ -85,9 +95,13 @@ echo "  tags      : ${VERSION_TAG} / ${FLOATING_TAG}"
 echo
 
 # 早失败优于编到一半才发现基座不对。
-if ! docker manifest inspect "${BUILD_BASE_IMAGE}" 2>/dev/null | grep -q '"architecture": *"arm64"'; then
-  echo "ERROR: ${BUILD_BASE_IMAGE} 没有 arm64 变体。" >&2
+# 用 imagetools 而不是 `docker manifest inspect`:后者对单架构镜像返回的
+# manifest 里根本没有 architecture 字段(那在 config 里),而经
+# `crane --platform` 搬进 ACR 的镜像正是被拍平成单架构的,会误判。
+if ! docker buildx imagetools inspect "${BUILD_BASE_IMAGE}" 2>/dev/null | grep -qi "arm64"; then
+  echo "ERROR: ${BUILD_BASE_IMAGE} 看不到 arm64(或镜像不可达)。" >&2
   echo "       别用 docker/Dockerfile 的默认 BUILD_BASE_IMAGE(manylinux2_28-builder 是 amd64 单架构)。" >&2
+  echo "       隔离网下先跑 mirror-build-base-to-acr.yml 把基座搬进 ACR。" >&2
   exit 1
 fi
 
@@ -113,11 +127,21 @@ fi
 # provenance/sbom 关掉:阿里云 ACR 个人版不认 buildx 的证明清单
 # (空描述符 application/vnd.oci.empty.v1+json),推送报
 # "denied: unknown manifest class"。踩过,见 LightX2V 的 build-arm64-docker.yml。
+EXTRA_ARGS=()
+[ -n "${FINAL_BASE_IMAGE}" ] && EXTRA_ARGS+=(--build-arg "FINAL_BASE_IMAGE=${FINAL_BASE_IMAGE}")
+if [ -n "${PIP_INDEX_URL}" ]; then
+  # Dockerfile 里 UV_INDEX_URL 默认取 PIP_INDEX_URL,但那是 ARG 默认值,
+  # 显式传了 PIP_INDEX_URL 时两个都给,免得某一层走到 uv 又回落到 pypi.org。
+  EXTRA_ARGS+=(--build-arg "PIP_INDEX_URL=${PIP_INDEX_URL}"
+               --build-arg "UV_INDEX_URL=${PIP_INDEX_URL}")
+fi
+
 docker buildx build \
   --file docker/Dockerfile \
   --target vllm-openai \
   --provenance=false \
   --sbom=false \
+  "${EXTRA_ARGS[@]}" \
   --build-arg "BUILD_BASE_IMAGE=${BUILD_BASE_IMAGE}" \
   --build-arg "torch_cuda_arch_list=${TORCH_CUDA_ARCH_LIST}" \
   --build-arg "max_jobs=${MAX_JOBS}" \
