@@ -59,6 +59,21 @@ RUN set -eux; \
     dnf makecache; \
     dnf -y install --setopt=install_weak_deps=False ccache && dnf clean all
 
+# wheelhouse:兜住"镜像源里没有、只在 GitHub Releases 上"的 wheel。
+#
+# requirements/cuda.txt 里的 --extra-index-url https://flashinfer.ai/whl/
+# 指向的其实是 GitHub Release 资产,例如
+#   flashinfer_cubin-0.6.18.post1-py3-none-any.whl  (1.5 GB)
+# 而 github.com 的 https 在隔离网内不通,阿里云 PyPI 镜像又只同步到
+# flashinfer-cubin 0.6.13(缺这个 pin)。所以换镜像源解决不了,
+# 只能由有外网的机器下载后放进 docker/cn/wheelhouse/,在这里烘进基座。
+#
+# uv 的 --find-links 支持 UV_FIND_LINKS 环境变量(已在镜像里 uv 上确认),
+# 而 docker/Dockerfile 的 base 阶段就是 FROM 本镜像,所以 ENV 会被继承 ——
+# 不需要改 vllm 的 Dockerfile,也不需要在构建期起 HTTP 服务。
+COPY docker/cn/wheelhouse/ /opt/wheelhouse/
+ENV UV_FIND_LINKS=/opt/wheelhouse
+
 # ---------------------------------------------------------------------------
 # FINAL_BASE_IMAGE:Ubuntu noble 的 apt 源换成阿里云 ubuntu-ports
 # ---------------------------------------------------------------------------
