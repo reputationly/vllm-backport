@@ -73,6 +73,15 @@ RUN set -eux; \
 # 不需要改 vllm 的 Dockerfile,也不需要在构建期起 HTTP 服务。
 COPY docker/cn/wheelhouse/ /opt/wheelhouse/
 ENV UV_FIND_LINKS=/opt/wheelhouse
+# uv 的分发缓存锁超时默认 300s。docker/Dockerfile 里 base 阶段与运行时侧的
+# vllm-base 阶段会**并行**执行,而两者共享同一个
+# `--mount=type=cache,target=/opt/uv/cache`,于是一边下大包持锁、另一边 300s
+# 等不到就报 "Failed to acquire lock on the distribution cache"。
+# 在慢网络下这几乎必然发生,所以把超时抬高。
+# (另一个更彻底的办法是分两趟构建,先 --target base,见
+#  docker/build_base_aarch64.sh 的 BUILD_TARGET。)
+ENV UV_LOCK_TIMEOUT=1800
+
 
 # ---------------------------------------------------------------------------
 # FINAL_BASE_IMAGE:Ubuntu noble 的 apt 源换成阿里云 ubuntu-ports
@@ -110,6 +119,15 @@ ENV UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 # UV_FIND_LINKS 指向宿主机上的 HTTP 服务,但那会让构建依赖一个常驻进程。
 COPY docker/cn/wheelhouse/ /opt/wheelhouse/
 ENV UV_FIND_LINKS=/opt/wheelhouse
+# uv 的分发缓存锁超时默认 300s。docker/Dockerfile 里 base 阶段与运行时侧的
+# vllm-base 阶段会**并行**执行,而两者共享同一个
+# `--mount=type=cache,target=/opt/uv/cache`,于是一边下大包持锁、另一边 300s
+# 等不到就报 "Failed to acquire lock on the distribution cache"。
+# 在慢网络下这几乎必然发生,所以把超时抬高。
+# (另一个更彻底的办法是分两趟构建,先 --target base,见
+#  docker/build_base_aarch64.sh 的 BUILD_TARGET。)
+ENV UV_LOCK_TIMEOUT=1800
+
 
 # get-pip.py 的替身。
 #

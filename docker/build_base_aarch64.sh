@@ -24,6 +24,17 @@ set -euo pipefail
 # 之后 `docker login` 再 `docker push` 两个 tag 即可。
 PUSH="${PUSH:-1}"
 
+# 构建目标。默认一把梭到 vllm-openai。
+#
+# 慢网络下建议分两趟:先 BUILD_TARGET=base PUSH=0(只建 builder 侧),
+# 再跑默认目标。原因:docker/Dockerfile 的 base 阶段与运行时侧的 vllm-base
+# 阶段会并行装依赖,而两者共享同一个
+# `--mount=type=cache,target=/opt/uv/cache`,一边下大包持锁、另一边等锁
+# 超时就报 "Failed to acquire lock on the distribution cache"。
+# 分两趟让第一趟独占缓存并落层缓存,第二趟就不会撞。
+# (cn-bases 里也设了 ENV UV_LOCK_TIMEOUT=1800 作为兜底。)
+BUILD_TARGET="${BUILD_TARGET:-vllm-openai}"
+
 ACR_REGISTRY="${ACR_REGISTRY:-crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com}"
 ACR_REPO="${ACR_REPO:-${ACR_REGISTRY}/reputationly/vllm-backport}"
 
@@ -99,6 +110,7 @@ echo "  build base: ${BUILD_BASE_IMAGE}"
 echo "  arch list : ${TORCH_CUDA_ARCH_LIST}  (tag slug ${ARCH_SLUG})"
 echo "  max_jobs  : ${MAX_JOBS}  (cores ${CORES}, mem ${MEM_GB}GB), nvcc_threads ${NVCC_THREADS}"
 echo "  commit    : $(git rev-parse HEAD)"
+echo "  target    : ${BUILD_TARGET}"
 echo "  tags      : ${VERSION_TAG} / ${FLOATING_TAG}"
 echo
 
@@ -157,7 +169,7 @@ fi
 
 docker buildx build \
   --file docker/Dockerfile \
-  --target vllm-openai \
+  --target "${BUILD_TARGET}" \
   --provenance=false \
   --sbom=false \
   "${EXTRA_ARGS[@]}" \
