@@ -1,0 +1,105 @@
+name: Mirror an upstream image to ACR
+
+# 把 Docker Hub 上的镜像搬进阿里云 ACR,给隔离网的 GPU 节点用。
+#
+# 为什么需要:gpu4x 与 mgr 都不通 Docker Hub / github.com(https),
+# 实测只有这些通:
+#   mirrors.aliyun.com/pypi        200
+#   download.pytorch.org/whl       200
+#   ACR / 华为 SWR                 401(标准 auth challenge,匿名拉取可用)
+#   github.com:22                  TCP 可达(git over ssh 可用)
+#   registry-1.docker.io           不通
+#   pypi.org / github.com https    不通
+# 而 docker/Dockerfile 的两个基座都在 Docker Hub 上,所以只能借
+# GitHub runner(有外网 + 有 ACR secrets)中转。照 gpustack 的
+# sync-image-to-acr.yml 的路子,但换成 crane:crane 逐 blob 流式转发,
+# 不像 skopeo 那样可能把整个镜像暂存到 runner 的 ~14GB 磁盘上
+# (manylinuxaarch64-builder 单个就 7GB+)。
+#
+# vllm-backport 需要搬的两个(分别跑一次):
+#
+#   source   = pytorch/manylinuxaarch64-builder:cuda13.0-b8b5f17a7d9ccfc25bbc5cf17b3fcea12964a042
+#   dest     = manylinuxaarch64-builder
+#   dest_tag = cuda13.0-b8b5f17a
+#   platform = linux/arm64
+#     -> 对应 docker/Dockerfile 的 BUILD_BASE_IMAGE
+#        (默认值 manylinux2_28-builder 是 amd64 单架构,arm64 上不能用)
+#
+#   source   = nvidia/cuda:13.0.3-base-ubuntu24.04
+#   dest     = nvidia-cuda
+#   dest_tag = 13.0.3-base-ubuntu24.04
+#   platform = linux/arm64
+#     -> 对应 docker/Dockerfile 的 FINAL_BASE_IMAGE
+#
+# 搬完在节点上这样用(ACR 匿名可拉,节点无需 docker login):
+#   BUILD_BASE_IMAGE=<ACR>/reputationly/manylinuxaarch64-builder:cuda13.0-b8b5f17a \
+#   FINAL_BASE_IMAGE=<ACR>/reputationly/nvidia-cuda:13.0.3-base-ubuntu24.04 \
+#   PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
+#   ./docker/build_base_aarch64.sh
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: '源镜像(含 tag),如 pytorch/manylinuxaarch64-builder:cuda13.0-b8b5f17a7d9ccfc25bbc5cf17b3fcea12964a042'
+        required: true
+      dest:
+        description: 'ACR 下的仓名(reputationly/ 之后的那段),如 manylinuxaarch64-builder'
+        required: true
+      dest_tag:
+        description: 'ACR 目标 tag,如 cuda13.0-b8b5f17a'
+        required: true
+      platform:
+        description: '只搬这一个平台(留空=整个 manifest index 全搬)。arm64 目标填 linux/arm64。'
+        default: 'linux/arm64'
+        required: false
+
+env:
+  ACR_REGISTRY: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com
+  ACR_NS: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly
+
+jobs:
+  mirror:
+    # registry 间直传,与镜像架构无关,标准 x86 runner 即可。
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Set up crane
+        uses: imjasonh/setup-crane@v0.4
+
+      - name: Login to Aliyun ACR
+        run: |
+          echo "${{ secrets.ACR_PASSWORD }}" \
+            | crane auth login "${ACR_REGISTRY}" -u "${{ secrets.ACR_USERNAME }}" --password-stdin
+
+      - name: Copy Docker Hub -> ACR
+        run: |
+          set -euo pipefail
+          DEST="${ACR_NS}/${{ github.event.inputs.dest }}:${{ github.event.inputs.dest_tag }}"
+          PLATFORM="${{ github.event.inputs.platform }}"
+          if [ -n "${PLATFORM}" ]; then
+            # 指定平台会把多架构 index 拍平成单架构镜像,正是节点要的,
+            # 也避免把 amd64 那份白搬一遍。
+            set -x
+            crane --platform "${PLATFORM}" copy "${{ github.event.inputs.source }}" "${DEST}"
+          else
+            set -x
+            crane copy "${{ github.event.inputs.source }}" "${DEST}"
+          fi
+
+      - name: Verify
+        run: |
+          set -euo pipefail
+          DEST="${ACR_NS}/${{ github.event.inputs.dest }}:${{ github.event.inputs.dest_tag }}"
+          crane manifest "${DEST}" | head -c 400; echo
+          echo "--- config platform ---"
+          crane config "${DEST}" | grep -E '"architecture"|"os"'
+          {
+            echo "### Mirrored to ACR"
+            echo ""
+            echo "- source: \`${{ github.event.inputs.source }}\`"
+            echo "- dest: \`${DEST}\`"
+            echo "- platform: \`${{ github.event.inputs.platform }}\`"
+            echo ""
+            echo "节点可匿名拉取,无需 docker login。"
+          } >> "$GITHUB_STEP_SUMMARY"
