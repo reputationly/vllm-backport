@@ -52,6 +52,14 @@ BUILD_BASE_IMAGE="${BUILD_BASE_IMAGE:-pytorch/manylinuxaarch64-builder:cuda13.0-
 # FINAL_BASE_IMAGE 留空则用 Dockerfile 的默认 nvidia/cuda:${CUDA_VERSION}-base-...
 FINAL_BASE_IMAGE="${FINAL_BASE_IMAGE:-}"
 PIP_INDEX_URL="${PIP_INDEX_URL:-}"
+# bootstrap.pypa.io 在隔离网内完全不通,而 Dockerfile 的 vllm-runtime-base
+# 阶段会 `curl -sS ${GET_PIP_URL} | python3.12`。阿里云有一份:
+#   GET_PIP_URL=https://mirrors.aliyun.com/pypi/get-pip.py   (实测 1.49MB/s)
+GET_PIP_URL="${GET_PIP_URL:-}"
+# ppa.launchpad.net 只有 8KB/s。把 DEADSNAKES_MIRROR_URL 设成非空而不设
+# DEADSNAKES_GPGKEY_URL,Dockerfile 两个分支都不会走 —— 直接跳过
+# add-apt-repository,python3.12 由 noble 的 main 仓提供(24.04 自带 3.12)。
+DEADSNAKES_MIRROR_URL="${DEADSNAKES_MIRROR_URL:-}"
 
 # 上游 arm64 CI 用 max_jobs=16 / nvcc_threads=4;fork 自己的 docker-publish.yml
 # 用 nvcc_threads=1 配按内存算出的 max_jobs。默认跟 fork,内存富裕可调到 2~4。
@@ -98,7 +106,15 @@ echo
 # 用 imagetools 而不是 `docker manifest inspect`:后者对单架构镜像返回的
 # manifest 里根本没有 architecture 字段(那在 config 里),而经
 # `crane --platform` 搬进 ACR 的镜像正是被拍平成单架构的,会误判。
-if ! docker buildx imagetools inspect "${BUILD_BASE_IMAGE}" 2>/dev/null | grep -qi "arm64"; then
+if docker image inspect "${BUILD_BASE_IMAGE}" >/dev/null 2>&1; then
+  # 本地已有(含 Dockerfile.cn-bases 派生出的 local/* 纯本地 tag)。
+  # 这种镜像不在任何 registry 上,imagetools 查不到,所以先查本地镜像库。
+  base_arch="$(docker image inspect "${BUILD_BASE_IMAGE}" --format '{{.Architecture}}')"
+  if [ "${base_arch}" != "arm64" ]; then
+    echo "ERROR: ${BUILD_BASE_IMAGE} 是 ${base_arch},不是 arm64。" >&2
+    exit 1
+  fi
+elif ! docker buildx imagetools inspect "${BUILD_BASE_IMAGE}" 2>/dev/null | grep -qi "arm64"; then
   echo "ERROR: ${BUILD_BASE_IMAGE} 看不到 arm64(或镜像不可达)。" >&2
   echo "       别用 docker/Dockerfile 的默认 BUILD_BASE_IMAGE(manylinux2_28-builder 是 amd64 单架构)。" >&2
   echo "       隔离网下先跑 mirror-build-base-to-acr.yml 把基座搬进 ACR。" >&2
@@ -129,6 +145,9 @@ fi
 # "denied: unknown manifest class"。踩过,见 LightX2V 的 build-arm64-docker.yml。
 EXTRA_ARGS=()
 [ -n "${FINAL_BASE_IMAGE}" ] && EXTRA_ARGS+=(--build-arg "FINAL_BASE_IMAGE=${FINAL_BASE_IMAGE}")
+[ -n "${GET_PIP_URL}" ] && EXTRA_ARGS+=(--build-arg "GET_PIP_URL=${GET_PIP_URL}")
+[ -n "${DEADSNAKES_MIRROR_URL}" ] \
+  && EXTRA_ARGS+=(--build-arg "DEADSNAKES_MIRROR_URL=${DEADSNAKES_MIRROR_URL}")
 if [ -n "${PIP_INDEX_URL}" ]; then
   # Dockerfile 里 UV_INDEX_URL 默认取 PIP_INDEX_URL,但那是 ARG 默认值,
   # 显式传了 PIP_INDEX_URL 时两个都给,免得某一层走到 uv 又回落到 pypi.org。

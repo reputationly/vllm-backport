@@ -1,0 +1,74 @@
+# 把 docker/Dockerfile 的两个上游基座改造成"境内可用"版本。
+#
+# 背景:gpu4x 节点在隔离网内,实测下列域名**完全不通**,
+# 而 docker/Dockerfile 的构建过程会用到它们:
+#   repo.almalinux.org          (manylinux 基座里的 dnf 源)
+#   mirrors.fedoraproject.org   (EPEL metalink,ccache 来自 EPEL)
+#   bootstrap.pypa.io           (get-pip.py)
+# 另外这两个通但极慢:
+#   ports.ubuntu.com            58KB/s  -> mirrors.aliyun.com/ubuntu-ports 477KB/s(8x)
+#   ppa.launchpad.net           8KB/s
+#
+# 其中 GET_PIP_URL / DEADSNAKES_MIRROR_URL / PIP_INDEX_URL 都有现成的
+# build-arg 可以覆盖(见 build_base_aarch64.sh),但 dnf 源和 apt 源写在
+# 基座镜像里面,没有 build-arg 能改 —— 所以在这里派生两个薄层。
+#
+# 用法(在 aarch64 节点上,两个 target 各 build 一次):
+#   docker build -f docker/Dockerfile.cn-bases --target builder-cn \
+#     --build-arg UPSTREAM_BUILDER=<manylinuxaarch64-builder 的本地/镜像源地址> \
+#     -t local/manylinuxaarch64-builder:cuda13.0-cn .
+#   docker build -f docker/Dockerfile.cn-bases --target runtime-cn \
+#     --build-arg UPSTREAM_RUNTIME=<nvidia/cuda:13.0.3-base-ubuntu24.04 的地址> \
+#     -t local/nvidia-cuda:13.0.3-base-ubuntu24.04-cn .
+# 然后把这两个 tag 作为 BUILD_BASE_IMAGE / FINAL_BASE_IMAGE 传给
+# build_base_aarch64.sh。
+
+ARG UPSTREAM_BUILDER=pytorch/manylinuxaarch64-builder:cuda13.0-b8b5f17a7d9ccfc25bbc5cf17b3fcea12964a042
+ARG UPSTREAM_RUNTIME=nvidia/cuda:13.0.3-base-ubuntu24.04
+
+# ---------------------------------------------------------------------------
+# BUILD_BASE_IMAGE:AlmaLinux 8 的 dnf 源换成阿里云
+# ---------------------------------------------------------------------------
+FROM ${UPSTREAM_BUILDER} AS builder-cn
+
+# 全部用单引号,避免 $releasever / $basearch 被 shell 吃掉 —— 它们必须原样
+# 留在 repo 文件里由 dnf 自己展开。almalinux.repo 里本来就有一行注释掉的
+# baseurl,阿里云的目录结构与 repo.almalinux.org 一一对应,所以只换主机名。
+RUN set -eux; \
+    sed -i 's|^mirrorlist=|#mirrorlist=|' /etc/yum.repos.d/almalinux*.repo; \
+    sed -i 's|^# baseurl=https://repo.almalinux.org/almalinux/|baseurl=https://mirrors.aliyun.com/almalinux/|' \
+        /etc/yum.repos.d/almalinux*.repo; \
+    # EPEL 用的是 metalink(指向 mirrors.fedoraproject.org,不通),而它自带的
+    # #baseurl 只是占位的 download.example。仅注掉 metalink 还不够 ——
+    # [epel] 仍然 enabled=1 却没有任何可用 baseurl,dnf 会直接报
+    # "Cannot find a valid baseurl for repo: epel"。所以把自带的 epel*
+    # 全部停用,另写一个干净的 repo 文件,arch 写死 aarch64
+    # (本文件只服务 arm64 构建)。gpgcheck 保留,沿用镜像里已有的公钥。
+    sed -i -e 's|^metalink=|#metalink=|' -e 's|^enabled=1|enabled=0|' \
+        /etc/yum.repos.d/epel*.repo; \
+    printf '%s\n' \
+      '[epel-aliyun]' \
+      'name=EPEL 8 - aarch64 (aliyun mirror)' \
+      'baseurl=https://mirrors.aliyun.com/epel/8/Everything/aarch64/' \
+      'enabled=1' \
+      'gpgcheck=1' \
+      'gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-8' \
+      > /etc/yum.repos.d/epel-aliyun.repo; \
+    dnf clean all; \
+    # 立刻建缓存:换源写错了要在这里炸,而不是等主构建跑到 #10 才炸。
+    dnf makecache; \
+    dnf -y install --setopt=install_weak_deps=False ccache && dnf clean all
+
+# ---------------------------------------------------------------------------
+# FINAL_BASE_IMAGE:Ubuntu noble 的 apt 源换成阿里云 ubuntu-ports
+# ---------------------------------------------------------------------------
+FROM ${UPSTREAM_RUNTIME} AS runtime-cn
+
+# noble 用 deb822 格式的 /etc/apt/sources.list.d/ubuntu.sources,
+# 里面两段(noble/noble-updates/noble-backports 与 noble-security)
+# 的 URIs 都是 http://ports.ubuntu.com/ubuntu-ports/。
+RUN set -eux; \
+    sed -i 's|http://ports.ubuntu.com/ubuntu-ports|https://mirrors.aliyun.com/ubuntu-ports|g' \
+        /etc/apt/sources.list.d/ubuntu.sources; \
+    apt-get update -y; \
+    rm -rf /var/lib/apt/lists/*
