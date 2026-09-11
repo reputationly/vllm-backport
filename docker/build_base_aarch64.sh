@@ -15,8 +15,14 @@
 #
 # 用法:
 #   ACR_USERNAME=xxx ACR_PASSWORD=xxx ./docker/build_base_aarch64.sh
+#   PUSH=0 ./docker/build_base_aarch64.sh                          # 只构建到本地,不推送
 #   TORCH_CUDA_ARCH_LIST="8.0 8.6" ./docker/build_base_aarch64.sh   # 顺带带上 A6000
 set -euo pipefail
+
+# PUSH=0 时只把镜像留在本地 docker 镜像库,不需要任何 registry 凭据。
+# 用于先验证 aarch64 编译本身(最贵最容易失败的一步),
+# 之后 `docker login` 再 `docker push` 两个 tag 即可。
+PUSH="${PUSH:-1}"
 
 ACR_REGISTRY="${ACR_REGISTRY:-crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com}"
 ACR_REPO="${ACR_REPO:-${ACR_REGISTRY}/reputationly/vllm-backport}"
@@ -44,6 +50,15 @@ NVCC_THREADS="${NVCC_THREADS:-1}"
 if [ "$(uname -m)" != "aarch64" ]; then
   echo "ERROR: 需要在 aarch64 机器上跑(当前 $(uname -m))。" >&2
   echo "       x86 上用 --platform linux/arm64 会走 QEMU,编 CUDA 扩展会慢到不可用。" >&2
+  exit 1
+fi
+
+# vllm 的 Dockerfile 通篇用 RUN --mount=type=cache/bind,必须 BuildKit;
+# 而 Ubuntu 的 docker.io 包不带 buildx,没有它 DOCKER_BUILDKIT=1 也只会报
+# "BuildKit is enabled but the buildx component is missing or broken"。
+if ! docker buildx version >/dev/null 2>&1; then
+  echo "ERROR: 缺少 docker buildx(vllm 的 Dockerfile 需要 BuildKit)。" >&2
+  echo "       Ubuntu: apt-get install -y docker-buildx" >&2
   exit 1
 fi
 
@@ -76,9 +91,23 @@ if ! docker manifest inspect "${BUILD_BASE_IMAGE}" 2>/dev/null | grep -q '"archi
   exit 1
 fi
 
-if [ -n "${ACR_PASSWORD:-}" ]; then
-  echo "${ACR_PASSWORD}" | docker login "${ACR_REGISTRY}" \
-    -u "${ACR_USERNAME:?需要 ACR_USERNAME}" --password-stdin
+OUTPUT_ARGS=()
+if [ "${PUSH}" = "1" ]; then
+  if [ -n "${ACR_PASSWORD:-}" ]; then
+    echo "${ACR_PASSWORD}" | docker login "${ACR_REGISTRY}" \
+      -u "${ACR_USERNAME:?需要 ACR_USERNAME}" --password-stdin
+  fi
+  # buildx 的默认 `docker` driver 不能导出到 registry(--push),
+  # 所以推送走一个专用的 docker-container builder。
+  # 清理:docker buildx rm "${BUILDER_NAME}"
+  BUILDER_NAME="${BUILDER_NAME:-vllm-backport-builder}"
+  docker buildx inspect "${BUILDER_NAME}" >/dev/null 2>&1 \
+    || docker buildx create --name "${BUILDER_NAME}" --driver docker-container >/dev/null
+  OUTPUT_ARGS=(--builder "${BUILDER_NAME}" --push)
+else
+  # 默认 `docker` driver 直接把镜像建进本地镜像库,不必 --load。
+  echo "PUSH=0:只构建到本地镜像库,不推送。"
+  OUTPUT_ARGS=()
 fi
 
 # provenance/sbom 关掉:阿里云 ACR 个人版不认 buildx 的证明清单
@@ -87,7 +116,6 @@ fi
 docker buildx build \
   --file docker/Dockerfile \
   --target vllm-openai \
-  --platform linux/arm64 \
   --provenance=false \
   --sbom=false \
   --build-arg "BUILD_BASE_IMAGE=${BUILD_BASE_IMAGE}" \
@@ -100,13 +128,20 @@ docker buildx build \
   --label "io.vllm-backport.build-base-image=${BUILD_BASE_IMAGE}" \
   --tag "${ACR_REPO}:${VERSION_TAG}" \
   --tag "${ACR_REPO}:${FLOATING_TAG}" \
-  --push \
+  "${OUTPUT_ARGS[@]}" \
   .
 
 echo
 echo "=== 完成 ==="
 echo "  ${ACR_REPO}:${VERSION_TAG}"
 echo "  ${ACR_REPO}:${FLOATING_TAG}"
+if [ "${PUSH}" != "1" ]; then
+  echo
+  echo "镜像只在本地。推送:"
+  echo "  docker login ${ACR_REGISTRY}"
+  echo "  docker push ${ACR_REPO}:${VERSION_TAG}"
+  echo "  docker push ${ACR_REPO}:${FLOATING_TAG}"
+fi
 echo
 echo "下一步:"
 echo "  1) 跑 'Sync base image (ACR -> Docker Hub)' 流水线,base_tag=${FLOATING_TAG}"
