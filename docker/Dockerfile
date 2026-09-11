@@ -493,10 +493,19 @@ WORKDIR /workspace
 COPY tools/ep_kernels/install_python_libraries.sh /tmp/install_python_libraries.sh
 # Defaults moved here from tools/ep_kernels/install_python_libraries.sh for centralized version management
 ARG DEEPEP_COMMIT_HASH=d4f41e4e93
+# sm8x(A100 等)不需要 DeepEP:下面那步固定
+# `export TORCH_CUDA_ARCH_LIST='9.0a 10.0a'`,只给 Hopper/Blackwell 编,
+# 而且要 `git clone github.com/deepseek-ai/DeepEP`,在隔离网内还拿不到。
+# 置 false 可整步跳过;下游三处消费 dist/*.whl 的地方都已做空目录兜底。
+ARG INSTALL_EP_KERNELS=true
 ARG NVSHMEM_VER
 ARG NCCL_VERSION
 RUN --mount=type=cache,target=/opt/uv/cache \
     mkdir -p /tmp/ep_kernels_workspace/dist && \
+    if [ "${INSTALL_EP_KERNELS}" != "true" ]; then \
+        echo "INSTALL_EP_KERNELS=${INSTALL_EP_KERNELS}: skip DeepEP/NVSHMEM build"; \
+        exit 0; \
+    fi && \
     if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
         # The Rubin CUDA builder provides NCCL in its architecture-specific \
         # toolkit directory rather than as a Python package. Give DeepEP a \
@@ -661,8 +670,12 @@ RUN sha256sum dist/*.whl > dist/wheel.sha256
 COPY --from=extensions-build /tmp/ep_kernels_workspace/dist /tmp/ep_kernels_workspace/dist
 
 # Record the EP kernels wheel checksum for the same cache-busting purpose.
-RUN sha256sum /tmp/ep_kernels_workspace/dist/*.whl \
-    > /tmp/ep_kernels_workspace/dist/wheels.sha256
+RUN if ls /tmp/ep_kernels_workspace/dist/*.whl >/dev/null 2>&1; then \
+        sha256sum /tmp/ep_kernels_workspace/dist/*.whl \
+            > /tmp/ep_kernels_workspace/dist/wheels.sha256; \
+    else \
+        : > /tmp/ep_kernels_workspace/dist/wheels.sha256; \
+    fi
 
 # Check the size of the CUDA 13 wheel uploaded to PyPI
 COPY .buildkite/check-wheel-size.py check-wheel-size.py
@@ -1079,8 +1092,12 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 COPY --from=build /tmp/ep_kernels_workspace/dist/wheels.sha256 /tmp/ep-kernels-wheels.sha256
 RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm-workspace/ep_kernels/dist \
     --mount=type=cache,target=/opt/uv/cache \
-    uv pip install --system ep_kernels/dist/*.whl --verbose \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
+    if ls ep_kernels/dist/*.whl >/dev/null 2>&1; then \
+        uv pip install --system ep_kernels/dist/*.whl --verbose \
+            --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+    else \
+        echo "no EP kernel wheels (INSTALL_EP_KERNELS=false); skipping"; \
+    fi
 
 # CUDA image changed from /usr/local/nvidia to /usr/local/cuda in 12.8 but will
 # return to /usr/local/nvidia in 13.0 to allow container providers to mount drivers
@@ -1189,8 +1206,12 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 COPY --from=build /tmp/ep_kernels_workspace/dist/wheels.sha256 /tmp/ep-kernels-wheels.sha256
 RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm-workspace/ep_kernels/dist \
     --mount=type=cache,target=/opt/uv/cache \
-    uv pip install --system ep_kernels/dist/*.whl --verbose \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
+    if ls ep_kernels/dist/*.whl >/dev/null 2>&1; then \
+        uv pip install --system ep_kernels/dist/*.whl --verbose \
+            --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+    else \
+        echo "no EP kernel wheels (INSTALL_EP_KERNELS=false); skipping"; \
+    fi
 
 # See the matching comment in the vllm-base stage.
 ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}

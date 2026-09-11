@@ -42,6 +42,10 @@ ACR_REPO="${ACR_REPO:-${ACR_REGISTRY}/reputationly/vllm-backport}"
 # 而你们全是 A100。要兼容 A6000/4090 再加 8.6 / 8.9。
 TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0}"
 INSTALL_LMCACHE="${INSTALL_LMCACHE:-true}"
+# DeepEP 只给 Hopper/Blackwell 编(那步固定 TORCH_CUDA_ARCH_LIST='9.0a 10.0a'),
+# 对 A100 无用;而且它要 git clone github.com/deepseek-ai/DeepEP,隔离网内拿不到。
+# 所以 sm80 构建默认关掉。开关与兜底见 docker/Dockerfile 的 INSTALL_EP_KERNELS。
+INSTALL_EP_KERNELS="${INSTALL_EP_KERNELS:-false}"
 
 # ⚠ 必须显式换构建基座。docker/Dockerfile:44 的默认值
 #   pytorch/manylinux2_28-builder:cuda13.0-78e737ad... 经 Docker Hub API 核实
@@ -178,6 +182,7 @@ docker buildx build \
   --build-arg "max_jobs=${MAX_JOBS}" \
   --build-arg "nvcc_threads=${NVCC_THREADS}" \
   --build-arg "INSTALL_LMCACHE=${INSTALL_LMCACHE}" \
+  --build-arg "INSTALL_EP_KERNELS=${INSTALL_EP_KERNELS}" \
   --label "io.vllm-backport.base-commit=$(git rev-parse HEAD)" \
   --label "io.vllm-backport.torch-cuda-arch-list=${TORCH_CUDA_ARCH_LIST}" \
   --label "io.vllm-backport.build-base-image=${BUILD_BASE_IMAGE}" \
