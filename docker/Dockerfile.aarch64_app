@@ -1,0 +1,48 @@
+# vllm-backport ARM64 App 层 — 只替换 Python/Triton 代码,不重编 CUDA 扩展
+#
+# 为什么要分层:本 fork 的 sm80 适配绝大部分是 Python + Triton
+# (vllm/v1/attention/ops/fp8_sm80.py、mqa_logits_triton.py、
+#  vllm/models/deepseek_v4/ampere/ 等),改这些不需要动 nvcc。
+# 全量编译(docker/build_base_aarch64.sh)是小时级,app 层是分钟级。
+#
+# ⚠ 什么时候必须重建 base 而不是只跑 app 层:
+#   csrc/ | CMakeLists.txt | cmake/ | setup.py | requirements/ 有改动时。
+#   本 fork 确实改了 csrc(custom_all_reduce.cuh / libtorch_stable/*),
+#   所以不能用 VLLM_USE_PRECOMPILED,base 必须自己编。
+#   build-arm64-app.yml 里的 "Guard" 步骤会在这些路径变化时直接失败。
+#
+# 用法:
+#   docker build -f docker/Dockerfile.aarch64_app \
+#     --build-arg BASE_IMAGE=arronlee/vllm-backport:arm64-sm80-base \
+#     -t vllm-backport:app .
+
+ARG BASE_IMAGE=arronlee/vllm-backport:arm64-sm80-base
+FROM ${BASE_IMAGE}
+
+# base 里 vllm 是 `uv pip install --system dist/*.whl` 装的(不在 /opt/venv),
+# 具体 site-packages 路径随 PYTHON_VERSION / deadsnakes 布局变化,
+# 所以构建时解析,不写死。
+COPY vllm/ /tmp/vllm-src/
+
+RUN set -eux; \
+    # 宿主机若在仓库里 in-place 编译过,vllm/ 下会残留 .so;
+    # 那些是给宿主 arch 编的,绝不能覆盖 base 里正确的产物。
+    find /tmp/vllm-src -name '*.so' -delete; \
+    find /tmp/vllm-src -name '__pycache__' -type d -prune -exec rm -rf {} +; \
+    VLLM_PKG="$(python3 -c 'import vllm, os; print(os.path.dirname(vllm.__file__))')"; \
+    echo "overlaying python tree onto ${VLLM_PKG}"; \
+    # 编译产物(_C.abi3.so 等)和 setuptools_scm 生成的 _version.py 都在
+    # ${VLLM_PKG} 里且不在 git 中。用 merge 语义的 `cp -a src/. dest/`,
+    # 不要先删目标目录。
+    find "${VLLM_PKG}" -name '__pycache__' -type d -prune -exec rm -rf {} +; \
+    cp -a /tmp/vllm-src/. "${VLLM_PKG}/"; \
+    rm -rf /tmp/vllm-src; \
+    # 冒烟:import 成功 + 确认编译产物里仍含 sm_80。
+    python3 -c "import vllm; print('vllm', vllm.__version__)"; \
+    python3 -c "import torch; al = torch.cuda.get_arch_list(); print('arch_list', al); assert any('80' in a for a in al), 'sm_80 missing in base image'"
+
+# 这两个在 base 里是 COPY 进来的,同步更新以免和 Python 树版本漂移。
+COPY examples examples
+COPY benchmarks benchmarks
+
+# base 的 ENTRYPOINT 是 ["vllm", "serve"],保持不变。

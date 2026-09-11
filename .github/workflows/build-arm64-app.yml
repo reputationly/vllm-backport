@@ -1,0 +1,171 @@
+name: Build ARM64 sm80 app image (ACR + Docker Hub)
+
+# vllm-backport ARM64/A100 出包流水线 —— 双推阿里云 ACR(上海) + Docker Hub。
+# 照 LightX2V 的 build-arm64-docker.yml 与 vllm-omni 的 build-arm64.yml 的模式。
+#
+# 分工:
+#   base(全量编译 nvcc,小时级)   -> docker/build_base_aarch64.sh,在自己的
+#                                     ARM64 机器上低频跑,直推 ACR
+#   ACR -> Docker Hub              -> sync-base-to-dockerhub.yml(base 重建后跑一次)
+#   app(只换 Python/Triton,分钟级)-> 本流水线,GitHub 原生 arm64 runner
+#
+# 为什么必须自建 base(和 vllm-omni 不同):
+#   vllm-omni 能直接拿 vllm/vllm-openai 官方镜像当 base,因为它只是上层应用。
+#   本仓 *就是* vllm 本体,而且改了 csrc(custom_all_reduce.cuh /
+#   libtorch_stable/persistent_topk.cuh / sampler.cu / topk.cu),
+#   官方镜像里的 .so 不含这些改动,VLLM_USE_PRECOMPILED 也用不了。
+#
+# 为什么 app 层能这么快:
+#   fork 的 sm80 适配九成在 Python + Triton(fp8_sm80.py、mqa_logits_triton.py、
+#   models/deepseek_v4/ampere/、sparse_attn_indexer.py …),不碰 nvcc。
+#
+# Secrets(与 gpustack / LightX2V / vllm-omni fork 同名):
+#   ACR_USERNAME / ACR_PASSWORD
+#   DOCKERHUB_USERNAME / DOCKERHUB_TOKEN
+#
+# Run: Actions -> 本流水线 -> Run workflow
+#   or: gh workflow run build-arm64-app.yml --ref master
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: 'base 镜像(默认从 Docker Hub 拉,国外 runner 快得多;base 重建后记得先跑 sync 流水线)'
+        default: 'arronlee/vllm-backport:arm64-sm80-base'
+        required: true
+      base_commit:
+        description: 'base 镜像对应的 commit(可留空跳过校验)。填了会检查 csrc/cmake/依赖有没有在 base 之后被改动——改了就必须重建 base,只跑 app 层会静默发出装着旧 .so 的镜像。'
+        default: ''
+        required: false
+      dest_tag:
+        description: '浮动 tag'
+        default: 'arm64-sm80-latest'
+        required: true
+
+env:
+  ACR_REGISTRY: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com
+  ACR_REPO: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/vllm-backport
+  # Docker Hub 兼两职:registry build cache(无 GHA 的 10GB 上限)+ 镜像双推目标。
+  DOCKERHUB_REPO: arronlee/vllm-backport
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: write   # 建 GitHub Release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # setuptools_scm 要 git 历史;下面的 guard 也要能 diff 到 base_commit
+
+      # 静默发错镜像是这套分层最大的风险:app 层只换 Python,
+      # 如果 base 之后有人动了 csrc,发出去的镜像 Python 是新的、.so 是旧的,
+      # 症状会是运行期的怪异数值错误而不是构建失败。所以这里挡一道。
+      - name: Guard — native build inputs unchanged since base
+        if: ${{ github.event.inputs.base_commit != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="${{ github.event.inputs.base_commit }}"
+          if ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            echo "::error::base_commit ${BASE} 不在本仓历史里(base 是从别的分支/仓编的?)"
+            exit 1
+          fi
+          CHANGED="$(git diff --name-only "${BASE}" HEAD -- \
+            csrc CMakeLists.txt cmake setup.py requirements docker/Dockerfile)"
+          if [ -n "${CHANGED}" ]; then
+            echo "::error::以下影响原生编译的路径在 base(${BASE})之后有改动,必须重建 base:"
+            echo "${CHANGED}" | sed 's/^/  /'
+            echo "先在 ARM64 机器上跑 docker/build_base_aarch64.sh,再跑 sync 流水线。"
+            exit 1
+          fi
+          echo "OK:csrc/cmake/依赖自 ${BASE} 起未变,app 层足够。"
+
+      - name: Compute tags
+        id: tags
+        shell: bash
+        run: |
+          echo "version=arm64-sm80-$(date -u +%Y%m%d-%H%M)-$(git rev-parse --short=8 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Aliyun ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      # base 从 Docker Hub 公开仓拉不需要登录;这步是为了推镜像 + 推 buildcache。
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push app layer (arm64)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.aarch64_app
+          platforms: linux/arm64
+          push: true
+          # 阿里云 ACR 个人版不认 buildx 的证明清单(空描述符
+          # application/vnd.oci.empty.v1+json),推送报
+          # "denied: unknown manifest class"。显式关掉。
+          provenance: false
+          sbom: false
+          build-args: |
+            BASE_IMAGE=${{ github.event.inputs.base_image }}
+          tags: |
+            ${{ env.ACR_REPO }}:${{ github.event.inputs.dest_tag }}
+            ${{ env.ACR_REPO }}:${{ steps.tags.outputs.version }}
+            ${{ env.DOCKERHUB_REPO }}:${{ github.event.inputs.dest_tag }}
+            ${{ env.DOCKERHUB_REPO }}:${{ steps.tags.outputs.version }}
+          cache-from: type=registry,ref=${{ env.DOCKERHUB_REPO }}:buildcache
+          cache-to: type=registry,ref=${{ env.DOCKERHUB_REPO }}:buildcache,mode=max
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tags.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: vllm-backport arm64/sm80 ${{ steps.tags.outputs.version }}
+          body: |
+            ARM64 + A100(sm80)镜像,双推 ACR 与 Docker Hub。
+
+            - Floating: `${{ env.ACR_REPO }}:${{ github.event.inputs.dest_tag }}`
+            - Immutable: `${{ env.ACR_REPO }}:${{ steps.tags.outputs.version }}`
+            - Docker Hub: `${{ env.DOCKERHUB_REPO }}:${{ steps.tags.outputs.version }}`
+            - Digest: `${{ steps.build.outputs.digest }}`
+            - Base: `${{ github.event.inputs.base_image }}`
+            - Base commit: `${{ github.event.inputs.base_commit }}`
+            - Commit: ${{ github.sha }}
+
+            **上机预检:**
+            ```
+            docker run --rm --gpus all --entrypoint python3 <img> \
+              -c 'import torch; print(torch.cuda.get_arch_list())'
+            ```
+            必须含 `sm_80`。
+
+            **隔离网分发:** pull -> save -> NFS tar -> 各节点 `docker load`。
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo "### vllm-backport arm64/sm80 image"
+            echo ""
+            echo "- \`${ACR_REPO}:${{ github.event.inputs.dest_tag }}\` (floating)"
+            echo "- \`${ACR_REPO}:${{ steps.tags.outputs.version }}\` (immutable)"
+            echo "- \`${DOCKERHUB_REPO}:${{ steps.tags.outputs.version }}\`"
+            echo "- digest \`${{ steps.build.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          ACR_REPO: ${{ env.ACR_REPO }}
+          DOCKERHUB_REPO: ${{ env.DOCKERHUB_REPO }}
