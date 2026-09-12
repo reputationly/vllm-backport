@@ -30,6 +30,24 @@ RAY_PORT="${RAY_PORT:-6379}"
 SOCKET_IFNAME="${SOCKET_IFNAME:-enp131s0f0}"
 IB_HCA="${IB_HCA:-mlx5_0,mlx5_1,mlx5_2,mlx5_3}"
 
+# JIT / autotune 缓存挂到宿主机,跨容器重启复用。
+#
+# 为什么重要:本 fork 重度依赖 Triton kernel(mqa_logits_triton、sparse MLA、
+# Marlin MoE),首次使用要 autotune。实测冷态到热态吞吐差 1.7~2 倍
+# (180~210 -> 约 356 tok/s),TTFT P99 从 13~15 秒降到 0.7~1 秒。
+# 缓存默认落在容器内的 /root/.cache 与 /root/.triton,容器一删就没了 ——
+# 每次重建都要重新付一遍热身代价。挂出来之后:
+#   - 生产:重启服务不再退回冷态
+#   - 调参:换配置重启后不必重新热身,A/B 对比也更干净
+# 默认放共享 NFS:一个节点热身完,其余节点直接复用,不必各自再付一遍。
+# 代价与风险(所以留了覆盖入口):
+#   - Triton 用原子 rename 落缓存,多节点并发写在 NFS 上基本安全但非保证;
+#     若怀疑缓存损坏,删掉该目录重建即可。
+#   - 大量小文件读在 NFS 上比本地盘慢,极端情况下可能反而拖慢启动。
+#     要退回本地盘:CACHE_HOST_DIR=/var/cache/vllm-backport
+CACHE_HOST_DIR="${CACHE_HOST_DIR:-/nfs-models/vllm-backport-cache}"
+mkdir -p "${CACHE_HOST_DIR}" "${CACHE_HOST_DIR}-triton"
+
 GPUS_PER_NODE="$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)"
 TP="${TP:-${GPUS_PER_NODE}}"
 PP="${PP:-${NODES}}"
@@ -50,6 +68,8 @@ docker run -d --name "${CONTAINER}" \
   --ulimit memlock=-1 \
   --ulimit stack=67108864 \
   -v "${MODEL_HOST_DIR}":/models/"$(basename "${MODEL_HOST_DIR}")":ro \
+  -v "${CACHE_HOST_DIR}":/root/.cache \
+  -v "${CACHE_HOST_DIR}-triton":/root/.triton \
   -e NCCL_IB_HCA="${IB_HCA}" \
   -e NCCL_IB_GID_INDEX=3 \
   -e NCCL_SOCKET_IFNAME="${SOCKET_IFNAME}" \
