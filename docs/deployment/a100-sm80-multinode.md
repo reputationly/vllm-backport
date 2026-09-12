@@ -243,3 +243,65 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
 另外 0731 的 thinking 默认开启(见 README 的 0731 契约),不加
 `--reasoning-parser` 时思考内容会内联在 `content` 里带着 `</think>`,
 不会被拆到 `reasoning_content`。
+
+---
+
+## 6. 性能实测与调优结论
+
+环境:2 节点 × 4×A100-40G,TP4×PP2,DSv4-Flash-0731,DSpark-5。
+负载:`vllm bench serve`,random 1024 入 / 256 出,64 请求,并发 16,`--ignore-eos`。
+
+### 最重要的一条:热身值 1.7~2 倍
+
+同一配置、同一负载,只是反复跑:
+
+| 轮次 | 集群 A | 集群 B | 对照(同事另一套部署) |
+|---|---|---|---|
+| 1 | 210.70 | 180.82 | 238.71 |
+| 2 | 270.83 | 255.11 | — |
+| 3 | 268.83 | 346.44 | 323.02 |
+| 4 | **356.24** | **355.70** | — |
+
+单位是 output tok/s。冷态到热态差 **1.7~2 倍**,TTFT P99 从 13~15 秒降到
+0.7~1 秒。原因是本 fork 重度依赖 Triton kernel(`mqa_logits_triton`、
+sparse MLA、Marlin MoE),首次使用要 autotune;启动日志里的
+`enable_jit_warmup=True` / `enable_flashinfer_autotune=True` 并未覆盖全部路径。
+
+**生产必做:服务启动后先打一轮覆盖典型输入长度的 warm-up 流量,再接入正式请求。**
+这比任何参数调优都值钱,也是横向对比时最大的陷阱 —— 对比前双方都必须跑到收敛
+(经验值 ≥3 轮相同负载)。
+
+### 收敛后的数字
+
+| | fp8 KV | fp8_ds_mla KV | 对照部署 |
+|---|---|---|---|
+| Output tok/s | **356.24** | 355.70 | 323.02 |
+| TTFT 中位 (ms) | 242 | 235 | 506 |
+| TTFT P99 (ms) | 956 | 729 | 681 |
+| TPOT 均值 (ms) | 42.05 | 40.70 | 46.42 |
+| TPOT P99 (ms) | 51.11 | 51.02 | 59.09 |
+| DSpark acceptance length | 2.28 | 2.30 | 2.25 |
+
+单流(并发 1,热态前):约 67 tok/s,Mean ITL 27 ms。
+
+### 各项配置的实测影响
+
+| 配置 | 实测结论 |
+|---|---|
+| **CUDA graph** | `--enforce-eager` 单流 6~10 tok/s,FULL_AND_PIECEWISE 约 67 tok/s,**7~10 倍**。日志里会出现 `Capturing model for DSpark speculator...`,说明 draft 循环也被捕获 |
+| **`--max-num-batched-tokens`** | 启用 spec decode 后会被自动压到 2048(启动有 warning),16 并发 × 1024 prompt 直接排队 → TTFT P99 爆到 15 秒。设 8192 可用;**设 16384 会把 KV 挤到不足**(`8.74 GiB < 9.13 GiB`)启动失败 |
+| **`--enable-expert-parallel`** | 让 MoE 走上 Marlin(日志 `Using 'MARLIN' Mxfp4 MoE backend` / `MarlinExperts`)。README 解释过机理:纯 TP 时专家中间维可能不是 128 的倍数,会被迫走 Triton fp8 MoE,而 sm8x 没有 fp8 tensor core |
+| **`draft_sample_method: greedy`** | acceptance length 2.11 → 2.32 |
+| **`--kv-cache-dtype`** | `fp8` 与 `fp8_ds_mla` **无差异**:吞吐 356.24 vs 355.70,KV 容量都是 517,998 token(该 build 里解析成同一布局) |
+| **`--block-size 256`** | 传 256 但实际 resolved 为 4(DSv4 混合注意力用多 KV cache group,该字段报统一后的最小块);两套部署都一样 |
+| **PP3(3 节点)** | **更差**:吞吐 -25%(210.7 → 157.7),TPOT +48%(60 → 90 ms),ITL P99 差 6.7 倍。KV 涨 2.24 倍(51.8 万 → 116 万)但该负载用不上。**2 节点是最优** |
+| **`torch.compile`** | **不可用**。`vllm/config/vllm.py:759` 的 `_maybe_enable_breakable_cudagraph()` 在 breakable cudagraph 启用时强制 `mode = CompilationMode.NONE`;DSv4 稀疏 indexer 需要 breakable cudagraph,两者互斥 |
+| **`num_speculative_tokens`** | 固定 5。README:低于 5 被拒(checkpoint 的 `dspark_block_size=5`),6 的 draft 几乎不被接受,7 需约 200KB shared memory 超过 Ampere 的 163KB |
+
+### 仍未挖掘的空间
+
+1. **真实负载下的 prefix caching / LMCache** —— benchmark 用 random prompt,
+   前缀零共享,`--enable-prefix-caching` 完全没发挥。真实场景有共享 system
+   prompt 或多轮对话时收益可能是数量级的。fork 自带配套 LMCache 且已打进镜像。
+2. **`--max-num-seqs` 扫描**(当前 32)。
+3. 4 条 RoCE 修好后的跨节点 TP / EP all-to-all —— 但对 TP4×PP2 不是瓶颈。
