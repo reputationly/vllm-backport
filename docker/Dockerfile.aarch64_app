@@ -45,4 +45,16 @@ RUN set -eux; \
 COPY examples examples
 COPY benchmarks benchmarks
 
+# ray:跨节点 TP/PP 必需。
+#
+# vLLM 的 distributed_executor_backend 只有 mp(单机)和 ray(跨机),
+# 多节点必须有 ray,而且 ray worker 是在容器内起的,必须和容器里的
+# vllm/torch 共用同一个 Python 环境 —— 装在宿主系统里容器看不见。
+# 版本按 requirements/test/cuda.txt 的 pin。
+#
+# 烘进镜像而不是每次起集群时 pip install:实测 8 个容器并发装会互相拖慢
+# 到 15 分钟以上,而这一层只需在构建时付一次。
+RUN pip install --no-cache-dir "ray[cgraph,default]==2.56.1" \
+ && ray --version
+
 # base 的 ENTRYPOINT 是 ["vllm", "serve"],保持不变。
