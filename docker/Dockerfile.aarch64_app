@@ -103,7 +103,7 @@ RUN pip install --no-cache-dir "ray[cgraph,default]==2.56.1" \
 # 用 ld.so.conf.d 而不是 ENV LD_LIBRARY_PATH:后者会被所有子进程继承并影响
 # 整个镜像的库搜索顺序,且 base 若未设该变量会留下空条目(等于当前目录)。
 RUN pip install --no-cache-dir --no-deps mooncake-transfer-engine nvidia-cuda-runtime-cu12 \
- && CU12_LIB="$(python3 -c 'import nvidia.cuda_runtime, os; print(os.path.join(os.path.dirname(nvidia.cuda_runtime.__file__), "lib"))')" \
+ && CU12_LIB="$(python3 -c 'import nvidia.cuda_runtime as m, os; print(os.path.join(list(m.__path__)[0], "lib"))')" \
  && test -e "${CU12_LIB}/libcudart.so.12" \
  && echo "${CU12_LIB}" > /etc/ld.so.conf.d/zz-cuda12-for-mooncake.conf \
  && ldconfig \
