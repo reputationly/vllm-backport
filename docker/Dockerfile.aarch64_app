@@ -57,4 +57,34 @@ COPY benchmarks benchmarks
 RUN pip install --no-cache-dir "ray[cgraph,default]==2.56.1" \
  && ray --version
 
+# Mooncake / NIXL:跨实例 KV 共享的传输层。
+#
+# 为什么需要:本集群的 KV 分层受传输带宽支配(见
+# docs/deployment/a100-token-capacity-analysis.md §7.4)。实测重算 140k 上下文
+# 需 12.3s,而搬同一份 KV(约 75 KB/token,平均会话 12.5 GB)需要:
+#   宿主内存 PCIe ~20 GB/s -> 0.6s      ✅ 已用(--kv-offloading-size)
+#   RoCE RDMA 4x100G 50 GB/s -> 0.25s   ✅ 本层要打开的通道
+#   NFS 多流聚合 0.95 GB/s   -> 13.2s   ❌ 不如重算
+#   本地盘 0.11 GB/s         -> 115s    ❌
+# 也就是说跨实例共享只有走 RDMA 才成立,而那 4 张 100G 卡目前只用来传
+# PP 的 hidden states(每步几十 MB),带宽几乎全空着。
+#
+# 装在镜像里而不是宿主机:连接器是在 vllm worker 进程内 import 的
+# (mooncake_connector.py:71 `from mooncake.engine import TransferEngine`),
+# 必须和容器里的 vllm/torch 同一个 Python 环境。
+#
+# 两个包的分工:
+#   mooncake-transfer-engine -> MooncakeStoreConnector(共享 KV 池,我们要的)
+#                               与 MooncakeConnector(P2P,PD 分离用)
+#   nixl                     -> NixlConnector(P2P,PD 分离用)
+# 只装包不够:MooncakeStoreConnector 运行时还需要 metadata_server
+# (etcd/http/redis)与 master_server_address 两个常驻服务,那是部署侧的事。
+#
+# 版本不 pin 到具体小版本:这两个包迭代快,且 aarch64 轮子只在较新版本齐全
+# (实测 cp312 manylinux_2_28_aarch64 从 mooncake 0.3.8 / nixl 0.6.1 起可用)。
+RUN pip install --no-cache-dir mooncake-transfer-engine nixl \
+ && python3 -c "from mooncake.engine import TransferEngine; print('mooncake TransferEngine OK')" \
+ && python3 -c "from mooncake.store import MooncakeDistributedStore; print('mooncake Store OK')" \
+ && python3 -c "import nixl; print('nixl OK')"
+
 # base 的 ENTRYPOINT 是 ["vllm", "serve"],保持不变。
