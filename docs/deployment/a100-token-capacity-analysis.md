@@ -491,14 +491,75 @@ NCCL_IB_HCA=mlx5_0,mlx5_2  NCCL_IB_GID_INDEX=3  NCCL_ALGO=Ring  NCCL_PROTO=Simpl
 
 > 注:这些节点的本地盘(109 MB/s)比 NFS(478 MB/s)还慢,不要想当然。
 
-### 7.5 可用的跨实例 KV connector
+### 7.5 RDMA 通道实测:可用,但 GPU-Direct 被硬件挡住 `[实测]`
+
+用 mooncake 自带的 `transfer_engine_bench` 在 gpu45 ↔ gpu47 之间实测
+(`--protocol=rdma`,metadata 走自带的 HTTP server):
+
+| 模式 | 结果 |
+|---|---|
+| 主机内存 ↔ 主机内存,单张 100G(`mlx5_2`) | **12.23 GB/s**(线速 12.5,已到顶) |
+| 主机内存,`--auto_discovery`(多卡) | **19.61 GB/s** |
+| **GPU 显存直传(GDR,`--use_vram=true`)** | **失败:`transport retry counter exceeded`** |
+
+**RoCE fabric 本身健康,坏的专是 GDR。** 原因在硬件拓扑:
+
+```
+nvidia-smi topo -m:  GPU0..3 ↔ NIC0..3 全是 SYS
+                     (要穿 PCIe + 跨 NUMA 的 CPU 互联)
+ACS:                 19 个 PCI 桥中 11 个已启用 —— ACS 会阻断 peer-to-peer DMA
+```
+
+`nvidia-peermem.ko`(580.65.06)本来没加载,`modprobe nvidia_peermem` 后
+`/sys/kernel/mm/memory_peers/nv_mem` 出现、内存注册那一步过了,但数据仍传不过去
+—— 剩下的是 ACS + 跨 NUMA,只能在 BIOS/启动参数层面解(`pcie_acs_override`),
+属运维决策。
+
+另外 `mlx5_1` / `mlx5_3` 在本 fabric 上全部报 transport retry 失败,与集群一直
+只设 `NCCL_IB_HCA=mlx5_0,mlx5_2` 的既有结论一致 —— **只有 2 张卡真正通**。
+
+**所以跨实例 KV 共享要经主机内存中转**,搬一个平均会话(12.5 GB):
+
+```
+GPU → 主机内存 (PCIe ~20 GB/s)   0.6s
+    → RDMA (2 卡 ~20 GB/s)       0.63s
+    → 主机内存 → GPU              0.6s
+                       合计 ≈ 1.8s   vs 重算 12.3s  →  约 7× 快
+```
+
+比 GDR 理想值(~0.8s)差一倍,但仍远优于重算,方案成立。
+
+### 7.6 Mooncake 的安装:三个坑 `[实测]`
+
+已烘入 `docker/Dockerfile.aarch64_app`。踩过的坑:
+
+1. **不能带依赖装。** `nixl` 的 `Requires-Dist` 含 `torch`,pip 重新解析后开始拉
+   `nvidia-nccl-cu13`(206 MB)等,有覆盖 base 里 `2.13.0+cu130`(带 sm_80)的
+   风险。**已去掉 nixl**(它是 P2P/PD 分离用的,不是共享缓存);mooncake 改
+   `--no-deps`(其依赖 aiohttp/requests/msgpack 在 base 里已满足)。
+2. **轮子是 CUDA 12 的,镜像是 CUDA 13。** `ldd mooncake/engine.so` →
+   `libcudart.so.12 => not found`,PyPI 无 cu13 变体。解法:并存装
+   `nvidia-cuda-runtime-cu12`,用 `ld.so.conf.d` 注册(不用 `LD_LIBRARY_PATH`,
+   那会污染全镜像的库搜索顺序)。soname 不同所以两个运行时互不干扰,已实测
+   torch 建张量 → import mooncake → torch 再建张量全部正常、`arch_list` 仍含 sm_80。
+3. **`nvidia.cuda_runtime` 是命名空间包**,`__file__` 为 `None`,取路径必须用
+   `list(m.__path__)[0]`。
+
+**不需要外部 etcd/redis** —— 轮子自带 `mooncake_master`、
+`mooncake_http_metadata_server`、`transfer_engine_bench`、
+`transfer_engine_topology_dump`。部署就是在一台起 master + metadata server,
+其余实例指过去。
+
+容器还需 `--cap-add=SYS_NICE`,否则 NUMA 绑定报 `mbind: Operation not permitted`。
+
+### 7.7 可用的跨实例 KV connector
 
 | connector | 来源 | 镜像内 |
 |---|---|---|
 | `lmcache_*` | LMCache | ⚠️ 包已装(0.5.5.dev135)但**两条接口都起不来**:`--kv-offloading-backend lmcache` 报 `device.py:56 Failed to infer device type`;`--kv-transfer-config LMCacheConnectorV1` 把 KV 显存账改写成「524288 需 36.6 GiB」超出可用 |
 | `ExampleConnector` | vLLM 内置 | ⚠️ 机制对(按 input_ids 哈希写共享目录),但只能走文件系统 —— 见 §7.4,原理上不成立 |
-| **`mooncake`** | Moonshot | ❌ **未装。唯一可行的 RDMA 路径,应优先解决离线安装** |
-| `nixl` | NVIDIA(PD 分离) | ❌ 未装,同上 |
+| **`mooncake`** | Moonshot | ✅ **已烘入镜像**(见 §7.6)。RDMA 通道已实测可用(§7.5) |
+| `nixl` | NVIDIA(PD 分离) | ❌ 故意不装:`Requires-Dist: torch`,有覆盖 base 的风险;且用途是 PD 分离而非共享缓存 |
 | `hf3fs` | DeepSeek 3FS | ❌ 未装 |
 
 ---
