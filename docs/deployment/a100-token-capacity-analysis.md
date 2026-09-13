@@ -453,14 +453,53 @@ NCCL_IB_HCA=mlx5_0,mlx5_2  NCCL_IB_GID_INDEX=3  NCCL_ALGO=Ring  NCCL_PROTO=Simpl
 | 3 | **预热**:收到文档立即发 `max_tokens=1` 预热请求,用户思考时间是免费算力 | 网关待做,**唯一能救首轮的手段** |
 | 4 | 跨实例 KV 共享 | 见 §7.4 |
 
-### 7.4 可用的跨实例 KV connector
+### 7.4 KV 分层的判据:传输必须比重算快 `[实测]`
+
+**每 token 的 KV ≈ 75 KB**(实测:8 卡 × 9.2 GiB 可用 KV 显存 ÷ 1,012,659 token;
+与报错「524,288 token 需要 36.6 GiB」算出的 75 KB/token 吻合)。
+所以一个平均会话(166.5k token)约 **12.5 GB**,满 1M 的会话约 **75 GB**。
+
+各介质实测带宽,以及搬 12.5 GB 与重算的对比:
+
+| 层 | 实测带宽 | 加载 12.5 GB | vs 重算 |
+|---|---|---|---|
+| **RoCE RDMA(4×100G 齐上)** | **50 GB/s** | **0.25s** | **50× 快** ✅ |
+| **RoCE RDMA(单张 100G)** | **12.5 GB/s** | **1.0s** | **12× 快** ✅ |
+| 宿主内存(PCIe) | ~20 GB/s | **0.6s** | **20× 快** ✅ 已采纳 |
+| **NFS**(多流聚合,实测 942~952 MB/s) | **0.95 GB/s** | **13.2s** | **打平/略慢** ❌ |
+| NFS(单流,实测) | 478 MB/s | 26s | 2× 慢 ❌ |
+| **本地磁盘**(实测) | **109 MB/s** | **115s** | **9× 慢** ❌ |
+| 重算 prefill(140k) | 11,370 tok/s | 12.3s | 基准 |
+
+**判据:传输必须比重算快,否则分层是负收益。** 我们重算 140k 要 12.3s,
+所以约 1 GB/s 是生死线。这一条排除:
+
+- `ExampleConnector` + 共享文件系统(NFS 打平,无收益)
+- LMCache 的 `local_disk` 后端(不论指向 NFS 还是本地盘)
+- 任何「磁盘 L3」设想
+
+### 网络拓扑:RoCE 那 50 GB/s 完全没用上 `[实测]`
+
+| 路径 | 带宽 | 当前用途 |
+|---|---|---|
+| 管理网 `enp131s0f0`(NFS 走这条) | ~950 MB/s | 模型权重、NFS |
+| **RoCE `enp194s0f0/f1`+`enp226s0f0/f1`** | **4×100G = 50 GB/s** | 仅传 PP 的 hidden states(每步几十 MB) |
+
+`ip route get <nfs-server>` 确认 NFS 走管理网。**所以跨实例 KV 共享走 RDMA 时
+有 50 GB/s 可用,比宿主内存的 PCIe 还快** —— 这使 **Mooncake / NIXL 的离线安装
+成为最高价值的工程任务**,而不是可选项。
+
+> 注:这些节点的本地盘(109 MB/s)比 NFS(478 MB/s)还慢,不要想当然。
+
+### 7.5 可用的跨实例 KV connector
 
 | connector | 来源 | 镜像内 |
 |---|---|---|
-| `lmcache_*` | LMCache | ✅ 0.5.5.dev135 |
-| `mooncake` | Moonshot | ❌ 未装(有 4×100G RoCE,装了可做全机队共享 KV 池) |
+| `lmcache_*` | LMCache | ⚠️ 包已装(0.5.5.dev135)但**两条接口都起不来**:`--kv-offloading-backend lmcache` 报 `device.py:56 Failed to infer device type`;`--kv-transfer-config LMCacheConnectorV1` 把 KV 显存账改写成「524288 需 36.6 GiB」超出可用 |
+| `ExampleConnector` | vLLM 内置 | ⚠️ 机制对(按 input_ids 哈希写共享目录),但只能走文件系统 —— 见 §7.4,原理上不成立 |
+| **`mooncake`** | Moonshot | ❌ **未装。唯一可行的 RDMA 路径,应优先解决离线安装** |
+| `nixl` | NVIDIA(PD 分离) | ❌ 未装,同上 |
 | `hf3fs` | DeepSeek 3FS | ❌ 未装 |
-| `nixl` | NVIDIA(PD 分离) | ❌ 未装 |
 
 ---
 
