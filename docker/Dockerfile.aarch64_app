@@ -57,7 +57,7 @@ COPY benchmarks benchmarks
 RUN pip install --no-cache-dir "ray[cgraph,default]==2.56.1" \
  && ray --version
 
-# Mooncake / NIXL:跨实例 KV 共享的传输层。
+# Mooncake:跨实例 KV 共享的传输层。
 #
 # 为什么需要:本集群的 KV 分层受传输带宽支配(见
 # docs/deployment/a100-token-capacity-analysis.md §7.4)。实测重算 140k 上下文
@@ -73,18 +73,27 @@ RUN pip install --no-cache-dir "ray[cgraph,default]==2.56.1" \
 # (mooncake_connector.py:71 `from mooncake.engine import TransferEngine`),
 # 必须和容器里的 vllm/torch 同一个 Python 环境。
 #
-# 两个包的分工:
+# 只装 mooncake,不装 nixl:
 #   mooncake-transfer-engine -> MooncakeStoreConnector(共享 KV 池,我们要的)
-#                               与 MooncakeConnector(P2P,PD 分离用)
-#   nixl                     -> NixlConnector(P2P,PD 分离用)
-# 只装包不够:MooncakeStoreConnector 运行时还需要 metadata_server
+#   nixl                     -> NixlConnector,是 P2P/PD 分离用的,不是共享缓存;
+#       且它 `Requires-Dist: torch`,pip 会重新解析 torch 并去拉
+#       nvidia-nccl-cu13(206 MB)等,有覆盖 base 里 2.13.0+cu130(带 sm_80)
+#       的风险 —— 实测触发过一次,及时中止。等真要做 PD 分离再单独评估,
+#       届时务必 --no-deps。
+#
+# `--no-deps` 的依据(新增依赖时必须重新核实这一行):mooncake 的
+# Requires-Dist 只有 aiohttp / requests / msgpack,base 里分别是
+# 3.14.3 / 2.34.2 / 1.2.2,均已满足。跳过依赖解析既安全,又避免 pip
+# 顺手动到 torch。
+#
+# 只装包不足以启用:MooncakeStoreConnector 运行时还需要 metadata_server
 # (etcd/http/redis)与 master_server_address 两个常驻服务,那是部署侧的事。
 #
-# 版本不 pin 到具体小版本:这两个包迭代快,且 aarch64 轮子只在较新版本齐全
-# (实测 cp312 manylinux_2_28_aarch64 从 mooncake 0.3.8 / nixl 0.6.1 起可用)。
-RUN pip install --no-cache-dir mooncake-transfer-engine nixl \
+# 不 pin 小版本:该包迭代快,且 aarch64 轮子只在较新版本齐全
+# (实测 cp312 manylinux_2_28_aarch64 自 0.3.8 起可用,当前 0.3.13.post1)。
+RUN pip install --no-cache-dir --no-deps mooncake-transfer-engine \
  && python3 -c "from mooncake.engine import TransferEngine; print('mooncake TransferEngine OK')" \
  && python3 -c "from mooncake.store import MooncakeDistributedStore; print('mooncake Store OK')" \
- && python3 -c "import nixl; print('nixl OK')"
+ && python3 -c "import torch; al=torch.cuda.get_arch_list(); print('arch_list', al); assert any('80' in a for a in al), 'sm_80 lost'"
 
 # base 的 ENTRYPOINT 是 ["vllm", "serve"],保持不变。
