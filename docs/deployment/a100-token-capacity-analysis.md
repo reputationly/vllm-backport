@@ -552,7 +552,62 @@ GPU → 主机内存 (PCIe ~20 GB/s)   0.6s
 
 容器还需 `--cap-add=SYS_NICE`,否则 NUMA 绑定报 `mbind: Operation not permitted`。
 
-### 7.7 可用的跨实例 KV connector
+### 7.7 MooncakeStoreConnector 接通了,但**写路径不触发** `[实测]`
+
+已完整搭起两实例共享一个 Store 的环境并实测,结论是**目前拿不到收益**。
+
+环境(均已验证):
+- `mooncake_master --enable_http_metadata_server=true`(master 与元数据服务同进程,
+  **不需要外部 etcd/redis**)
+- 两个 TP2×PP4 实例 + `--kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both"}'`
+- `MOONCAKE_CONFIG_PATH` 指向 `{metadata_server, master_server_address, protocol=rdma,
+  device_name=mlx5_2, mode=embedded, global_segment_size=8GiB}`
+- 容器需 `--cap-add=SYS_NICE`(否则 `mbind: Operation not permitted`)
+
+启动侧一切正常:
+
+```
+master:  Clients: 16                        (8 rank × 2 实例全部注册)
+         master_total_capacity_bytes 68719476736   (64 GiB 池)
+worker:  Mooncake mode=embedded (global_segment_size=8589934592, ...)
+         Mounting segment: 8589934592 bytes
+         Started 1 Mooncake KV-load receive thread(s)
+```
+
+**读路径通,写路径不通:**
+
+```
+KV Transfer metrics: lookup_exists_count=7, lookup_exists_total_keys=24564   ← 在查
+master_put_start_requests_total 0                                            ← 从不写
+```
+
+跨实例测试(固定 90k 文档,A 冷算后 B 打同一份):
+
+| 步骤 | TTFT |
+|---|---|
+| A 首次(冷) | 16.73s |
+| Store `key_count` | **0** |
+| B 跨实例 | **17.28s**(零收益) |
+
+对照:同实例同请求连打三次 **16.69s → 1.12s → 0.88s**,
+说明**本地前缀缓存不受影响**,问题只在 Store 的写路径。
+
+已逐一排除的拦截点(读代码 + 算数,非猜测):
+
+| 候选 | 排除依据 |
+|---|---|
+| `kv_role` | `scheduler.py:208` `is_consumer = kv_role == "kv_consumer"`,`kv_both` → False → `skip_save=False` |
+| chunk 门槛 | `data.py:779-783`:首 chunk 8192 token,`num_tokens_to_save=8192 ≥ chunk_boundary=256` |
+| `block_hashes` 为 None | `data.py:775` 会降级为 `[]`,不提前返回 |
+| `transfer_group_ids` 为空 | `kv_cache_interface.py:1278` `enable_kv_transfer` 默认 True,核心代码无处置 False |
+
+**结论:断点在 worker 侧执行 put 的路径上,需要在连接器里加调试日志定位。**
+这是 vLLM 标注 experimental 的 API(`base.py:203` 自带警告),属开发任务。
+
+> 即便修通,收益也要按 §7.5 的实测打折:GDR 被 ACS + 跨 NUMA 挡住,
+> 必须经主机内存中转,搬一个平均会话约 1.8s(vs 重算 12.3s,约 7×)。
+
+### 7.8 可用的跨实例 KV connector
 
 | connector | 来源 | 镜像内 |
 |---|---|---|
