@@ -91,7 +91,22 @@ RUN pip install --no-cache-dir "ray[cgraph,default]==2.56.1" \
 #
 # 不 pin 小版本:该包迭代快,且 aarch64 轮子只在较新版本齐全
 # (实测 cp312 manylinux_2_28_aarch64 自 0.3.8 起可用,当前 0.3.13.post1)。
-RUN pip install --no-cache-dir --no-deps mooncake-transfer-engine \
+# 还要补一份 CUDA 12 运行时:mooncake 的预编译轮子链接 libcudart.so.12
+# (`ldd .../mooncake/engine.so` -> `libcudart.so.12 => not found`),
+# 而 base 是 CUDA 13(只有 libcudart.so.13),PyPI 也没有 cu13 变体。
+#
+# 两个运行时同进程共存是安全的:soname 不同(.so.12 / .so.13),torch 按
+# soname 解析仍拿到 13,mooncake 拿 12,驱动对 12 向后兼容。已在 A100 节点
+# 实测:torch 建 GPU 张量 -> import mooncake -> torch 再建张量,全部正常,
+# arch_list 仍含 sm_80。
+#
+# 用 ld.so.conf.d 而不是 ENV LD_LIBRARY_PATH:后者会被所有子进程继承并影响
+# 整个镜像的库搜索顺序,且 base 若未设该变量会留下空条目(等于当前目录)。
+RUN pip install --no-cache-dir --no-deps mooncake-transfer-engine nvidia-cuda-runtime-cu12 \
+ && CU12_LIB="$(python3 -c 'import nvidia.cuda_runtime, os; print(os.path.join(os.path.dirname(nvidia.cuda_runtime.__file__), "lib"))')" \
+ && test -e "${CU12_LIB}/libcudart.so.12" \
+ && echo "${CU12_LIB}" > /etc/ld.so.conf.d/zz-cuda12-for-mooncake.conf \
+ && ldconfig \
  && python3 -c "from mooncake.engine import TransferEngine; print('mooncake TransferEngine OK')" \
  && python3 -c "from mooncake.store import MooncakeDistributedStore; print('mooncake Store OK')" \
  && python3 -c "import torch; al=torch.cuda.get_arch_list(); print('arch_list', al); assert any('80' in a for a in al), 'sm_80 lost'"
