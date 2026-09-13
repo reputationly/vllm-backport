@@ -102,13 +102,21 @@ RUN pip install --no-cache-dir "ray[cgraph,default]==2.56.1" \
 #
 # 用 ld.so.conf.d 而不是 ENV LD_LIBRARY_PATH:后者会被所有子进程继承并影响
 # 整个镜像的库搜索顺序,且 base 若未设该变量会留下空条目(等于当前目录)。
+# 构建期**不能** import mooncake:它链接 libcuda.so.1(驱动库),那是 NVIDIA
+# 容器运行时在容器启动时注入的,构建机(GitHub runner,无 GPU 无驱动)上没有。
+# 试过一次,构建在 `ImportError: libcuda.so.1` 处失败。
+# 所以这里只验证构建期可验证的部分:libcudart.so.12 已被 ldconfig 收录、
+# engine.so 对它的依赖能解析到实际路径(libcuda.so.1 这时必然 not found,正常)。
+# 真正的 import 验证在有 GPU 的节点上做,已在 gpu45 / gpu47 通过。
 RUN pip install --no-cache-dir --no-deps mooncake-transfer-engine nvidia-cuda-runtime-cu12 \
  && CU12_LIB="$(python3 -c 'import nvidia.cuda_runtime as m, os; print(os.path.join(list(m.__path__)[0], "lib"))')" \
  && test -e "${CU12_LIB}/libcudart.so.12" \
  && echo "${CU12_LIB}" > /etc/ld.so.conf.d/zz-cuda12-for-mooncake.conf \
  && ldconfig \
- && python3 -c "from mooncake.engine import TransferEngine; print('mooncake TransferEngine OK')" \
- && python3 -c "from mooncake.store import MooncakeDistributedStore; print('mooncake Store OK')" \
+ && ldconfig -p | grep -q 'libcudart\.so\.12' \
+ && MC_SO="$(python3 -c 'import mooncake as m, os; print(os.path.join(list(m.__path__)[0], "engine.so"))')" \
+ && ldd "${MC_SO}" | grep 'libcudart.so.12' | grep -qv 'not found' \
+ && echo "mooncake engine.so 的 libcudart.so.12 已可解析" \
  && python3 -c "import torch; al=torch.cuda.get_arch_list(); print('arch_list', al); assert any('80' in a for a in al), 'sm_80 lost'"
 
 # base 的 ENTRYPOINT 是 ["vllm", "serve"],保持不变。
