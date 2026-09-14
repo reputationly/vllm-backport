@@ -29,6 +29,7 @@
 | 外部仓的 EP 否定结论(72σ)适用于我们 | **反的** —— 我们开 EP 快 17.2%(§3.8) |
 | 900k 深度召回崩到 30%/0% | **我的 `max_tokens=64` 截断造成的假象。给足预算后 862k 深度 10/10 全中**(§3.9) |
 | 随机文本会虚高吞吐 ~35% | 方向反了,自然文本还略快(§3.9) |
+| 「8 台机器 rail2 坏了 / 只有 2 条轨可用 / metric 决定可达性 / SDN 没下发端口-IP 绑定」 | **全部作废。RoCE 从没坏过 —— 55 台 × 4 轨 RDMA 全部线速 11.4~11.7 GB/s。是我拿 ping 当健康判据,而 ICMP 与 RoCEv2(UDP/4791)是两条策略路径(§7.4.1)** |
 
 两条方法论教训:
 
@@ -40,6 +41,10 @@
    他们的 EP 否定、`ROW_CHUNK` 修复、kernel 开关收益,在我们这儿三条不成立。
 4. **推理模型的评测必须给足输出预算。** `max_tokens=64` 让 862k 深度的召回从
    100% 读成 0%(思维链还没写完就被截断)。对齐各组预算,否则测的是预算。
+5. **判据必须走要用的那条路。** 同一类错误已犯三次:`max_tokens=64` 当召回判据、
+   批量 ping 超时当可达性判据、ICMP 当 RoCE 健康判据。前两次浪费时间,
+   第三次更严重 —— 为一个不存在的故障重启了 6 台生产机、改了 7 台的路由。
+   **要测 RDMA 就用 `ib_write_bw`,要测召回就给足预算,不要用替代信号。**
 
 ---
 
@@ -464,7 +469,7 @@ NCCL_IB_HCA=mlx5_0,mlx5_2  NCCL_IB_GID_INDEX=3  NCCL_ALGO=Ring  NCCL_PROTO=Simpl
 | 层 | 实测带宽 | 加载 12.5 GB | vs 重算 |
 |---|---|---|---|
 | **RoCE RDMA(4×100G 齐上)** | **50 GB/s** | **0.25s** | **50× 快** ✅ |
-| **RoCE RDMA(单张 100G)** | **12.5 GB/s** | **1.0s** | **12× 快** ✅ |
+| **RoCE RDMA(单张 100G,实测 12.2)** | **12.5 GB/s** | **1.0s** | **12× 快** ✅ |
 | 宿主内存(PCIe) | ~20 GB/s | **0.6s** | **20× 快** ✅ 已采纳 |
 | **NFS**(多流聚合,实测 942~952 MB/s) | **0.95 GB/s** | **13.2s** | **打平/略慢** ❌ |
 | NFS(单流,实测) | 478 MB/s | 26s | 2× 慢 ❌ |
@@ -490,6 +495,48 @@ NCCL_IB_HCA=mlx5_0,mlx5_2  NCCL_IB_GID_INDEX=3  NCCL_ALGO=Ring  NCCL_PROTO=Simpl
 成为最高价值的工程任务**,而不是可选项。
 
 > 注:这些节点的本地盘(109 MB/s)比 NFS(478 MB/s)还慢,不要想当然。
+
+### 7.4.1 RoCE 健康判据:**不要用 ping** `[实测,一次代价很大的误判]`
+
+**ping 不通 ≠ RoCE 坏。** 本集群每台有 4 个 RoCE IP(全在 `29.165.0.0/16`),
+云侧 SDN 只让其中一个回 ICMP,其余三个的 ICMP 在 fabric 里就被丢掉 ——
+`tcpdump -i any icmp` 在目标机上**一个包都抓不到**,看起来像是网络坏了。
+但 RoCEv2 走 UDP/4791,与 ICMP 是两条完全不同的策略路径。
+
+实测对照(gpu46 ↔ gpu43,以及 gpu46 ↔ 8 台「ping 不通」的机器):
+
+| 轨 | `ping -I <iface>` | `ib_write_bw -d mlx5_N -x 3` |
+|---|---|---|
+| rail0 `mlx5_0` | ✅ 通 | **11,685 MiB/s**(线速) |
+| rail1 `mlx5_1` | ❌ 100% loss(全集群双向) | **11,675 MiB/s**(线速) |
+| rail2 `mlx5_2` | ❌ 8 台 100% loss | **11,421~11,686 MiB/s**(线速) |
+| rail3 `mlx5_3` | ❌ 100% loss(全集群双向) | **11,679 MiB/s**(线速) |
+
+**结论:55 台 × 4 轨 RDMA 全部线速,RoCE fabric 完全健康。**
+之前基于 ping 得出的「8 台坏 rail2」「只有 2 条轨可用」「metric 决定可达性」
+「SDN 未下发端口-IP 绑定」全部作废 —— 那些是 ICMP 策略的假象。
+
+正确的检查方式:
+
+```bash
+# 1) 廉价预检:GID 3(RoCEv2 IPv4)存在 + 端口 ACTIVE
+for d in mlx5_0 mlx5_1 mlx5_2 mlx5_3; do
+  printf "%s state=%s gid3=%s\n" $d \
+    "$(cat /sys/class/infiniband/$d/ports/1/state)" \
+    "$(cat /sys/class/infiniband/$d/ports/1/gids/3)"
+done   # gid3 全 0 = 该轨没地址,这才是真故障
+
+# 2) 权威判据:实打 RDMA(带外握手走管理网,数据面走指定轨)
+#    服务端
+ib_write_bw -d mlx5_2 -x 3 -F -D 5
+#    客户端(<mgmt-ip> 是服务端的 10.0.0.x)
+ib_write_bw -d mlx5_2 -x 3 -F -D 5 <mgmt-ip>
+```
+
+> 唯一真实存在过的故障是**地址完全缺失**(netplan/NetworkManager 竞态,
+> 曾在 gpu1/gpu48 出现 0 个地址)。那种情况下 GID 3 全零,RDMA 真的会断,
+> 用上面的预检一眼能看出来。修复:`nmcli device reapply <iface>`(零中断)。
+> 另外开机后云侧配置有几分钟延迟,**boot 后至少等 10 分钟再判定**。
 
 ### 7.5 RDMA 通道实测:可用,但 GPU-Direct 被硬件挡住 `[实测]`
 
