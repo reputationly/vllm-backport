@@ -316,6 +316,7 @@ if TYPE_CHECKING:
     VLLM_UNREPLICATE_ATTN_GEMMS: bool = False
     VLLM_INDEXER_QUERY_SHARD: bool = False
     VLLM_INDEXER_QUERY_SHARD_QPATH: bool = False
+    VLLM_REASONING_OUTPUT_AS_REASONING_CONTENT: bool = False
     VLLM_SPARSE_PREFILL_EXACT_TILE: bool = False
     VLLM_SPARSE_RAGGED_FAST_SCAN: bool = False
     VLLM_DSV4_FIXED_DECODE_SPLITS: int = 16
@@ -2282,6 +2283,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # construction.
     "VLLM_INDEXER_QUERY_SHARD_QPATH": lambda: (
         os.environ.get("VLLM_INDEXER_QUERY_SHARD_QPATH", "0") == "1"
+    ),
+    # Emit the assistant's chain of thought as ``reasoning_content`` instead of
+    # ``reasoning`` in chat completion responses and stream deltas.
+    #
+    # Requests already accept either spelling -- ChatCompletionRequest's
+    # _normalize_messages_before folds ``reasoning_content`` into ``reasoning``.
+    # Responses only ever emit ``reasoning``, so a client written against
+    # DeepSeek's API (which emits ``reasoning_content``) silently reads nothing
+    # and drops the chain of thought. Set this when serving as a drop-in
+    # replacement for such an endpoint.
+    #
+    # Renames the wire key only; the internal field stays ``reasoning`` so the
+    # Anthropic/Cohere/Responses paths that read ``.reasoning`` are untouched.
+    "VLLM_REASONING_OUTPUT_AS_REASONING_CONTENT": lambda: (
+        os.environ.get("VLLM_REASONING_OUTPUT_AS_REASONING_CONTENT", "0") == "1"
     ),
     # Fuse each DSpark Markov draft step (embedding lookup, transition GEMV,
     # base-logit add, padding mask, shard argmax) into one Triton pass, so the

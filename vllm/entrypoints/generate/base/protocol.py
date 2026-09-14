@@ -348,6 +348,17 @@ class ExtractedToolCallInformation(BaseModel):
     content: str | None = None
 
 
+def apply_reasoning_field_alias(data: dict) -> dict:
+    """Rename ``reasoning`` to ``reasoning_content`` on the wire when asked.
+
+    See VLLM_REASONING_OUTPUT_AS_REASONING_CONTENT in envs.py. Only the
+    serialized key changes; the model field keeps its name.
+    """
+    if envs.VLLM_REASONING_OUTPUT_AS_REASONING_CONTENT and "reasoning" in data:
+        data["reasoning_content"] = data.pop("reasoning")
+    return data
+
+
 class DeltaMessage(OpenAIBaseModel):
     role: str | None = None
     content: str | None = None
@@ -359,4 +370,4 @@ class DeltaMessage(OpenAIBaseModel):
         data = handler(self)
         if len(data.get("tool_calls", [])) == 0:
             data.pop("tool_calls", None)
-        return data
+        return apply_reasoning_field_alias(data)

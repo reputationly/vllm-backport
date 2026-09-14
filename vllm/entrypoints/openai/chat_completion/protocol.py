@@ -32,6 +32,7 @@ from vllm.entrypoints.generate.base.protocol import (
     StopParam,
     StreamOptions,
     ToolCall,
+    apply_reasoning_field_alias,
     structured_outputs_from_response_format,
     validate_cache_salt,
     validate_structural_tag_response_format,
@@ -76,7 +77,7 @@ class ChatMessage(OpenAIBaseModel):
         data = handler(self)
         if len(data.get("tool_calls", [])) == 0:
             data.pop("tool_calls", None)
-        return data
+        return apply_reasoning_field_alias(data)
 
 
 class ChatCompletionLogProb(OpenAIBaseModel):
