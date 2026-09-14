@@ -684,7 +684,10 @@ Rail paused: peer=...@mlx5_1 error_count=5 pause_ms=30000
 
 容器还需 `--cap-add=SYS_NICE`,否则 NUMA 绑定报 `mbind: Operation not permitted`。
 
-### 7.7 MooncakeStoreConnector 接通了,但**写路径不触发** `[实测]`
+### 7.7 MooncakeStoreConnector:接通了,但写不进去 `[实测]`
+
+> **已结案,见 §7.7.1** —— 根因是这套硬件上 GPU-Direct RDMA 不可用,
+> 不是连接器 bug。下文保留当时的排查过程与被排除的候选。
 
 已完整搭起两实例共享一个 Store 的环境并实测,结论是**目前拿不到收益**。
 
@@ -733,11 +736,62 @@ master_put_start_requests_total 0                                            ←
 | `block_hashes` 为 None | `data.py:775` 会降级为 `[]`,不提前返回 |
 | `transfer_group_ids` 为空 | `kv_cache_interface.py:1278` `enable_kv_transfer` 默认 True,核心代码无处置 False |
 
-**结论:断点在 worker 侧执行 put 的路径上,需要在连接器里加调试日志定位。**
-这是 vLLM 标注 experimental 的 API(`base.py:203` 自带警告),属开发任务。
+### 7.7.1 结案:写路径**一直在触发**,是每个 key 都失败 `[实测]`
 
-> 即便修通,收益也要按 §7.5 的实测打折:GDR 被 ACS + 跨 NUMA 挡住,
-> 必须经主机内存中转,搬一个平均会话约 1.8s(vs 重算 12.3s,约 7×)。
+上面「写路径不触发」的判断是错的 —— 我只看了 master 侧的
+`master_put_start_requests_total`,而失败发生在**客户端、RPC 发出之前**,
+所以 master 什么也没看到。
+
+vLLM 自己的 `/metrics` 里写得很清楚:
+
+```
+vllm:mooncake_store_operation_total{operation="save_exists",status="ok"}              8
+vllm:mooncake_store_operation_total{operation="save_put",status="partial_failure"}    8
+vllm:mooncake_store_operation_keys_total{operation="save_put"}                      116
+vllm:mooncake_store_operation_failed_keys_total{operation="save_put"}                116   ← 全失败
+vllm:mooncake_store_operation_bytes_total{operation="save_put"}                29,064,960
+```
+
+失败码在 Ray worker 的日志里(**不在 driver 的 serve.log 里**,这是之前漏掉的原因,
+要去 `/tmp/ray/session_*/logs/` 找):
+
+```
+WARNING [worker.py:1160] batch_put failed: 15/15 keys failed (codes={-800},
+        batch_bytes=3559680), first_key=...@pp_rank:0@group:0@875ba951...
+```
+
+8 个 rank 全是 `codes={-800}`。
+
+**根因:`batch_put_from_multi_buffers` 传入的是 KV cache 的 GPU 显存地址,
+而这套硬件上 GPU-Direct RDMA 不可用。** 逐步实测(gpu41 ↔ gpu42,同轨 mlx5_0):
+
+| 条件 | 结果 |
+|---|---|
+| `--use_vram=false`(主机内存) | **12.20 GB/s** ✅ |
+| `--use_vram=true`,`nvidia_peermem` 未加载 | `Failed to register memory: Bad address [14]` —— 注册就失败 |
+| `--use_vram=true`,`nvidia_peermem` 已加载 | 注册通过、QP 连上,**但传输 `transport retry counter exceeded`** |
+
+也就是说 peermem 只解决注册,数据仍然过不去。硬件侧证据:
+
+```
+/proc/cmdline           无 pcie_acs_override / iommu 相关参数
+lspci -vvv              19 个 PCI 桥,11 个 ACSCtl SrcValid+   ← ACS 阻断 P2P DMA
+nvidia-smi topo -m      GPU↔NIC 全为 SYS;GPU0/1 在 NUMA 0,GPU2/3 在 NUMA 2
+```
+
+**所以这不是连接器的 bug,是硬件能力缺失。** 三条出路:
+
+1. **BIOS / 内核加 `pcie_acs_override`** 后重测 —— 唯一可能真正打开 GDR 的办法,
+   属运维决策(要改启动参数并重启)。跨 NUMA 那一段仍在,收益未知。
+2. **改连接器走主机内存中转**(GPU→主机 PCIe,再从主机 RDMA)。
+   `--use_vram=false` 已实测 12.20 GB/s,原理成立,但连接器目前不做这一步,
+   属引擎开发任务。
+3. **放弃跨实例共享,靠网关会话亲和**(§7.2)把同一会话钉在同一实例上。
+   本地 KV 卸载到主机内存已有 3.7× 收益(§3),而会话亲和做到之后,
+   跨实例共享的价值本来就大幅下降。**这是当前的实际方案。**
+
+> 附带修正:§7.7 表格里「`device_name=mlx5_2`」不是问题所在,
+> 换成 `mlx5_0` 并确保同轨配对后,`save_exists` 正常、`save_put` 依旧全失败。
 
 ### 7.8 可用的跨实例 KV connector
 
