@@ -362,6 +362,37 @@ TP2×PP4: 实测 16 会话(约 2.2M token)仍然健康 → 上限至少 16 个�
 | **`VLLM_DISABLE_SHARED_EXPERTS_STREAM=1`** | **−1.8%** —— 同上,别关 |
 | `VLLM_SPARSE_PREFILL_EXACT_TILE=1` | **读代码即排除**:生效条件是 `num_heads == BLOCK_H`,注释注明只在 TP=8 成立,TP=2 下是空操作 |
 | `VLLM_INDEXER_QUERY_SHARD_QPATH=1` | 依赖 `VLLM_INDEXER_QUERY_SHARD`(已实测 −3%),不再单测 |
+| **`VLLM_MHC_POST_FUSE_SQRSUM=1`** | **引擎起不来**:`tilelang.py:867` 导入的 `mhc_post_sqrsum_tilelang` 在 `tilelang_kernels.py` 里**根本没有定义**,且无 Triton 回退。本硬件无 DeepGEMM,必然走进这条坏分支 |
+| **`VLLM_MHC_PRENORM_SHARD=1`**(单开) | **空转**:`triton.py:158-162` 的门控要求 `sqrsum is None`,而那恰好等价于「`POST_FUSE_SQRSUM` 已开」;注释里写明这个配对是强制的。所以单开永不生效 —— 两个 mHC 优化被同一个缺失 kernel 一起堵死 |
+| `VLLM_USE_BREAKABLE_CUDAGRAPH=0`(想借此打开 torch.compile) | **由构造即排除**:`@support_torch_compile` 只加在 `deepseek_v4/cpu/model.py`,CUDA 版模型没有装饰器,GPU 上 torch.compile 永不生效。关掉 breakable cudagraph 只会两头落空,引擎直接报 `piecewise CUDA graphs unavailable, model is not torch-compiled` |
+| **`VLLM_MARLIN_USE_ATOMIC_ADD=1`** | 确认已生效(开启后那条 "consider set ...ATOMIC_ADD to 1" 的建议日志消失),但**无可测差异** |
+| **`VLLM_DSPARK_VOCAB_SHARD=1`** | 无可测差异(配置为 greedy 草稿,条件满足) |
+| **`VLLM_SPARSE_DECODE_MAXNREG=128`** | 无可测差异 |
+
+> **这一轮的方法论结论比结果更重要:并发压测分辨不了 kernel 开关。**
+> 同配置两次重复(不同 salt、全新文档)的波动:
+>
+> | arm | rep1 | rep2 | 均值 |
+> |---|---|---|---|
+> | 基线 | 2724.6 | 2613.9 | 2669.2 |
+> | `MHC_PRENORM_SHARD` | 2650.8 | 2659.3 | 2655.1 |
+> | `MARLIN_USE_ATOMIC_ADD` | 2744.0 | 2631.1 | 2687.6 |
+> | `DSPARK_VOCAB_SHARD` | 2575.6 | 2676.6 | 2626.1 |
+> | `SPARSE_DECODE_MAXNREG` | 2618.5 | 2711.2 | 2664.8 |
+>
+> **重复间波动约 4%,而五个均值全在 2669 ± 30(±1.1%)内。** 单次读到的
+> 「−5.5%」「−3.9%」在第二次重复里直接翻了符号。
+> 换成串行隔离探针后分辨率是 0.2~1.0%,五个 arm 在每个尺寸上都无差异:
+>
+> | 尺寸 | 基线 | PRENORM | ATOMIC | VOCAB | MAXNREG | 极差 |
+> |---|---|---|---|---|---|---|
+> | 20k | 7967 | 7968 | 8000 | 7952 | 7920 | 1.0% |
+> | 60k | 11186 | 11189 | 11216 | 11196 | 11215 | 0.3% |
+> | 140k | 11180 | 11186 | 11206 | 11196 | 11201 | 0.2% |
+> | 260k | 9795 | 9823 | 9792 | 9808 | 9813 | 0.3% |
+>
+> 另外:**「无差异」必须区分「生效了但没用」和「根本没生效」。**
+> `MHC_PRENORM_SHARD` 属于后者(门控未满足),这是读代码才发现的。
 
 冷 prefill 撬不动。用隔离探针(串行单请求、每次全新文档、无缓存无排队、
 各 2 次重复,两次相差 ~1%)测得的真实速率曲线是**非单调**的:
