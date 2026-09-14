@@ -356,8 +356,29 @@ TP2×PP4: 实测 16 会话(约 2.2M token)仍然健康 → 上限至少 16 个�
 | `VLLM_INDEXER_QUERY_SHARD=1` | −3% |
 | `--gpu-memory-utilization 0.90` | 运行期 OOM |
 | PP3 / PP4 | −25% / −65% |
+| **`VLLM_UNREPLICATE_ATTN_GEMMS=1`** | **发布态直接崩引擎**(已修,见 `9a53df78b`);修好后在 TP=2 上冷 prefill **慢 1.3~3.6%** |
+| **`--kv-cache-dtype fp8_ds_mla`**(对照通用 `fp8`) | **打平**(+0.5%,噪声内),但冷 TTFT 更差(81.5s vs 73.7s) |
+| **`VLLM_DISABLE_MULTI_STREAM_PARALLEL=1`** | **−6.6%** —— 多流重叠是有效的,别关 |
+| **`VLLM_DISABLE_SHARED_EXPERTS_STREAM=1`** | **−1.8%** —— 同上,别关 |
+| `VLLM_SPARSE_PREFILL_EXACT_TILE=1` | **读代码即排除**:生效条件是 `num_heads == BLOCK_H`,注释注明只在 TP=8 成立,TP=2 下是空操作 |
+| `VLLM_INDEXER_QUERY_SHARD_QPATH=1` | 依赖 `VLLM_INDEXER_QUERY_SHARD`(已实测 −3%),不再单测 |
 
-冷 prefill 稳定在 ~7,300 tok/s 撬不动。日志里的结构性原因:
+冷 prefill 撬不动。用隔离探针(串行单请求、每次全新文档、无缓存无排队、
+各 2 次重复,两次相差 ~1%)测得的真实速率曲线是**非单调**的:
+
+| prompt | 冷 prefill 速率 | TTFT |
+|---|---|---|
+| 21k | 7,891 tok/s | 2.7s |
+| **63k** | **11,035 tok/s** | 5.7s |
+| **148k** | **11,028 tok/s** | 13.4s |
+| 274k | 9,701 tok/s | 28.3s |
+
+比原先记录的「稳定 ~7,300」要好,峰值在 63k~148k,两端都衰减。
+**测冷 prefill 必须用这种隔离探针** —— 并发压测里的第 0 轮 TTFT 中位
+主要由排队顺序决定:同一组 arm,并发下读到「73.65s → 22.8s,快 3 倍」,
+隔离探针下方向是反的(慢 1.3~3.6%)。
+
+日志里的结构性原因:
 
 ```
 custom_all_reduce.py:237  Custom allreduce is disabled because it's not
@@ -367,6 +388,41 @@ sparse_attn_indexer.py:1082  DeepGEMM not supported on this platform;
 ```
 
 **TP4 all-reduce 只能走 NCCL 绕 PCIe,稀疏 indexer 只能走 Triton 回退 —— sm80 + 无 P2P 的硬伤,没有开关能绕。**
+
+### 4.1 Triton JIT 缓存**不能**放共享 NFS `[实测]`
+
+`docker/run_multinode_sm80.sh` 默认把 `/root/.cache` 与 `/root/.triton`
+挂到 `/nfs-models/vllm-backport-cache*`,本意是「一台热身完其余节点直接复用」。
+**多实例并发下这会把引擎打死**,而且它在两个维度上都更差。
+
+5 个 TP2×PP4 实例(40 个 rank 进程)并发压测时,其中 **2 个**在第一轮就挂:
+
+```
+OSError: [Errno 116] Stale file handle
+  在 deepseek_v4/.../combine_topk_swa_indices 的 Triton kernel 启动处
+→ EngineCore 挂掉 → 之后所有请求 HTTP 500
+```
+
+ESTALE 是 NFS 的错误码。缓存规模决定了这是个元数据密集负载,不是带宽负载 ——
+**1.9 GB / 40,080 个文件**。实测各介质(2000 个 50 KB 文件,写用临时文件 + rename,
+与 Triton 的落盘方式一致):
+
+| 介质 | 写 | 读 |
+|---|---|---|
+| **本地盘** | 2.9s(**690 文件/s**) | **1.0s** |
+| NFS | 24.8s(81 文件/s)**慢 8.5×** | 10.2s **慢 10×** |
+| tmpfs | 2.6s(769 文件/s) | 1.0s |
+
+也就是说共享 NFS 缓存既会打死引擎,读 4 万个文件还慢 10 倍
+(本地约 40s vs NFS 约 200s)——「一台热身完其余复用」实际上在**拖慢**启动。
+
+**结论:用本地盘。** `CACHE_HOST_DIR=/var/cache/vllm-backport`。
+空间不是问题(需要 1.9 GB,节点本地盘空闲 673 GB)。
+
+顺带否掉「NFS 只读种子 + 本地写」这个折中:`cp -r` 那 1.9 GB / 4 万文件
+实测 **191s**,比本地重新 JIT 还贵。
+
+> 机队规模上这是硬约束:35 个实例 × 8 rank = 280 个进程共写一份 NFS 缓存。
 
 ---
 
