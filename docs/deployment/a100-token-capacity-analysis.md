@@ -609,19 +609,57 @@ ACS:                 19 个 PCI 桥中 11 个已启用 —— ACS 会阻断 peer
 —— 剩下的是 ACS + 跨 NUMA,只能在 BIOS/启动参数层面解(`pcie_acs_override`),
 属运维决策。
 
-另外 `mlx5_1` / `mlx5_3` 在本 fabric 上全部报 transport retry 失败,与集群一直
-只设 `NCCL_IB_HCA=mlx5_0,mlx5_2` 的既有结论一致 —— **只有 2 张卡真正通**。
+> **已推翻**:此处原写「`mlx5_1`/`mlx5_3` 全部报 transport retry,只有 2 张卡
+> 真正通」。见下面 §7.5.1 —— 那是**跨轨配对**失败被误读成轨道故障。
+> 4 张卡都能跑满线速。
 
 **所以跨实例 KV 共享要经主机内存中转**,搬一个平均会话(12.5 GB):
 
 ```
 GPU → 主机内存 (PCIe ~20 GB/s)   0.6s
-    → RDMA (2 卡 ~20 GB/s)       0.63s
+    → RDMA (单轨 12.21 GB/s)     1.02s
     → 主机内存 → GPU              0.6s
-                       合计 ≈ 1.8s   vs 重算 12.3s  →  约 7× 快
+                       合计 ≈ 2.2s   vs 重算 12.3s  →  约 5.6× 快
 ```
 
-比 GDR 理想值(~0.8s)差一倍,但仍远优于重算,方案成立。
+比 GDR 理想值(~0.8s)差,但仍远优于重算,方案成立。
+
+### 7.5.1 这是 rail-optimized 拓扑:只能同轨对同轨 `[实测]`
+
+用 mooncake 的 `transfer_engine_bench` 在 gpu31 ↔ gpu32 之间逐轨实测
+(带外 metadata 走管理网的 `mooncake_http_metadata_server`,
+`--use_vram=false`):
+
+| 配对方式 | 结果 |
+|---|---|
+| `--device_name=mlx5_0` 两端同轨 | **12.21 GB/s** |
+| `--device_name=mlx5_1` 两端同轨 | **12.21 GB/s** |
+| `--device_name=mlx5_2` 两端同轨 | **12.21 GB/s** |
+| `--device_name=mlx5_3` 两端同轨 | **12.21 GB/s** |
+| `--auto_discovery`(mooncake 自行配对) | **失败**,读写皆然 |
+
+`auto_discovery` 的报错点明了原因 —— 它尝试的是跨轨路径:
+
+```
+local_nic: mlx5_2, peer_nic: ...@mlx5_1 : transport retry counter exceeded
+local_nic: mlx5_3, peer_nic: ...@mlx5_2 : transport retry counter exceeded
+local_nic: mlx5_3, peer_nic: ...@mlx5_0 : transport retry counter exceeded
+Rail paused: peer=...@mlx5_1 error_count=5 pause_ms=30000
+```
+
+**第 N 条轨只与对端第 N 条轨连通,轨间无路径** —— 标准的 rail-optimized
+组网(每张卡接不同的 leaf 平面,平面之间不互联)。
+
+工程结论:
+
+- **不要开 `--auto_discovery`**,它假设 NIC 之间任意可达
+- MooncakeStore 必须显式指定单轨(或给出只产生同轨配对的
+  `--nic_priority_matrix`),单轨 12.21 GB/s 已满足 §7.4 的判据
+  (搬 12.5 GB 约 1.0s vs 重算 12.3s)
+- 之前记录的 `--auto_discovery` 19.61 GB/s 是只有部分轨恰好同轨配对时的读数,
+  不是可复现的聚合带宽
+- 同理,`NCCL_IB_HCA` 列出多卡本身没问题(NCCL 按 rank 同序配对),
+  但任何假设任意 NIC 互通的工具都会在这个 fabric 上失败
 
 ### 7.6 Mooncake 的安装:三个坑 `[实测]`
 
