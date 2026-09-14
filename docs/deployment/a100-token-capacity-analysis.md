@@ -512,9 +512,9 @@ NCCL_IB_HCA=mlx5_0,mlx5_2  NCCL_IB_GID_INDEX=3  NCCL_ALGO=Ring  NCCL_PROTO=Simpl
 | rail2 `mlx5_2` | ❌ 8 台 100% loss | **11,421~11,686 MiB/s**(线速) |
 | rail3 `mlx5_3` | ❌ 100% loss(全集群双向) | **11,679 MiB/s**(线速) |
 
-**结论:55 台 × 4 轨 RDMA 全部线速,RoCE fabric 完全健康。**
 之前基于 ping 得出的「8 台坏 rail2」「只有 2 条轨可用」「metric 决定可达性」
 「SDN 未下发端口-IP 绑定」全部作废 —— 那些是 ICMP 策略的假象。
+**那 8 台(gpu2/4/6/7/11/15/16/27)四轨 RDMA 全部线速,完全健康。**
 
 正确的检查方式:
 
@@ -537,6 +537,52 @@ ib_write_bw -d mlx5_2 -x 3 -F -D 5 <mgmt-ip>
 > 曾在 gpu1/gpu48 出现 0 个地址)。那种情况下 GID 3 全零,RDMA 真的会断,
 > 用上面的预检一眼能看出来。修复:`nmcli device reapply <iface>`(零中断)。
 > 另外开机后云侧配置有几分钟延迟,**boot 后至少等 10 分钟再判定**。
+
+### 7.4.2 全量 RDMA 巡检结果:3 台机器 5 条轨真坏 `[实测]`
+
+用 `ib_write_bw` 对 **55 台 × 4 轨 = 220 个组合**做了全量实打(28 对配对,
+每台至少作一端)。GID 3 预检 220/220 通过;RDMA 实测结果:
+
+| | 台数 |
+|---|---|
+| 4 轨全部线速(11.4~11.69 GB/s) | **52** |
+| 有轨道 RDMA 不通 | **3** |
+
+坏的具体是:
+
+| 机器 | 坏轨 | 网卡 | 好轨 |
+|---|---|---|---|
+| **gpu10** | rail1、rail2 | `mlx5_1`/`enp194s0f1np1`、`mlx5_2`/`enp226s0f0np0` | rail0、rail3 线速 |
+| **gpu35** | rail3 | `mlx5_3`/`enp226s0f1np1` | 其余三轨线速 |
+| **gpu37** | rail2、rail3 | `mlx5_2`、`mlx5_3` | rail0、rail1 线速 |
+
+故障特征(和「ping 不通」那类假象完全不同):
+
+- QP 建得起来、GID 正常交换,**但数据零字节**,`BW average = 0.00` 后挂住
+- **双向都不通**(嫌疑机作发端、作收端都是 0.00)
+- **换 3 个不同对端复现**(gpu20 / gpu50 / gpu26 / gpu44 全部 0.00),
+  而同一台机器的好轨打同一个对端是线速 → 排除对端与配对因素
+- 计数器只有 `hw_counters/local_ack_timeout_err`(发出去收不到 ACK)
+  和 `req_cqe_error`;`port_rcv_errors`、`port_xmit_discards`、`symbol_error`
+  **全为 0**,链路 100 Gb/sec ACTIVE、MTU 8888
+- 55 台的 `ecn/roce_np`、`traffic_class`、MTU 配置完全一致 → 不是主机配置差异
+
+结论:**本地网卡与主机配置无问题,故障在这 5 个交换机端口的转发路径上**,
+需要云侧处理(与云平台此前自述的「交换机 bug」吻合,但受影响的是这 3 台)。
+
+**在修好之前的规避办法** —— 这 3 台不要用默认的四卡 `NCCL_IB_HCA`,
+否则 NCCL 会在坏轨上挂死:
+
+```bash
+# gpu10
+NCCL_IB_HCA=mlx5_0,mlx5_3
+# gpu35
+NCCL_IB_HCA=mlx5_0,mlx5_1,mlx5_2
+# gpu37
+NCCL_IB_HCA=mlx5_0,mlx5_1
+```
+
+更简单的做法:组多节点实例时直接跳过这 3 台 —— 还有 52 台可用。
 
 ### 7.5 RDMA 通道实测:可用,但 GPU-Direct 被硬件挡住 `[实测]`
 
