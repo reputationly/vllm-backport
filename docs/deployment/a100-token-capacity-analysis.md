@@ -30,6 +30,11 @@
 | 900k 深度召回崩到 30%/0% | **我的 `max_tokens=64` 截断造成的假象。给足预算后 862k 深度 10/10 全中**(§3.9) |
 | 随机文本会虚高吞吐 ~35% | 方向反了,自然文本还略快(§3.9) |
 | 「8 台机器 rail2 坏了 / 只有 2 条轨可用 / metric 决定可达性 / SDN 没下发端口-IP 绑定」 | **全部作废。RoCE 从没坏过 —— 55 台 × 4 轨 RDMA 全部线速 11.4~11.7 GB/s。是我拿 ping 当健康判据,而 ICMP 与 RoCEv2(UDP/4791)是两条策略路径(§7.4.1)** |
+| 合成基准上 TP4×PP2 的 decode 每卡快 36%,该换回去 | **真实形状下反而慢 22.1%**(计费 2409.9 vs 3092.5 tokens/s/卡),轮0 TTFT +49.6s。合成基准的输入:输出是 2.5:1,线上是 100:1(§3.6.1) |
+| `--max-num-batched-tokens` 提到 8192 能提吞吐 | 1M 下**装不下**(需 5.07 GiB > 可用 5.06 GiB,启动失败);4096 能装但 −1.7% 且吃掉 41% KV 池(§3.6.1) |
+| 卸载缓冲区实用上限是 150 GiB | **上限是 `cudaHostRegister` 的注册次数(约 4.5 万次/进程),不是固定 GiB 数。** 它随 chunk 大小变,而 chunk 大小随并行配置变。本配置下 150 GiB 需 70,595 次,实测失败(§3.3) |
+| 投机解码 `num_speculative_tokens` 从 5 降到 3 有 +5.8% | 真实形状下 **−0.2%**,噪声下限的 1/27。那 +5.8% 来自合成基准(§3.6.1) |
+| GPU KV 池越大命中率越高 | **无关。** KV 池小 20% 时命中率完全相同(79.5% vs 79.4%)—— 淘汰的前缀落到宿主内存那层,重入 2.79s vs GPU 热态 2.70s(§3.10) |
 
 两条方法论教训:
 
@@ -45,6 +50,18 @@
    批量 ping 超时当可达性判据、ICMP 当 RoCE 健康判据。前两次浪费时间,
    第三次更严重 —— 为一个不存在的故障重启了 6 台生产机、改了 7 台的路由。
    **要测 RDMA 就用 `ib_write_bw`,要测召回就给足预算,不要用替代信号。**
+6. **合成基准的 workload 形状不匹配线上时,结论可能符号相反 —— 不是偏差,是反的。**
+   同一对配置(TP2×PP4 vs TP4×PP2),合成基准(输入:输出 2.5:1、强制 cache miss)
+   得出 TP4×PP2 **赢 36%**;真实会话形状(输入:输出 ~100:1、命中率 79.4%)得出
+   TP4×PP2 **输 22.1%**。原因是线上的 prompt 九成被缓存省掉,真实开销集中在
+   轮0/轮1 的冷 prefill,而合成基准把 decode 的权重放大了约 40 倍。
+   **任何拓扑 / 调度 / 投机解码参数的决策,必须用 §3.2 那套会话形状回放复核。
+   单请求或短输出的合成基准只能用来定位现象,不能用来做决策。**
+7. **一个端点上只能有一个压测客户端。** 实例启动失败后我在同一端口重开,
+   而上一轮的 poller 还在轮询,于是两个客户端同时发压 —— 并发翻倍、TTFT 从
+   4.75s 读成 103.44s,整组数据作废。重开必须换端口,或先确认旧 poller 已退出。
+   并行测多臂时**每臂配一个独立客户端节点**:一个 Python 进程驱动 24 路
+   19 万 token 的 SSE 长流,客户端自己就是瓶颈,测出来的 TTFT 全是排队时间。
 
 ---
 
@@ -183,8 +200,45 @@ gpu45+47 卸载 + `PP_LAYER_PARTITION=24,19` → 370.3s / 2295.1(PP 分区**变�
 ... or set VLLM_KV_OFFLOAD_REGION_BACKEND=memfd
 ```
 
-`memfd` 后端可突破 `/dev/shm`,但 200 GiB 会在 `cudaHostRegister` 撞宿主内存墙
-(41270/51200 chunk ≈ 161 GiB 处失败)。**实用上限约 150 GiB。**
+`memfd` 后端可突破 `/dev/shm`,但会在 `cudaHostRegister` 处撞墙。
+
+**墙是注册次数,不是字节数,也不是剩余内存 `[2026-09-15 修正]`**
+
+原先这里写的是「实用上限约 150 GiB」。那个数字只在当时那组 chunk 大小下成立,
+不是通用上限。三次实测:
+
+| flag | chunk 大小 | 总 chunk 数 | 结果 |
+|---|---|---|---|
+| **75**(现网) | 2.28 MB | 35,297 | ✅ `pinned 35297 chunks in 35297 registrations (10.06 GB)` |
+| 150 | 2.28 MB | 70,595 | ❌ rank0 死在 59365、rank1 死在 45452 |
+| 300 | 2.28 MB | 141,190 | ❌ 死在 49419 |
+| 200(旧配置) | 4.19 MB | 51,200 | ❌ 死在 41270(≈161 GiB) |
+
+失败点全部落在 **4.1~5.9 万次注册**,而 chunk 大小差 1.8 倍、失败时的已注册字节
+从 56 GB 到 173 GB 不等。失败时宿主机 251 GiB 里还空着 176 GiB —— **和内存余量无关**。
+
+```python
+# vllm/v1/kv_offload/cpu/spec.py:104-120
+num_copies = 1 if replicated_layout else world_size
+kv_bytes_per_chunk = worker_kv_bytes_per_block * num_copies * blocks_per_chunk
+num_chunks = int(cpu_bytes_to_use) // round_up(kv_bytes_per_chunk, BLOCK_SIZE_ALIGNMENT)
+```
+
+`chunk` 大小由 `world_size`、`blocks_per_chunk`、每 block 的 KV 字节共同决定,
+**换并行配置就会变**。所以可填的最大 GiB 也跟着变:
+
+```
+可填上限 ≈ 45,000 × chunk 大小
+本配置(TP2×PP4,chunk 2.28 MB)→ 约 100 GB ≈ 95 GiB
+```
+
+**现网填 75(35,297 次注册)已经贴着天花板,没有加的空间。** 想榨到 90 也可以
+(约 42,000 次),但按下表 8 会话量级的收益只有 1.4%(噪声),而撞墙的代价是
+实例 pending 十几分钟后才失败,比直接报错更难排查。不值得。
+
+> 这也解释了 §6 那句「TP4×PP2 用 150,TP2×PP4 必须减半到 75」**是对的**。
+> 我曾按代码算式推断「每节点只 pin flag/2,所以能填 300」,实测 300 和 150 都失败。
+> 推导输给实测。
 
 | 卸载大小 | 8 会话 | 24 会话 |
 |---|---|---|
@@ -282,6 +336,88 @@ TP2×PP4: 实测 16 会话(约 2.2M token)仍然健康 → 上限至少 16 个�
 `TP1×PP8` 起不来:`No available memory for the cache blocks`。TP1 时每卡要独自承担
 全部 8192 token 的激活(无 TP 分片),显存不够。用批 2048 可重试,但 TP2×PP4 已够用。
 
+### 3.6.1 六个候选的全量对照:全部否掉 `[实测 2026-09-15]`
+
+起因是和同事的线上实例(同为 8 卡跨 2 节点、A100-PCIE-40GB)正面对比,发现
+**decode 每卡我们 40.2、他们 57.9(−31%)**。为定位原因,在 gpu31-40 上手工起了
+五个隔离对照臂(各 8 卡、独占 2 台机器),与现网配置逐变量对比。
+
+**配置差异(同事 vs 我们)**
+
+| | 我们(现网) | 同事 |
+|---|---|---|
+| TP × PP | **2 × 4** | **4 × 2** |
+| `--max-num-batched-tokens` | **2048** | **8192** |
+| `--max-model-len` | **1,048,576** | 400,000 |
+| `--kv-offloading-size` | **75** | 无 |
+| `--disable-custom-all-reduce` | 有 | 无 |
+| KV 池 | **3,611,775**(并发 3.44×) | 539,151(并发 1.35×) |
+| 累计前缀命中率 | — | **89.3%**(生产流量积累) |
+| 思维链字段 | `reasoning_content` | `reasoning` |
+
+**第一阶段:合成基准(并发 32,prompt≈1k,out≤1024,唯一前缀强制 miss)**
+
+| 臂 | 上下文 | 批 | 拓扑 | spec | decode 每卡(热) | TTFT | KV 池 |
+|---|---|---|---|---|---|---|---|
+| 现网 | 1M | 2048 | TP2×PP4 | 5 | 40.2 | 4.20s | 3,611,775 |
+| **D** 基线复现 | 1M | 2048 | TP2×PP4 | 5 | **41.2** | 4.16s | 3,611,775 |
+| A' | 400K | 8192 | TP2×PP4 | 5 | 40.8 | 4.75s | 528,476 |
+| **C** | 1M | 2048 | **TP4×PP2** | 5 | **55.9** | 6.03s | 2,890,000 |
+| E | 1M | **4096** | TP2×PP4 | 5 | 40.5 | 4.31s | 2,126,396 |
+| F | 1M | 2048 | TP2×PP4 | **3** | 43.6 | 4.43s | 3,607,724 |
+| 同事参照 | 400K | 8192 | TP4×PP2 | 5 | 57.9 | 5.96s | 539,151 |
+
+D 复现出现网的 41.2 vs 40.2(差 2.5%),基线可信。合成基准的结论是
+**「差距全在拓扑」**:A' 把上下文和批预算一起改只动了 +1.5%,而 C 换拓扑 +36%。
+
+**第二阶段:真实会话形状回放(8 会话 × 5 轮,文档按 §1.2 分位点采样,均值 19 万 prompt)**
+
+这一步推翻了第一阶段的结论。三臂并行、**每臂独立客户端节点**:
+
+| 臂 | 计费 tokens/s/卡 | 均值 | vs 现网 | 轮0 TTFT | 轮1 | 轮2-4 | 命中率 |
+|---|---|---|---|---|---|---|---|
+| **D** 现网配置 | 3052.9 / 3028.3 / 3196.4 | **3092.5** | — | 69.7s | 2.91s | 2.4~2.8s | 79.4% |
+| **F** spec 3 | 3056.3 / 3116.3 | **3086.3** | **−0.2%** | 72.8s | 2.96s | 2.4~2.7s | 79.4% |
+| **C** TP4×PP2 | 2293.3 / 2526.4 | **2409.9** | **−22.1%** | **119.3s** | **34.3s** | 2.5~2.6s | 79.5% |
+
+D 三次跨度 3028.3~3196.4 = **5.5%,这是本 harness 的噪声下限**。
+
+harness 的形状与线上对得上,所以它的结论可采信:
+
+| | 本 harness | 线上真实流量(§1.1) |
+|---|---|---|
+| 前缀命中率 | 79.4% | 77.3% |
+| 计费:算力 | 4.80:1 | 4.26:1 |
+| 轮2 起 TTFT | 2.4~2.8s | §3.2 实测 1.3~3.6s |
+
+**结论表**
+
+| 候选 | 判据 | 结论 |
+|---|---|---|
+| 批预算 8192 + 1M | 需 5.07 GiB > 可用 5.06 GiB,`_check_enough_kv_cache_memory` 启动失败 | **物理不可能** |
+| 批预算 4096 | 合成 −1.7%,代价 41% KV 池(3.61M→2.13M) | 否 |
+| 上下文 400K | decode 40.8 vs 41.2,和批预算一起改也只 +1.5% | **不是杠杆** |
+| **拓扑 TP4×PP2** | **真实形状计费 −22.1%(两次都输),轮0 TTFT +49.6s、轮1 +31.4s** | **否** |
+| **spec 5→3** | **真实形状 −0.2%**(合成基准的 +5.8% 是假信号) | **否** |
+| 卸载 150 / 300 | `cudaHostRegister` 注册次数撞墙(§3.3) | **物理不可能** |
+
+**`--max-num-batched-tokens` 这条线彻底关闭:1M 下 2048 是唯一可行值,而且提高它
+对 decode 毫无帮助。** §6 原先那句「批预算要降到 2048…只影响冷 prefill 2~5%」的
+前半句是硬约束(不是偏好),后半句的适用范围只限冷 prefill —— 但补测表明它对并发
+decode 也没有影响,所以这个取舍比原先描述的更便宜。
+
+**投机解码的接受率与 spec 深度**
+
+| spec | 接受率 | 每步接受 tok(上限 spec+1) |
+|---|---|---|
+| 5 | 28.1~28.9% | 2.41~2.44 |
+| 3 | 40.8~41.7% | 2.22~2.25 |
+
+画 5 个 draft 只中 28%,减到 3 个能中 42% —— 后两个位置基本浪费。但每步接受量
+从 2.43 降到 2.25,两者抵消,真实形状下净效果 −0.2%。**保持 5。**
+同事那台在同一批请求下的增量接受率是 27.3%,与我们的 28.9% 一致,
+**排除了「draft 质量差异」这个怀疑对象**。
+
 ---
 
 ## 3.7 1M 多轮累积:已验证 `[实测]`
@@ -291,6 +427,10 @@ TP2×PP4: 实测 16 会话(约 2.2M token)仍然健康 → 上限至少 16 个�
 
 配置 TP2×PP4 / `max-model-len 1048576` / 批 2048,KV 池 **3,406,162 token**(并发 3.25×),
 每轮追加 2 万 token,连续 50 轮:
+
+> `[2026-09-15 更新]` 这个 KV 池数字来自 09-12 的构建。同一套参数在 `85d0e70c`
+> (09-14)上实测是 **3,611,775 token / 并发 3.44×**,多 6%。现网 gpustack 实例与
+> 手工起的隔离对照臂都是这个数,两台不同机器上完全一致。
 
 | `VLLM_DSV4_LOGITS_ROW_CHUNK` | 最终深度 | 第50轮 TTFT | 结果 |
 |---|---|---|---|
@@ -343,6 +483,62 @@ TP2×PP4: 实测 16 会话(约 2.2M token)仍然健康 → 上限至少 16 个�
 
 ---
 
+## 3.10 GPU KV 池的真实作用:是并发天花板,不是命中率 `[实测 2026-09-15]`
+
+开了 `--kv-offloading-size` 之后,KV 变成两层:GPU 是一级,宿主内存是二级。
+两层的容量关系要按**全局**口径算,别按每节点:
+
+```
+一级(GPU)   = 8 卡 × 11.46 GiB = 91.7 GiB 全局
+二级(宿主)  = cpu_bytes_to_use = 75 GiB 全局
+              每节点 mmap 一份 80.53 GB 的 region(sparse),
+              但每个 rank 只 pin 自己的 1/8 切片:10.06 GB × 8 = 80.5 GB = 75 GiB
+              每节点实际 pin = 4 个本地 rank × 10.06 = 40.24 GB
+```
+
+**所以二级是一级的 0.82 倍,略小,不是更大。** 曾误算成「每节点 75 GiB × 2 节点
+= 150 GiB、比一级大 1.6 倍」—— 那是把全局量当成了每节点量。
+
+§3.6.1 的三臂给出了直接证据 —— **KV 池差 20%,命中率完全相同**:
+
+| 臂 | GPU KV 池 | 1M 并发 | 真实形状命中率 |
+|---|---|---|---|
+| D | 3,611,775 | 3.44× | **79.4%** |
+| C | 2,890,000(**−20%**) | 2.76× | **79.5%** |
+| E | 2,126,396(**−41%**) | 2.03× | (合成臂,未跑形状) |
+
+配合 §3.1 的淘汰重入实测(GPU 热态 **2.70s** vs 被挤出后重入 **2.79s**,只差 3%,
+比重算的 106.34s 快 38 倍),结论是:
+
+> **被挤出 GPU 的前缀不会丢,落到宿主内存那层,命中照样算命中。
+> 所以 GPU KV 池的大小不决定命中率。**
+
+那它决定什么?**高并发时的人均上下文上限。** 每个在跑的请求,上下文里每个 token
+的 KV 都要驻留到请求结束:
+
+```
+3,611,775 ÷ max_num_seqs(32) = 每条请求平均 112,868 token
+```
+
+**32 并发时人均上下文超过约 11.3 万就开始抢占。** 对照 §1.2 的线上分布:
+
+| | prompt tokens | 32 并发时 |
+|---|---|---|
+| 中位 | 39,543 | 安全(用 35%) |
+| **P75** | **271,849** | **超 2.4 倍** |
+| P90 | 490,194 | 超 4.3 倍 |
+
+§3.6.1 那几轮(8 会话 × 19 万 = 1.59M,占池子 44%)**抢占次数全部为 0**,
+说明当前并发水平下这个天花板还没碰到。
+
+**评估「用 KV 容量换别的东西」这类选项时,不要按 KV token 数的降幅算损失。**
+要看两件事:二级缓存是否装得下被挤出的部分(现在余量充足),以及并发是否高到
+让容量真正成为约束(§3.3:8 会话下 100/150 GiB 无差别,24 会话才差 13.9%)。
+C 臂输掉 22.1% 与它少 20% 的 KV 池**无关** —— 它输在冷 prefill(轮0 TTFT
+119.3s vs 69.7s)。
+
+---
+
 ## 4. 无效与失败的尝试 `[实测]`
 
 | 尝试 | 结果 |
@@ -360,6 +556,11 @@ TP2×PP4: 实测 16 会话(约 2.2M token)仍然健康 → 上限至少 16 个�
 | **`--kv-cache-dtype fp8_ds_mla`**(对照通用 `fp8`) | **打平**(+0.5%,噪声内),但冷 TTFT 更差(81.5s vs 73.7s) |
 | **`VLLM_DISABLE_MULTI_STREAM_PARALLEL=1`** | **−6.6%** —— 多流重叠是有效的,别关 |
 | **`VLLM_DISABLE_SHARED_EXPERTS_STREAM=1`** | **−1.8%** —— 同上,别关 |
+| **拓扑 TP4×PP2**(2026-09-15 复测) | **真实形状计费 −22.1%**,轮0 TTFT +49.6s。合成基准上它 decode +36%,是假信号(§3.6.1) |
+| **`--max-num-batched-tokens` 4096 / 8192**(1M 下) | 4096 **−1.7%** 且吃掉 41% KV 池;8192 **启动失败**(需 5.07 GiB > 可用 5.06 GiB)(§3.6.1) |
+| **`num_speculative_tokens` 5→3** | 真实形状 **−0.2%**。接受率从 28% 涨到 42%,但每步接受量从 2.43 降到 2.25,抵消(§3.6.1) |
+| **`--max-model-len` 降到 400K** | decode 无变化(40.8 vs 41.2)。上下文长度不是产能杠杆,而 400K 只覆盖 ~46% 计费量(§1.3) |
+| **`--kv-offloading-size` 150 / 300** | `cudaHostRegister` 注册次数撞墙(约 4.5 万次/进程),75 已贴天花板(§3.3) |
 | `VLLM_SPARSE_PREFILL_EXACT_TILE=1` | **读代码即排除**:生效条件是 `num_heads == BLOCK_H`,注释注明只在 TP=8 成立,TP=2 下是空操作 |
 | `VLLM_INDEXER_QUERY_SHARD_QPATH=1` | 依赖 `VLLM_INDEXER_QUERY_SHARD`(已实测 −3%),不再单测 |
 | **`VLLM_MHC_POST_FUSE_SQRSUM=1`** | **引擎起不来**:`tilelang.py:867` 导入的 `mhc_post_sqrsum_tilelang` 在 `tilelang_kernels.py` 里**根本没有定义**,且无 Triton 回退。本硬件无 DeepGEMM,必然走进这条坏分支 |
@@ -510,12 +711,112 @@ T(r) = (r+1) / (r/p + 1/d)
 环境变量:
 VLLM_DETERMINISTIC_MOE_ALIGN=0                 # +9%
 VLLM_KV_OFFLOAD_REGION_BACKEND=memfd           # 卸载 >125 GiB 时必需
-NCCL_IB_HCA=mlx5_0,mlx5_2  NCCL_IB_GID_INDEX=3  NCCL_ALGO=Ring  NCCL_PROTO=Simple
+VLLM_REASONING_OUTPUT_AS_REASONING_CONTENT=1   # 无感知切换必需,见 §2.2
+NCCL_IB_GID_INDEX=3  NCCL_ALGO=Ring  NCCL_PROTO=Simple
+# NCCL_IB_HCA 不必再裁成 mlx5_0,mlx5_2 —— 4 轨都是线速(§7.4.1)
 # 不要设 VLLM_PP_LAYER_PARTITION(真实形状下变慢)
 ```
 
-> **本文全部结论均未修改引擎源码**,只调整了启动参数与环境变量。
-> 验证:`git diff --stat HEAD` 为空,`vllm/ csrc/ cmake/ setup.py` 均无改动。
+> **`--max-model-len` 填 524288 还是 1048576?**
+> 1M 已实测可用(§3.7:50 轮累积到 1,006,903,针召回 100%),所以**能填 1M**,
+> 而且填了就不必在网关做长度分流(1M 覆盖 99.7% 请求 / 98.3% 计费量)。
+> 代价:批预算**必须**降到 2048(§3.7 那组就是 `max-model-len 1048576` + 批 2048)。
+> 这是硬约束不是偏好 —— 1M + 批 8192 启动就失败(需 5.07 GiB KV > 可用 5.06 GiB),
+> 4096 能起但吃掉 41% 的 KV 池且 −1.7%(§3.6.1)。
+> 而这个代价比原先以为的更小:批预算 8192→2048 不仅只影响冷 prefill 2~5%(§4),
+> 对**并发 decode 也没有影响**(400K 下 8192 与 2048 分别是 40.8 / 41.2 每卡,§3.6.1)。
+> 贵的是 `max-model-len` 本身:400K→1M 在批 8192 下要多花 5.57 GiB/卡,
+> 因为 sparse indexer 元数据与 CUDA graph 地址空间都随它线性增长。
+> 512K 的唯一理由是「只想覆盖 90.9% 请求 / 62.3% 计费量、把长尾推给供应商」。
+> **默认建议 1M**,除非明确要做长度分流。
+
+> **上面这份配置不需要改引擎源码**,只是启动参数与环境变量。
+>
+> 但本轮调优确实产生了两个引擎改动,都与上面的配置无关(默认不生效):
+>
+> | commit | 内容 | 上线是否需要 |
+> |---|---|---|
+> | `f1c429fd8` | `VLLM_REASONING_OUTPUT_AS_REASONING_CONTENT`:思维链按 `reasoning_content` 输出 | **需要**(无感知切换,见 §2.2) |
+> | `9a53df78b` | 修 `VLLM_UNREPLICATE_ATTN_GEMMS` 会崩引擎的 bug | 不需要(该开关已否,见 §4) |
+
+### 6.1 在 GPUStack 上怎么填这些参数 `[已核对源码]`
+
+GPUStack 托管的实例不走 `docker/run_multinode_sm80.sh`,参数填在**模型的两个字段**里。
+
+**① 后端参数 → 模型的 `backend_parameters`(UI 里"后端参数"那一栏)**
+
+填法就是把上面那串命令行参数**逐个 token** 填进去,GPUStack 会自己规范化成
+`--k=v`(`utils/command.py:170 format_backend_parameters`):
+
+```
+--tensor-parallel-size=2
+--pipeline-parallel-size=4
+--max-model-len=524288
+--max-num-batched-tokens=8192
+--max-num-seqs=32
+--gpu-memory-utilization=0.85
+--block-size=256
+--kv-cache-dtype=fp8
+--enable-prefix-caching
+--kv-offloading-size=75
+--kv-offloading-backend=native
+--enable-expert-parallel
+--speculative-config={"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"greedy"}
+--tokenizer-mode=deepseek_v4
+--reasoning-parser=deepseek_v4
+--tool-call-parser=deepseek_v4
+--enable-auto-tool-choice
+--chat-template-content-format=string
+--enable-prompt-tokens-details
+--trust-remote-code
+--disable-custom-all-reduce
+```
+
+**TP/PP 必须自己填。** GPUStack 会按显存自己算一组
+(`worker/backends/base.py:1270 cal_distributed_parallelism_arguments`),但注入时走
+`extend_args_no_exist`(`utils/command.py:137`)—— **只在用户没填时才补**,所以我们填了
+就以我们的为准。不填的话它大概率给出 TP4×PP2,而那比 TP2×PP4 慢 51.6%(§3.6)。
+
+**`--enable-prompt-tokens-details` 必须显式加。** 它默认关
+(`cli_args.py:132`),不开的话 `usage.prompt_tokens_details.cached_tokens` 恒为空,
+new-api 会把全部 prompt 按 ¥3.00 计价 —— **客户账单高 3.81 倍**(§1.1)。
+
+**② 环境变量 → 模型的 `env`(UI 里"环境变量")**
+
+```
+VLLM_DETERMINISTIC_MOE_ALIGN=0
+VLLM_KV_OFFLOAD_REGION_BACKEND=memfd
+VLLM_REASONING_OUTPUT_AS_REASONING_CONTENT=1
+NCCL_IB_GID_INDEX=3
+NCCL_ALGO=Ring
+NCCL_PROTO=Simple
+```
+
+注入点在 `worker/backends/base.py:540`(`env.update(self._model.env)`),会覆盖
+worker 自身继承的同名变量。
+
+**`NCCL_IB_HCA` 可以不填。** 55 台 × 4 轨 RDMA 都是线速(§7.4.1),不需要像原来那样
+裁成 `mlx5_0,mlx5_2`。唯一的例外是 §7.4.2 那种单轨故障未修复的机器,那时按坏轨裁剪。
+
+**不要填的**:`--enforce-eager`(会关掉 CUDA graph)、`VLLM_PP_LAYER_PARTITION`
+(真实形状下变慢,§0)、`--default-chat-template-kwargs`(死配置,`tokenizer_config.json`
+里零匹配)。
+
+**③ JIT 缓存不用管**
+
+§4.1 说的「Triton 缓存不能放共享 NFS」**不适用于 GPUStack 托管的实例**:它把
+`VLLM_CACHE_ROOT` 指向 `<data_dir>/cache/vllm`(`worker/backends/vllm.py:416`),而
+worker 的 data_dir 是 `/var/lib/gpustack` → docker volume → **本地盘**。那个 ESTALE
+问题只出在我自己那个把 `/root/.cache` 挂到 NFS 的多节点脚本上。
+
+> 只有一处值得显式设:`VLLM_CACHE_ROOT` 管的是 vLLM 自己的缓存,Triton 的 JIT 缓存
+> 是否也落在同一路径取决于版本。若在日志里看到 `Stale file handle`,就在 `env` 里加
+> `TRITON_CACHE_DIR=/var/lib/gpustack/cache/triton` 显式钉到本地盘。
+
+**④ 一个实例 = 2 个节点 × 4 卡**
+
+TP2 × PP4 = 8 卡。GPUStack 的调度器按 `computed_resource_claim` 分配,确认它把
+8 张卡分在**两台**机器上(每台 4 张),而不是别的切法。
 
 ---
 
