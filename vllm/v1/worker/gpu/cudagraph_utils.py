@@ -42,6 +42,7 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import maybe_prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
+from vllm.v1.worker.gpu.pp_utils import clear_first_stage_only_inputs
 from vllm.v1.worker.utils import AttentionGroup, clear_layer_kv_caches
 
 if TYPE_CHECKING:
@@ -609,9 +610,9 @@ class ModelCudaGraphManager(CudaGraphManager):
                 **model_state.prepare_dummy_inputs(num_reqs, num_tokens),
             }
             if not self.is_first_pp_rank:
-                # Update for non-first PP ranks.
-                model_inputs["input_ids"] = None
-                model_inputs["inputs_embeds"] = None
+                # Update for non-first PP ranks. Must match the eager builder in
+                # GPUModelRunner.execute_model, or replay diverges from eager.
+                clear_first_stage_only_inputs(model_inputs, model)
                 assert intermediate_tensors is not None
                 model_inputs["intermediate_tensors"] = intermediate_tensors[:num_tokens]
 

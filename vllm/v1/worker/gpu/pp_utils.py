@@ -4,11 +4,14 @@
 
 from collections import deque
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 from vllm.distributed.parallel_state import get_pp_group
+from vllm.model_executor.models.interfaces import requires_raw_input_tokens
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
@@ -32,6 +35,33 @@ class PendingRecv:
     # detect requests aborted since then.
     gen_at_receive_np: np.ndarray  # [num_reqs]
     draft_tokens: torch.Tensor | None = None  # [num_reqs, num_speculative_steps]
+
+
+def clear_first_stage_only_inputs(
+    model_inputs: dict[str, Any], model: nn.Module
+) -> None:
+    """Null out the model inputs that only the first PP stage consumes.
+
+    Later stages receive ``intermediate_tensors`` instead of embedding the
+    prompt themselves, so ``inputs_embeds`` is always dropped. ``input_ids``
+    is only dropped for models that do not route on raw token ids: a model
+    declaring ``requires_raw_input_tokens`` needs them on *every* stage (e.g.
+    DeepSeek-V4-Flash-Vision-Exp applies a per-layer MoE routing bias at image
+    sentinel positions), and its later-stage layers raise without them. Keeping
+    them is free because ``input_ids`` is populated on all PP ranks.
+
+    Both the eager input builder and the CUDA-graph capture input builder must
+    go through here. When the two disagree, a model that tolerates a missing
+    ``input_ids`` silently bakes the wrong routing branch into the captured
+    graph instead of failing.
+
+    Args:
+        model_inputs: Forward kwargs, mutated in place.
+        model: The model being run, queried for ``requires_raw_input_tokens``.
+    """
+    if not requires_raw_input_tokens(model):
+        model_inputs["input_ids"] = None
+    model_inputs["inputs_embeds"] = None
 
 
 def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:

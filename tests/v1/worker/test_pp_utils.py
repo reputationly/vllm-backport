@@ -93,6 +93,66 @@ def test_decode_row_ahead_of_a_prefill_chunk():
 
 
 # ---------------------------------------------------------------------------
+# clear_first_stage_only_inputs: which forward kwargs later PP stages keep
+# ---------------------------------------------------------------------------
+
+
+class _RawTokenModel:
+    """Stands in for a model that routes on raw token ids, e.g. the
+    DeepSeek-V4 vision variant biasing MoE routing at image sentinels."""
+
+    requires_raw_input_tokens = True
+
+
+class _PlainModel:
+    pass
+
+
+def _first_stage_inputs():
+    return {
+        "input_ids": "TOKENS",
+        "inputs_embeds": "EMBEDS",
+        "positions": "POSITIONS",
+    }
+
+
+def test_raw_token_model_keeps_input_ids_on_later_stages():
+    """Later stages of a raw-token model still need the token ids.
+
+    Both the eager builder (GPUModelRunner.execute_model) and the CUDA graph
+    capture builder (ModelCudaGraphManager.capture) null these kwargs. When the
+    two disagree, a model that tolerates a missing `input_ids` bakes the wrong
+    routing branch into the captured graph instead of failing, so the contract
+    is pinned here rather than in either (CUDA-only) builder.
+    """
+    model_inputs = _first_stage_inputs()
+
+    pp_utils.clear_first_stage_only_inputs(model_inputs, _RawTokenModel())
+
+    assert model_inputs["input_ids"] == "TOKENS"
+    assert model_inputs["inputs_embeds"] is None
+
+
+def test_plain_model_drops_input_ids_on_later_stages():
+    """Unchanged behaviour: a model that embeds only on stage 0 loses both."""
+    model_inputs = _first_stage_inputs()
+
+    pp_utils.clear_first_stage_only_inputs(model_inputs, _PlainModel())
+
+    assert model_inputs["input_ids"] is None
+    assert model_inputs["inputs_embeds"] is None
+
+
+@pytest.mark.parametrize("model", [_RawTokenModel(), _PlainModel()])
+def test_other_forward_kwargs_are_untouched(model):
+    model_inputs = _first_stage_inputs()
+
+    pp_utils.clear_first_stage_only_inputs(model_inputs, model)
+
+    assert model_inputs["positions"] == "POSITIONS"
+
+
+# ---------------------------------------------------------------------------
 # PPHandler relay: sender and receiver must stay in lockstep on every step
 # ---------------------------------------------------------------------------
 
