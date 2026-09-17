@@ -254,3 +254,10 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# 内部运营文档:含定价、毛利、客户与内网拓扑,本仓是公开 fork,不要提交
+/HANDOFF-*.md
+/docs/deployment/a100-token-capacity-analysis.md
+/docs/deployment/five-way-endpoint-benchmark.md
+/docs/deployment/vision-exp-bringup.md
+/docs/deployment/*.xlsx
