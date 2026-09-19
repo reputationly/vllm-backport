@@ -469,9 +469,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             topk_indices_physical[:, 0] = topk_indices_physical[:, 0].masked_fill(
                 empty_rows, 0
             )
-            topk_lens = (
-                seq_lens.clamp(min=1) if needs_empty_query_guard else seq_lens
-            )
+            topk_lens = seq_lens.clamp(min=1) if needs_empty_query_guard else seq_lens
             extra_kwargs["sparse_mla_top_k_lens"] = topk_lens
 
         kernel_out = trtllm_batch_decode_with_kv_cache_mla(
