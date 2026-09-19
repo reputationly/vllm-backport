@@ -491,10 +491,21 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
 
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
+            # The kernel only gathers rows -- it never does arithmetic on the
+            # values -- so hand it byte views of any single-byte weight dtype.
+            # Triton gates `float8_e4m3fn` (fp8e4nv) on sm90+, which would
+            # otherwise fail to compile here even though the copy is dtype
+            # agnostic. uint8 has identical width and layout, so the gather is
+            # bit-exact and the caller still sees `output` in its own dtype.
+            weight_arg = self._uva_weight
+            output_arg = output
+            if weight_arg.element_size() == 1 and weight_arg.dtype != torch.uint8:
+                weight_arg = weight_arg.view(torch.uint8)
+                output_arg = output.view(torch.uint8)
             _lookup_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
-                self._uva_weight,
+                weight_arg,
                 flat_ids,
-                output,
+                output_arg,
                 self.embedding_dim,
                 self.shard_indices.org_vocab_start_index,
                 self.shard_indices.org_vocab_end_index,
