@@ -75,6 +75,25 @@ from vllm.v1.worker.worker_base import WorkerWrapperBase
 logger = init_logger(__name__)
 
 
+def _describe_exception(exc: BaseException) -> str:
+    """Render a worker exception for transport to the executor.
+
+    `str(exc)` alone collapses to "" for exceptions carrying no message (bare
+    asserts, several torch/CUDA errors), which surfaces to the user as
+    "Worker failed with error ''" -- the type and traceback only ever reach
+    that worker's own log, and for non-`output_rank` ranks not even that.
+    Always carry the type, and the traceback when one is attached.
+    """
+    message = str(exc) or repr(exc)
+    described = f"{type(exc).__name__}: {message}"
+    if exc.__traceback__ is not None:
+        formatted = "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        )
+        described = f"{described}\n{formatted}"
+    return described
+
+
 class FutureWrapper(Future):
     def __init__(
         self,
@@ -1018,7 +1037,7 @@ class WorkerProc:
                 output = e
 
         if isinstance(output, Exception):
-            result = (WorkerProc.ResponseStatus.FAILURE, str(output))
+            result = (WorkerProc.ResponseStatus.FAILURE, _describe_exception(output))
         else:
             result = (WorkerProc.ResponseStatus.SUCCESS, output)
         if (response_mq := self.worker_response_mq) is not None:
