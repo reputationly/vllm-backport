@@ -51,7 +51,9 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 60
+    # 60 分钟没有余量:app 层构建实测 45 分钟起步,runner 慢一点就会在
+    # "Build and push app layer" 中途被砍,发不出镜像也看不到失败原因。
+    timeout-minutes: 120
     permissions:
       contents: write   # 建 GitHub Release
     steps:
