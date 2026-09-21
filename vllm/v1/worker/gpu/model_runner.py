@@ -138,7 +138,7 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
-from vllm.v1.worker.gpu.pp_utils import PPHandler, clear_first_stage_only_inputs
+from vllm.v1.worker.gpu.pp_utils import PPHandler
 from vllm.v1.worker.gpu.sample.batch_shard import (
     BatchSharder,
     all_to_all_logits,
@@ -1798,7 +1798,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         }
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
-            clear_first_stage_only_inputs(model_inputs, self.model)
+            # Models that declare `requires_raw_input_tokens` need the raw token
+            # ids on every layer, not just on the first PP stage (e.g. the
+            # DeepSeek-V4 vision MoE gate routes image sentinel tokens with
+            # `bias_vl`). `input_ids` is `input_batch.input_ids`, assigned
+            # unconditionally above, so it is valid on every rank.
+            if not requires_raw_input_tokens(self.model):
+                model_inputs["input_ids"] = None
+            model_inputs["inputs_embeds"] = None
 
             # Prepare the intermediate tensors.
             assert intermediate_tensors is not None

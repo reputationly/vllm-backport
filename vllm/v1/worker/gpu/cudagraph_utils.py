@@ -30,6 +30,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.models.interfaces import requires_raw_input_tokens
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -42,7 +43,6 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import maybe_prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
-from vllm.v1.worker.gpu.pp_utils import clear_first_stage_only_inputs
 from vllm.v1.worker.utils import AttentionGroup, clear_layer_kv_caches
 
 if TYPE_CHECKING:
@@ -610,9 +610,14 @@ class ModelCudaGraphManager(CudaGraphManager):
                 **model_state.prepare_dummy_inputs(num_reqs, num_tokens),
             }
             if not self.is_first_pp_rank:
-                # Update for non-first PP ranks. Must match the eager builder in
-                # GPUModelRunner.execute_model, or replay diverges from eager.
-                clear_first_stage_only_inputs(model_inputs, model)
+                # Update for non-first PP ranks.
+                # Same contract as in `gpu/model_runner.py`: keep the raw token
+                # ids for models that declare `requires_raw_input_tokens`.
+                # `model` comes from the enclosing `capture()` scope, and
+                # `input_buffers.input_ids` is populated on every rank.
+                if not requires_raw_input_tokens(model):
+                    model_inputs["input_ids"] = None
+                model_inputs["inputs_embeds"] = None
                 assert intermediate_tensors is not None
                 model_inputs["intermediate_tensors"] = intermediate_tensors[:num_tokens]
 
