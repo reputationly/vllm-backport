@@ -156,12 +156,12 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             + dim_offsets[None, :]
         )
         if FP8_KV:
-            # The caller hands over byte views of the fp8 cache. Widening here
-            # rather than in a separate pass is the whole point: a scratch
-            # buffer would write and re-read a BF16 copy, spending exactly the
-            # bandwidth fp8 storage is meant to save. Both dequantisation
-            # scales are linear, so neither is applied per element -- k_scale
-            # rides along with the score scaling and v_scale with the output.
+            # The cache arrives as raw e4m3 bytes. Widening here rather than
+            # in a separate pass is the whole point: a scratch buffer would
+            # write and re-read a BF16 copy, spending exactly the bandwidth
+            # fp8 storage is meant to save. Both dequantisation scales are
+            # linear, so neither is applied per element -- k_scale rides along
+            # with the score scaling and v_scale with the output.
             keys = _dequantize_e4m3(
                 tl.load(key_addresses, mask=valid[None, :], other=0)
             )
@@ -532,17 +532,14 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    fp8_kv = k_cache.dtype == torch.float8_e4m3fn
+    # vLLM stores an e4m3 KV cache as raw uint8 bytes, so the kernel reads
+    # bytes directly and widens them itself.
+    fp8_kv = k_cache.dtype == torch.uint8
     assert q.dtype == torch.bfloat16
     assert k_cache.dtype == v_cache.dtype
     assert fp8_kv or k_cache.dtype == torch.bfloat16
-    if fp8_kv:
-        if k_scale is None or v_scale is None:
-            raise ValueError("fp8 QSA caches require k_scale and v_scale")
-        # Triton gates `float8e4nv` on sm90+, so the kernel reads bytes and
-        # widens them itself; the views keep shape, strides and storage.
-        k_cache = k_cache.view(torch.uint8)
-        v_cache = v_cache.view(torch.uint8)
+    if fp8_kv and (k_scale is None or v_scale is None):
+        raise ValueError("fp8 QSA caches require k_scale and v_scale")
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.device == k_cache.device == v_cache.device
@@ -678,17 +675,16 @@ def warmup_qsa_sparse_paged_attention(
     q_ptr = TritonWarmupTensor(
         torch.bfloat16, shape=(num_rows, num_query_heads, head_dim)
     )
-    # fp8 caches reach the kernel as byte views, so warm the byte variant or
-    # the first real request JIT-compiles during inference.
-    fp8_kv = key_cache.dtype == torch.float8_e4m3fn
-    cache_dtype = torch.uint8 if fp8_kv else key_cache.dtype
+    # Warm the variant the real launch will pick, or the first request
+    # JIT-compiles during inference.
+    fp8_kv = key_cache.dtype == torch.uint8
     k_cache_ptr = TritonWarmupTensor(
-        cache_dtype,
+        key_cache.dtype,
         shape=tuple(key_cache.shape),
         strides=tuple(key_cache.stride()),
     )
     v_cache_ptr = TritonWarmupTensor(
-        cache_dtype,
+        value_cache.dtype,
         shape=tuple(value_cache.shape),
         strides=tuple(value_cache.stride()),
     )

@@ -63,7 +63,12 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
 # QSA keeps its main KV either unquantized or as e4m3. The sparse kernel
 # widens the fp8 bytes itself rather than relying on Triton's `float8e4nv`,
 # which is gated on sm90+; see `_dequantize_e4m3` in `ops/qsa.py`.
-_QSA_CACHE_DTYPES: tuple[CacheDType, ...] = ("auto", "bfloat16", "fp8", "fp8_e4m3")
+_QSA_FP8_CACHE_DTYPES: tuple[CacheDType, ...] = ("fp8", "fp8_e4m3")
+_QSA_CACHE_DTYPES: tuple[CacheDType, ...] = (
+    "auto",
+    "bfloat16",
+    *_QSA_FP8_CACHE_DTYPES,
+)
 
 
 class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
@@ -116,6 +121,10 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise NotImplementedError(
                 "Qwen4Exp QSA supports only BF16 or e4m3 main KV caches"
             )
+        # vLLM allocates fp8 KV as uint8 bytes, a dtype it also uses for
+        # turboquant and nvfp4, so the cache tensor alone cannot say which
+        # format it holds. The configured string can.
+        self.fp8_kv = self.kv_cache_dtype in _QSA_FP8_CACHE_DTYPES
         self.supports_quant_query_input = False
 
     def forward_qsa(
@@ -151,15 +160,12 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         logical_indices = topk_buffer[:num_tokens]
         token_to_req = token_to_req[:num_tokens]
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
-        if query.dtype != torch.bfloat16 or key_cache.dtype not in (
-            torch.bfloat16,
-            torch.float8_e4m3fn,
-        ):
+        expected_cache_dtype = torch.uint8 if self.fp8_kv else torch.bfloat16
+        if query.dtype != torch.bfloat16 or key_cache.dtype != expected_cache_dtype:
             raise NotImplementedError("Qwen4Exp QSA requires a BF16 query")
 
         from .ops.qsa import qsa_sparse_paged_attention
 
-        fp8_kv = key_cache.dtype == torch.float8_e4m3fn
         qsa_sparse_paged_attention(
             query[:num_tokens],
             key_cache,
@@ -169,8 +175,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             token_to_req,
             use_prefill_config,
             output[:num_tokens],
-            k_scale=layer._k_scale if fp8_kv else None,
-            v_scale=layer._v_scale if fp8_kv else None,
+            k_scale=layer._k_scale if self.fp8_kv else None,
+            v_scale=layer._v_scale if self.fp8_kv else None,
         )
         return output
 
@@ -299,7 +305,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, model_config
         )
-        if self.kv_cache_torch_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        if self.kv_cache_torch_dtype not in (torch.bfloat16, torch.uint8):
             raise NotImplementedError(
                 "Qwen4Exp QSA requires BF16 or e4m3 cache storage"
             )
