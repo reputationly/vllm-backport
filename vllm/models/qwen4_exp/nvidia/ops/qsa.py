@@ -15,32 +15,28 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 
 @triton.jit
 def _dequantize_e4m3(raw: tl.tensor) -> tl.tensor:
-    """Widen raw `float8_e4m3fn` bytes to bf16 using integer ops only.
+    """Widen raw e4m3 bytes to bf16 without Triton's sm90-only fp8 type.
 
-    Triton gates its native `float8e4nv` type on sm90+, so on sm80 the paged
-    cache is loaded as bytes and widened here instead. e4m3fn is 1/4/3 with
-    exponent bias 7 and bf16 is 1/8/7 with bias 127, so a normal value only
-    needs its exponent rebased by 120 and its mantissa shifted left by 4.
-    Subnormals carry no implicit leading one and are renormalised explicitly;
-    e4m3fn has no infinities, and its two NaN encodings map to a bf16 NaN.
+    Shifting `eeeemmm` left by 20 lands the exponent on fp32's four lowest
+    exponent bits and the mantissa on its three highest mantissa bits, which
+    makes normals and subnormals decode through the same path: a normal comes
+    out as 2^(E-127)*1.mmm and a subnormal as mmm*2^-129, so one multiply by
+    2^120 turns them into e4m3's 2^(E-7)*1.mmm and mmm*2^-9 respectively.
+
+    Two earlier attempts were slower. Reconstructing the fields arithmetically
+    needs three `tl.where` branches for the subnormal case and measured 3.6x
+    slower end to end than a BF16 cache; a 256-entry lookup table removed the
+    branches but replaced them with a per-element gather and still ran 1.7x
+    slower. This form is branch-free except for the NaN fixup and reads the
+    cache as plain bytes.
     """
     bits = raw.to(tl.uint32)
-    sign = (bits & 0x80) << 8
-    exponent = (bits >> 3) & 0x0F
-    mantissa = bits & 0x07
-
-    normal = ((exponent + 120) << 7) | (mantissa << 4)
-
-    # Subnormals are mantissa * 2^-9. Renormalising shifts the mantissa left
-    # until its leading one reaches bit 2, and charges that shift to the
-    # exponent: 4..7 -> 2^-7, 2..3 -> 2^-8, 1 -> 2^-9.
-    shift = tl.where(mantissa >= 4, 0, tl.where(mantissa >= 2, 1, 2))
-    subnormal = ((120 - shift) << 7) | (((mantissa << shift) & 0x03) << 5)
-
-    body = tl.where(exponent == 0, tl.where(mantissa == 0, 0, subnormal), normal)
-    # 0x7F / 0xFF are the only NaN encodings; everything else is finite.
-    body = tl.where((exponent == 0x0F) & (mantissa == 0x07), 0x7FC0, body)
-    return (sign | body).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    value = (((bits & 0x7F) << 20) | ((bits & 0x80) << 24)).to(
+        tl.float32, bitcast=True
+    ) * 1.329227995784916e36  # 2^120
+    # 0x7F / 0xFF are e4m3's only NaN encodings; without this they would decode
+    # to a plausible-looking +-480 and hide whatever produced them.
+    return tl.where((bits & 0x7F) == 0x7F, float("nan"), value).to(tl.bfloat16)
 
 
 @triton.jit(do_not_specialize=["num_rows", "num_requests"])

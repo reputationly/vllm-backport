@@ -108,6 +108,10 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
 
     supports_dcp: bool = False
     supports_pcp: bool = False
+    # QSA runs its own Triton sparse kernel and only inherits the
+    # metadata and cache-update plumbing, so the FA kernel's kv-cache
+    # dtype support check does not describe what actually executes.
+    uses_flash_attn_kernel: ClassVar[bool] = False
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
