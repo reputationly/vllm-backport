@@ -196,6 +196,11 @@ class FlashAttnMLASparseImpl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):
         assert self.topk_indices_buffer is not None, (
             "Indexer or topk_indices_buffer required for sparse MLA"
         )
+        self.cu_seqlens_q_buffer = torch.arange(
+            self.topk_indices_buffer.shape[0] + 1,
+            dtype=torch.int32,
+            device=self.topk_indices_buffer.device,
+        )
         self.supports_quant_query_input = False
 
     def forward_mqa(
@@ -227,9 +232,7 @@ class FlashAttnMLASparseImpl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):
             return_valid_counts=True,
         )
 
-        cu_seqlens_q = torch.arange(
-            0, num_actual_toks + 1, dtype=torch.int32, device=q_rope.device
-        )
+        cu_seqlens_q = self.cu_seqlens_q_buffer[: num_actual_toks + 1]
         k_cache = kv_rows[:, self.kv_lora_rank :].unsqueeze(1).unsqueeze(1)
         v_cache = kv_rows[:, : self.kv_lora_rank].unsqueeze(1).unsqueeze(1)
 

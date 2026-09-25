@@ -7,6 +7,9 @@ import pytest
 import torch
 
 from tests.v1.attention.utils import create_vllm_config
+from vllm.model_executor.layers.attention.sparse_mla_attention import (
+    SparseMLACommonMetadataBuilder,
+)
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.mla.compressor_utils import (
     CompressedSlotMappingKernel,
@@ -157,3 +160,60 @@ def test_indexer_builder_deepseek_v4_compressed_slot_mapping_uses_num_states():
         device=device,
     )
     torch.testing.assert_close(valid_slots, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "query_lens", [[1], [0, 257, 1, 0, 3], [6] * 64, [2, 6, 4, 0], [0, 0, 0]]
+)
+@pytest.mark.parametrize("use_sparse_mla_builder", [False, True])
+def test_device_token_request_mapping(query_lens, use_sparse_mla_builder):
+    """Graph replay follows device boundaries even when CPU lengths are stale."""
+
+    def build_mapping(common, output):
+        if use_sparse_mla_builder:
+            builder = SimpleNamespace(req_id_per_token_buffer=output)
+            return SparseMLACommonMetadataBuilder._build_req_id_per_token(
+                builder, common
+            )
+        return common.token_to_req_indices(output)
+
+    lengths = torch.tensor(query_lens, device="cuda", dtype=torch.int32)
+    qsl = torch.cat(
+        [torch.zeros(1, device="cuda", dtype=torch.int32), lengths.cumsum(0).int()]
+    )
+    n = sum(query_lens)
+    output = torch.full((n + 7,), -99, device="cuda", dtype=torch.int32)
+    common = CommonAttentionMetadata(
+        query_start_loc=qsl,
+        query_start_loc_cpu=qsl.cpu(),
+        seq_lens=lengths,
+        num_reqs=len(query_lens),
+        num_actual_tokens=output.numel(),
+        max_query_len=max(query_lens),
+        max_seq_len=max(query_lens),
+        block_table_tensor=torch.empty(
+            (len(query_lens), 1), device="cuda", dtype=torch.int32
+        ),
+        slot_mapping=torch.full((n + 7,), -1, device="cuda", dtype=torch.int64),
+    )
+    result = build_mapping(common, output)
+    assert result.data_ptr() == output.data_ptr()
+    expected = torch.repeat_interleave(
+        torch.arange(len(query_lens), device="cuda", dtype=torch.int32), lengths
+    )
+    torch.testing.assert_close(output[:n], expected)
+    assert torch.count_nonzero(output[n:]) == 0
+    graph = torch.cuda.CUDAGraph()
+    common._token_to_req_indices_cache = None
+    with torch.cuda.graph(graph):
+        build_mapping(common, output)
+    reversed_lens = lengths.flip(0)
+    qsl[1:].copy_(reversed_lens.cumsum(0))
+    graph.replay()
+    expected = torch.repeat_interleave(
+        torch.arange(len(query_lens), device="cuda", dtype=torch.int32), reversed_lens
+    )
+    torch.testing.assert_close(output[:n], expected)
+    assert torch.count_nonzero(output[n:]) == 0
+
