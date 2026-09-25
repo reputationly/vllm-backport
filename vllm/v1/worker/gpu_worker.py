@@ -1252,8 +1252,10 @@ class Worker(WorkerBase):
 
         return None
 
-    def take_draft_token_ids(self) -> DraftTokenIds | None:
-        return self.model_runner.take_draft_token_ids()
+    def take_draft_token_ids(
+        self, req_ids: list[str] | None = None
+    ) -> DraftTokenIds | None:
+        return self.model_runner.take_draft_token_ids(req_ids)
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         # Check if profiling is enabled

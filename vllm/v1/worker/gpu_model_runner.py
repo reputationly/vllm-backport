@@ -4904,7 +4904,11 @@ class GPUModelRunner(
             self.input_batch.num_tokens_no_spec[i] = pos + 1
         self.input_batch.prev_req_id_to_index = prev_req_id_to_index
 
-    def take_draft_token_ids(self) -> DraftTokenIds | None:
+    def take_draft_token_ids(
+        self, req_ids: list[str] | None = None
+    ) -> DraftTokenIds | None:
+        # `req_ids` is only honoured by the V2 model runner: this runner does
+        # not overlap batches, so the last batch is always the right one.
         if not self.num_spec_tokens or not self._draft_token_req_ids:
             return None
         draft_token_ids, req_ids = self._get_draft_token_ids_cpu()

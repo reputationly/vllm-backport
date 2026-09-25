@@ -1035,6 +1035,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.encoder_cache.remove_request(req_id)
         if self.prompt_logprobs_worker is not None:
             self.prompt_logprobs_worker.remove_request(req_id)
+        self.draft_tokens_handler.remove_request(req_id)
         self.lora_state.remove_request(req_id)
         return True
 
@@ -2094,8 +2095,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         return async_output
 
-    def take_draft_token_ids(self) -> DraftTokenIds | None:
-        return self.draft_tokens_handler.get_draft_tokens()
+    def take_draft_token_ids(
+        self, req_ids: list[str] | None = None
+    ) -> DraftTokenIds | None:
+        return self.draft_tokens_handler.get_draft_tokens(req_ids)
 
     @torch.inference_mode()
     @step_eplb_after()

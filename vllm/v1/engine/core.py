@@ -741,7 +741,14 @@ class EngineCore:
             # When draft tokens are used with structured output, validate them
             # before computing the grammar bitmask for the deferred request.
             if self.check_for_draft_tokens:
-                draft_token_ids = self.model_executor.take_draft_token_ids()
+                # Ask for the drafts of *this* batch's requests. The batch that
+                # just finished above is generally a different microbatch under
+                # pipeline parallelism, and the worker's last-batch drafts would
+                # then belong to other requests, leaving these with -1
+                # placeholders and a bitmask built from the pre-draft state.
+                draft_token_ids = self.model_executor.take_draft_token_ids(
+                    list(deferred_scheduler_output.scheduled_spec_decode_tokens)
+                )
                 if draft_token_ids is not None:
                     # Update the draft token ids in the scheduler output to
                     # filter out the invalid spec tokens, which will be padded
