@@ -725,18 +725,19 @@ class SpeculativeConfig:
             "MiMoV2ForCausalLM",
             "MiMoV2OmniForCausalLM",
         ):
-            from vllm.model_executor.models.mimo_v2_mtp import (
-                _MIMO_V2_PRO_NUM_MTP_LAYERS,
-            )
-
             mtp_arch_maps = {
                 "MiMoV2ForCausalLM": "MiMoV2MTPModel",
                 "MiMoV2OmniForCausalLM": "MiMoV2OmniMTPModel",
             }
 
             hf_config.model_type = "mimo_v2_mtp"
-            # vLLM currently supports only the first MiMo-V2 MTP layer.
-            n_predict = _MIMO_V2_PRO_NUM_MTP_LAYERS
+            # Omni keeps a single (reused) MTP layer: its multi-layer path is
+            # untested with multimodal draft inputs.
+            n_predict = (
+                1
+                if arch == "MiMoV2OmniForCausalLM"
+                else getattr(hf_config, "num_nextn_predict_layers", 1)
+            )
             hf_config.update(
                 {
                     "num_hidden_layers": 0,
@@ -747,13 +748,8 @@ class SpeculativeConfig:
             )
 
         if hf_config.architectures[0] == "MiMoV2FlashForCausalLM":
-            from vllm.model_executor.models.mimo_v2_mtp import (
-                _MIMO_V2_FLASH_NUM_MTP_LAYERS,
-            )
-
             hf_config.model_type = "mimo_v2_mtp"
-            # vLLM currently supports only the first MiMo-V2 MTP layer.
-            n_predict = _MIMO_V2_FLASH_NUM_MTP_LAYERS
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
             hf_config.update(
                 {
                     "num_hidden_layers": 0,
@@ -1358,6 +1354,7 @@ class SpeculativeConfig:
                         self.num_speculative_tokens > 1
                         and self.draft_model_config.hf_config.model_type
                         not in ("step3p5_mtp", "inkling_mtp")
+                        and not self.use_multi_module_mtp()
                     ):
                         logger.warning(
                             "Enabling num_speculative_tokens > 1 will run "

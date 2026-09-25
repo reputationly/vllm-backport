@@ -48,11 +48,6 @@ from .interfaces import (
 from .mimo_v2 import MiMoV2Attention, MiMoV2MLP, _shard_fp8_qkv_proj
 from .utils import _merge_multimodal_embeddings, maybe_prefix
 
-# MiMo-V2 checkpoints contain multiple MTP layers, but vLLM currently supports
-# only the first layer
-_MIMO_V2_PRO_NUM_MTP_LAYERS = 1
-_MIMO_V2_FLASH_NUM_MTP_LAYERS = 1
-
 
 class MiMoV2MTPLayer(nn.Module):
     """Single MTP predictor layer for MiMo-V2 (Pro and Flash).
@@ -170,7 +165,7 @@ class MiMoV2MultiTokenPredictor(nn.Module):
         config = vllm_config.model_config.hf_config
         spec_cfg = vllm_config.speculative_config
         assert spec_cfg is not None
-        num_mtp_layers = 1
+        num_mtp_layers = getattr(config, "num_nextn_predict_layers", 1)
 
         self.num_mtp_layers = num_mtp_layers
 
@@ -202,9 +197,15 @@ class MiMoV2MultiTokenPredictor(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
         current_step_idx = spec_step_idx % self.num_mtp_layers
-        return self.mtp.layers[str(current_step_idx)](
+        hidden_states = self.mtp.layers[str(current_step_idx)](
             inputs_embeds, positions, previous_hidden_states
         )
+        if self.num_mtp_layers > 1:
+            # MiMo MTP modules are not chained: each one conditions on the
+            # target model's hidden states (as in SGLang's multi-layer EAGLE),
+            # so feed the input hidden states, not this output, to the next.
+            return hidden_states, previous_hidden_states
+        return hidden_states
 
     def compute_logits(
         self,
