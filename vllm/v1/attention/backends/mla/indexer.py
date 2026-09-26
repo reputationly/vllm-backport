@@ -183,9 +183,13 @@ class PrepareUniformDecodeKernel(
 # 168 us at T=8192 (ALLREDUCE.md, pynccl_ag 16 MiB), flattening near ~77 us
 # once the payload drops under ~4 MiB:
 #   T=8192 -> 9.2x    T=4096 -> 7.4x    T=2048 -> 5.0x    T=1024 -> 2.8x
-# 2048 is the crossover, and is above the cudagraph capture cap
-# (min(max_num_seqs*2, 512)), so a sharded batch is always an eager one.
-MIN_SHARD_TOKENS = 2048
+# That table is for an 8K prompt; the indexer work per row grows with the
+# context already cached, so at long context even small batches repay the
+# gather many times over. 1024 keeps a 2.8x margin at 8K and stays above the
+# cudagraph capture cap (min(max_num_seqs*2, 512)), so a sharded batch is
+# always an eager one. 2048 was never reached under spec decode with
+# max_num_batched_tokens=2048: the K-1 draft slots leave 2046 per batch.
+MIN_SHARD_TOKENS = 1024
 
 
 class ShardedChunkSpec(NamedTuple):
