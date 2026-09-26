@@ -219,6 +219,7 @@ if TYPE_CHECKING:
         "full",
         "relax",
     ] = "relax"
+    VLLM_STARTUP_WARMUP_TOKENS: int = 0
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_MOE_SKIP_PADDING: bool = True
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
@@ -1767,6 +1768,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "full",
             "relax",
         ],
+    ),
+    # Prefill this many random tokens once, right before the API server opens
+    # its port. Absorbs the one-off first-long-request JIT/autotune cost that
+    # GLM-5.3 and DeepSeek-V4 pay on A100 (15-30s at 128K). 0 disables.
+    # For GLM a short warmup does not cover long requests: use >= 131072.
+    "VLLM_STARTUP_WARMUP_TOKENS": lambda: int(
+        os.getenv("VLLM_STARTUP_WARMUP_TOKENS", "0")
     ),
     # Whether to use fused grouped_topk used for MoE expert selection.
     "VLLM_USE_FUSED_MOE_GROUPED_TOPK": lambda: bool(

@@ -4,9 +4,11 @@ import asyncio
 import multiprocessing
 import multiprocessing.forkserver as forkserver
 import os
+import random
 import signal
 import socket
 import tempfile
+import time
 from argparse import Namespace
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -17,6 +19,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
 from vllm.reasoning import ReasoningParserManager
+from vllm.sampling_params import SamplingParams
 from vllm.tool_parsers import ToolParserManager
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.system_utils import decorate_logs
@@ -112,6 +115,37 @@ async def build_async_engine_client_from_engine_args(
             async_llm.shutdown(timeout=vllm_config.shutdown_timeout)
 
 
+async def startup_warmup(engine_client: EngineClient) -> None:
+    """Prefill one long random prompt before opening the port.
+
+    Some models (GLM-5.3, DeepSeek-V4 on A100) pay a one-off 15-30s on the
+    first long request of a process -- JIT compiles and autotunes keyed on
+    large shapes -- and, for GLM, a short first request does not cover it.
+    Absorb that here so the first user request does not.
+    """
+    n_tokens = envs.VLLM_STARTUP_WARMUP_TOKENS
+    if n_tokens <= 0:
+        return
+    model_config = engine_client.model_config
+    n_tokens = min(n_tokens, model_config.max_model_len - 64)
+    rng = random.Random(0)
+    hi = min(model_config.get_vocab_size(), 30000)
+    ids = [rng.randrange(1000, hi) for _ in range(n_tokens)]
+    logger.info("Startup warmup: prefilling %d random tokens", n_tokens)
+    t0 = time.perf_counter()
+    try:
+        async for _ in engine_client.generate(
+            {"prompt_token_ids": ids},
+            SamplingParams(max_tokens=1),
+            request_id="startup-warmup",
+        ):
+            pass
+    except Exception:
+        logger.exception("Startup warmup failed; serving anyway")
+        return
+    logger.info("Startup warmup finished in %.1fs", time.perf_counter() - t0)
+
+
 async def build_and_serve(
     engine_client: EngineClient,
     listen_address: str,
@@ -135,6 +169,8 @@ async def build_and_serve(
     logger.info("Supported tasks: %s", supported_tasks)
     app = build_app(args, supported_tasks, model_config)
     await init_app_state(engine_client, app.state, args, supported_tasks)
+
+    await startup_warmup(engine_client)
 
     logger.info("Starting vLLM server on %s", listen_address)
 
