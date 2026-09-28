@@ -232,7 +232,14 @@ class DeepseekV32Attention(MLAAttention):
 
         fp8_attention = is_quantized_kv_cache(self.kv_cache_dtype)
         self._fp8_query = fp8_attention and self.impl.supports_quant_query_input
-        self._fp8_kv_needs_view = fp8_attention and self.kv_cache_dtype != "fp8_ds_mla"
+        # Triton sparse keeps per-tensor-fp8 KV in its uint8 storage (SM80 has
+        # no native fp8e4nv convert; the kernel decodes through the LUT), so
+        # the fp8 view meant for FlashMLA/FlashInfer must not be applied here.
+        self._fp8_kv_needs_view = (
+            fp8_attention
+            and self.kv_cache_dtype != "fp8_ds_mla"
+            and self.attn_backend.get_name() != "TRITON_MLA_SPARSE"
+        )
 
         self._index_rope_interleave = getattr(config, "indexer_rope_interleave", False)
 

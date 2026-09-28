@@ -8,6 +8,9 @@ import torch
 
 from vllm.triton_utils import LOG2E, LOGE2, tl, triton
 from vllm.utils.platform_utils import num_compute_units
+from vllm.v1.attention.ops.fp8_sm80 import (
+    get_e4m3fn_bf16_lut,
+)
 
 # DeepSeek-V3.2 / GLM-5 sparse MLA shape constants.
 _BLOCK_DMODEL = 512
@@ -48,10 +51,18 @@ _SPLIT_MAX_OCCUPANCY = 4  # skip split when baseline grid fills >=1/4 of SMs
 
 
 @triton.jit
+def _decode_e4m3fn_bf16_lut(u, lut_ptr):
+    # Same contract as mqa_logits_triton._decode_e4m3fn_bf16_lut; kept local so
+    # the sparse MLA kernels stay self-contained.
+    return tl.load(lut_ptr + u.to(tl.uint32))
+
+
+@triton.jit
 def _sparse_mla_compute_tile(
     q_buffer,
     k_buffer,  # V is the first BLOCK_DV lanes of each row of k_buffer.
     indices_ptr,
+    fp8_lut_ptr,  # 256-entry e4m3fn->bf16 table; only read when IS_FP8_KV.
     cur_q,
     cur_head,
     cur_kv_head_id,
@@ -71,6 +82,8 @@ def _sparse_mla_compute_tile(
     BLOCK_DV: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DPE: tl.constexpr,
+    IS_FP8_KV: tl.constexpr,
+    KV_SCALE: tl.constexpr,
 ):
     """Shared stage-1 body: load Q, run the sparse online-softmax loop over
     `[split_start, split_end)` of the topk axis, return accumulators."""
@@ -124,6 +137,11 @@ def _sparse_mla_compute_tile(
             + offs_d[:, None]
         )
         k = tl.load(k_buffer + offs_k, mask=mask_kv[None, :], other=0.0)
+        if IS_FP8_KV:
+            # Per-tensor fp8 KV: uint8 rows decoded through the LUT (SM80 has
+            # no native fp8e4nv convert), scaled back by the per-tensor scale
+            # that fused_norm_rope divided out on the write side.
+            k = _decode_e4m3fn_bf16_lut(k, fp8_lut_ptr) * KV_SCALE
         qk = tl.dot(q, k.to(q.dtype))
 
         if BLOCK_DPE > 0:
@@ -137,6 +155,8 @@ def _sparse_mla_compute_tile(
                 mask=mask_kv[None, :],
                 other=0.0,
             )
+            if IS_FP8_KV:
+                kpe = _decode_e4m3fn_bf16_lut(kpe, fp8_lut_ptr) * KV_SCALE
             qk += tl.dot(qpe, kpe.to(q.dtype))
 
         qk *= sm_scale
@@ -148,6 +168,8 @@ def _sparse_mla_compute_tile(
             + offs_dv[None, :]
         )
         v = tl.load(k_buffer + offs_v, mask=mask_kv[:, None], other=0.0)
+        if IS_FP8_KV:
+            v = _decode_e4m3fn_bf16_lut(v, fp8_lut_ptr) * KV_SCALE
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
         re_scale = tl.exp2(e_max - n_e_max)
@@ -166,6 +188,7 @@ def _sparse_mla_kernel_final(
     q_buffer,
     k_buffer,
     indices_ptr,
+    fp8_lut_ptr,
     out_ptr,
     seq_kv,
     h_q,
@@ -185,6 +208,8 @@ def _sparse_mla_kernel_final(
     BLOCK_DV: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DPE: tl.constexpr,
+    IS_FP8_KV: tl.constexpr,
+    KV_SCALE: tl.constexpr,
 ):
     """Single-pass fast path: full topk, write final bf16 output directly."""
     cur_q = tl.program_id(0)
@@ -199,6 +224,7 @@ def _sparse_mla_kernel_final(
         q_buffer,
         k_buffer,
         indices_ptr,
+        fp8_lut_ptr,
         cur_q,
         cur_head,
         cur_kv_head_id,
@@ -218,6 +244,8 @@ def _sparse_mla_kernel_final(
         BLOCK_DV,
         BLOCK_DMODEL,
         BLOCK_DPE,
+        IS_FP8_KV,
+        KV_SCALE,
     )
 
     # Guard against queries with zero valid KV (e_sum == 0 → NaN from 0/0).
@@ -242,6 +270,7 @@ def _sparse_mla_kernel_split(
     q_buffer,
     k_buffer,
     indices_ptr,
+    fp8_lut_ptr,
     mid_out_ptr,
     seq_kv,
     h_q,
@@ -264,6 +293,8 @@ def _sparse_mla_kernel_split(
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DPE: tl.constexpr,
     LOGE2: tl.constexpr,
+    IS_FP8_KV: tl.constexpr,
+    KV_SCALE: tl.constexpr,
 ):
     """Stage 1 of split-KV: process one slice of the topk axis and write
     its `(out_partial, lse_partial)` into the mid buffer."""
@@ -284,6 +315,7 @@ def _sparse_mla_kernel_split(
         q_buffer,
         k_buffer,
         indices_ptr,
+        fp8_lut_ptr,
         cur_q,
         cur_head,
         cur_kv_head_id,
@@ -303,6 +335,8 @@ def _sparse_mla_kernel_split(
         BLOCK_DV,
         BLOCK_DMODEL,
         BLOCK_DPE,
+        IS_FP8_KV,
+        KV_SCALE,
     )
 
     # Partial output and natural-log LSE for stage-2 merge.
@@ -434,16 +468,20 @@ def triton_mla_sparse_attention(
     sm_scale: float,
     num_kv_splits: int | None = None,
     sm_count: int | None = None,
+    kv_scale: float = 1.0,
 ) -> torch.Tensor:
     """Sparse MLA attention over topk indices.
 
     Args:
         q:         [num_tokens, num_heads_q, dim_qk] bf16
-        kv:        [seq_kv, num_heads_kv=1, dim_qk] bf16
+        kv:        [seq_kv, num_heads_kv=1, dim_qk] bf16, or uint8 rows holding
+                   per-tensor-fp8 e4m3fn bytes (kv_scale then multiplies them
+                   back; decoding goes through the SM80 LUT)
         indices:   [num_tokens, num_heads_kv=1, topk] int32
         sm_scale:  softmax scale
         num_kv_splits: override auto-heuristic; None/0 = auto, 1 = force single-pass.
         sm_count:  cached device SM count for the split heuristic.
+        kv_scale:  per-tensor fp8 scale applied after LUT decode (1.0 default).
 
     Returns:
         out:   [num_tokens, num_heads_q, _BLOCK_DV] bf16
@@ -463,6 +501,15 @@ def triton_mla_sparse_attention(
         f"topk ({index_topk}) must be a multiple of the smallest autotune "
         f"BLOCK_N ({_MIN_BLOCK_N})"
     )
+
+    is_fp8_kv = kv.dtype == torch.uint8
+    if is_fp8_kv:
+        # SM89+ could read a float8 view natively, but the LUT path is
+        # bit-identical and keeps one code path across the fleet.
+        fp8_lut = get_e4m3fn_bf16_lut(q.device)
+    else:
+        # Placeholder; never dereferenced when IS_FP8_KV is False (constexpr).
+        fp8_lut = q.new_empty(0, dtype=torch.bfloat16)
 
     kv_group_num = num_heads_q
     num_head_groups = triton.cdiv(num_heads_q, min(_BLOCK_H, kv_group_num))
@@ -485,6 +532,7 @@ def triton_mla_sparse_attention(
             q_buffer=q,
             k_buffer=kv,
             indices_ptr=indices,
+            fp8_lut_ptr=fp8_lut,
             out_ptr=out,
             seq_kv=kv.shape[0],
             h_q=num_heads_q,
@@ -503,6 +551,8 @@ def triton_mla_sparse_attention(
             BLOCK_DV=_BLOCK_DV,
             BLOCK_DMODEL=_BLOCK_DMODEL,
             BLOCK_DPE=block_dpe,
+            IS_FP8_KV=is_fp8_kv,
+            KV_SCALE=kv_scale,
         )
         return out
 
@@ -516,6 +566,7 @@ def triton_mla_sparse_attention(
         q_buffer=q,
         k_buffer=kv,
         indices_ptr=indices,
+        fp8_lut_ptr=fp8_lut,
         mid_out_ptr=mid_out,
         seq_kv=kv.shape[0],
         h_q=num_heads_q,
@@ -537,6 +588,8 @@ def triton_mla_sparse_attention(
         BLOCK_DMODEL=_BLOCK_DMODEL,
         BLOCK_DPE=block_dpe,
         LOGE2=LOGE2,
+        IS_FP8_KV=is_fp8_kv,
+        KV_SCALE=kv_scale,
     )
 
     _sparse_mla_merge_kernel[(num_tokens, num_heads_q, _NUM_MERGE_DV_TILES)](
