@@ -11,11 +11,14 @@ from vllm.model_executor.layers.attention.sparse_mla_attention import (
     SparseMLACommonMetadataBuilder,
 )
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.mla import indexer as indexer_module
 from vllm.v1.attention.backends.mla.compressor_utils import (
     CompressedSlotMappingKernel,
 )
 from vllm.v1.attention.backends.mla.indexer import (
     BuildPrefillChunkMetadataKernel,
+    DeepSeekV32IndexerDecodeMetadata,
+    DeepseekV32IndexerMetadata,
     DeepseekV32IndexerMetadataBuilder,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
@@ -217,3 +220,69 @@ def test_device_token_request_mapping(query_lens, use_sparse_mla_builder):
     torch.testing.assert_close(output[:n], expected)
     assert torch.count_nonzero(output[n:]) == 0
 
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_indexer_draft_decode_metadata_update_is_capture_safe():
+    if not indexer_module.has_deep_gemm():
+        pytest.skip("requires DeepGEMM")
+    device = torch.device("cuda")
+    num_reqs = 3
+    seq_lens = torch.tensor([17, 33, 65], dtype=torch.int32, device=device)
+    decode_seq_lens = torch.zeros((num_reqs, 1), dtype=torch.int32, device=device)
+    block_table = torch.arange(num_reqs * 4, dtype=torch.int32, device=device).view(
+        num_reqs, 4
+    )
+    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    schedule_metadata = indexer_module.get_paged_mqa_logits_metadata(
+        torch.div(seq_lens, 16, rounding_mode="floor").unsqueeze(1),
+        64,
+        num_sms,
+    ).clone()
+
+    builder = object.__new__(DeepseekV32IndexerMetadataBuilder)
+    builder.dcp_world_size = 1
+    builder.compress_ratio = 16
+    builder.num_sms = num_sms
+    builder.arange_buffer = torch.arange(num_reqs + 1, dtype=torch.int32, device=device)
+    builder.kv_cache_spec = SimpleNamespace(num_states=64)
+    metadata = DeepseekV32IndexerMetadata(
+        seq_lens=seq_lens,
+        max_seq_len=128,
+        slot_mapping=torch.zeros(num_reqs, dtype=torch.int64, device=device),
+        num_decodes=num_reqs,
+        num_decode_tokens=num_reqs,
+        num_prefills=0,
+        num_prefill_tokens=0,
+        decode=DeepSeekV32IndexerDecodeMetadata(
+            block_table=block_table,
+            seq_lens=decode_seq_lens,
+            max_seq_len=128,
+            decode_lens=torch.zeros(num_reqs, dtype=torch.int32, device=device),
+            requires_padding=False,
+            schedule_metadata=schedule_metadata,
+        ),
+    )
+
+    builder.update_draft_decode_metadata(metadata)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        builder.update_draft_decode_metadata(metadata)
+
+    seq_lens.copy_(torch.tensor([32, 48, 80], dtype=torch.int32, device=device))
+    graph.replay()
+    torch.accelerator.synchronize()
+
+    expected_decode_seq_lens = torch.div(seq_lens, 16, rounding_mode="floor")
+    torch.testing.assert_close(decode_seq_lens.flatten(), expected_decode_seq_lens)
+    torch.testing.assert_close(
+        schedule_metadata,
+        indexer_module.get_paged_mqa_logits_metadata(
+            expected_decode_seq_lens.unsqueeze(1), 64, num_sms
+        ),
+    )
+    assert metadata.decode is not None
+    assert torch.all(metadata.decode.decode_lens == 1)
+    expected_slot_mapping = block_table[:, 0].to(torch.int64) * 64 + torch.tensor(
+        [1, 2, 4], dtype=torch.int64, device=device
+    )
+    torch.testing.assert_close(metadata.slot_mapping, expected_slot_mapping)
