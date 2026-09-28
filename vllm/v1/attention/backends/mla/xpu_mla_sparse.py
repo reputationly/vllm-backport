@@ -101,9 +101,14 @@ class XPUMLASparseMetadata(AttentionMetadata):
     # (`num_decode_tokens == num_actual_tokens`, `num_prefills == 0`); that keeps
     # the shared layer's `num_mha_tokens` at 0 and never enters the dense-MHA
     # prefill branch (which needs prefill-only fields this backend lacks).
+    # `prefill: None` exists for the same reason: deepseek_v32's forward()
+    # probes `_use_sparse_mha(layer_attn_metadata)` unconditionally (GLM-5.3
+    # qlnorm skip), and `_use_sparse_mha` reads `.prefill` before anything
+    # else. None makes that probe return False on this backend.
     num_decodes: int = 0
     num_prefills: int = 0
     num_decode_tokens: int = 0
+    prefill: None = None
 
 
 @dataclass
