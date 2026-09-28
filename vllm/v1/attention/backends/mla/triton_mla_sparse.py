@@ -28,6 +28,29 @@ class TritonMLASparseMetadataBuilder(XPUMLASparseMetadataBuilder):
     # claims UNIFORM_BATCH for the CUDA/Triton path.
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
+    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        # Draft steps are single-token-per-request and uniform, so every field
+        # this backend's forward reads is step-invariant: req_id_per_token is
+        # arange over rows either way, block_table/query_start_loc come from
+        # persistent engine buffers, and slot_mapping is refreshed in place by
+        # the speculator's compute_slot_mappings before the update hook runs.
+        # The one per-step device rebuild the XPU base does (np.repeat +
+        # pinned H2D) is only needed for non-uniform query layouts. Like the
+        # dense Triton builder, the update itself is a no-op; DCP keeps the
+        # fallback because its local seq-lens are not advanced per step.
+        self.dcp_world_size = 1
+        try:
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            self.dcp_world_size = get_dcp_group().world_size
+        except AssertionError:
+            pass
+        self.supports_draft_decode_metadata_update = self.dcp_world_size == 1
+
+    def update_draft_decode_metadata(self, _metadata: XPUMLASparseMetadata) -> None:
+        pass
+
 
 class TritonMLASparseImpl(XPUMLASparseImpl):
     """Triton sparse-MLA impl with split-KV decode (3-7× faster than the
