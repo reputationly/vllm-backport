@@ -65,6 +65,13 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
     """Triton sparse-MLA impl with split-KV decode (3-7× faster than the
     single-pass XPU base for single-query decode on SM80 / SM121)."""
 
+    # Per-tensor fp8 KV stays in its uint8 storage: the wrapper must not
+    # reinterpret it as e4m3 bytes. `is_fp8_kv` in the kernel is a
+    # `dtype == uint8` test, so an fp8-typed view would silently take the
+    # bf16 path with a float8 pointer — which fails to compile below SM89
+    # ("fp8e4nv not supported in this architecture").
+    keeps_raw_kv_bytes: ClassVar[bool] = True
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._sm_count: int | None = None

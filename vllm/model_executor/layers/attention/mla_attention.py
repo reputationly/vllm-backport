@@ -879,7 +879,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # Opaque per-token byte formats stay as raw uint8
             "fp8_ds_mla",
             "nvfp4_ds_mla",
-        ):
+        ) and not getattr(self.impl, "keeps_raw_kv_bytes", False):
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
         assert (
