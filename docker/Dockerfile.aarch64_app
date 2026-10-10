@@ -54,7 +54,10 @@ COPY benchmarks benchmarks
 #
 # 烘进镜像而不是每次起集群时 pip install:实测 8 个容器并发装会互相拖慢
 # 到 15 分钟以上,而这一层只需在构建时付一次。
-RUN pip install --no-cache-dir "ray[cgraph,default]==2.56.1" \
+# 阿里云 PyPI 镜像会对部分 wheel 的 .metadata 返回 404，构建直接失败。
+# 这一层显式走官方索引。
+RUN pip install --no-cache-dir --index-url https://pypi.org/simple \
+    "ray[cgraph,default]==2.56.1" \
  && ray --version
 
 # Mooncake:跨实例 KV 共享的传输层。
@@ -108,7 +111,8 @@ RUN pip install --no-cache-dir "ray[cgraph,default]==2.56.1" \
 # 所以这里只验证构建期可验证的部分:libcudart.so.12 已被 ldconfig 收录、
 # engine.so 对它的依赖能解析到实际路径(libcuda.so.1 这时必然 not found,正常)。
 # 真正的 import 验证在有 GPU 的节点上做,已在 gpu45 / gpu47 通过。
-RUN pip install --no-cache-dir --no-deps mooncake-transfer-engine nvidia-cuda-runtime-cu12 \
+RUN pip install --no-cache-dir --index-url https://pypi.org/simple --no-deps \
+    mooncake-transfer-engine nvidia-cuda-runtime-cu12 \
  && CU12_LIB="$(python3 -c 'import nvidia.cuda_runtime as m, os; print(os.path.join(list(m.__path__)[0], "lib"))')" \
  && test -e "${CU12_LIB}/libcudart.so.12" \
  && echo "${CU12_LIB}" > /etc/ld.so.conf.d/zz-cuda12-for-mooncake.conf \
