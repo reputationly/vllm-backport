@@ -35,10 +35,9 @@ def test_reference_encoder_fixtures(case_id):
 @pytest.mark.parametrize(
     ("effort", "budget"),
     [
-        (None, 50),
-        ("low", 25),
-        ("high", 50),
-        ("xhigh", 75),
+        (None, 75),
+        ("low", 50),
+        ("high", 75),
         ("max", 100),
         (1, 1),
         (42, 42),
@@ -56,7 +55,9 @@ def test_numeric_reasoning_effort(effort, budget):
     )
 
 
-@pytest.mark.parametrize("effort", ["medium", "minimal", -1, 0, 101, True, 1.5, []])
+@pytest.mark.parametrize(
+    "effort", ["medium", "minimal", "xhigh", -1, 0, 101, True, 1.5, []]
+)
 def test_invalid_effort_is_a_request_error(effort):
     with pytest.raises(ValueError, match="reasoning_effort"):
         render([{"role": "user", "content": "question"}], reasoning_effort=effort)
@@ -140,7 +141,7 @@ def test_top_level_effort_overrides_template_effort():
         chat_template_kwargs={"reasoning_effort": 100},
     )
     kwargs = request.build_chat_params(None, "auto").get_apply_chat_template_kwargs()
-    assert "Reasoning Effort: 25 " in render(request.messages, **kwargs)
+    assert "Reasoning Effort: 50 " in render(request.messages, **kwargs)
 
 
 def test_encode_uses_one_bos_and_forwards_truncation():

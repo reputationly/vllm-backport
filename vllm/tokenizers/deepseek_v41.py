@@ -81,7 +81,7 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
                 or (isinstance(effort, str) and effort in REASONING_EFFORT_MAPPINGS)
             ):
                 raise ValueError(
-                    "DeepSeek V4.1 reasoning_effort must be low, high, xhigh, max, "
+                    "DeepSeek V4.1 reasoning_effort must be low, high, max, "
                     "or an integer within [1, 100] in chat_template_kwargs"
                 )
 

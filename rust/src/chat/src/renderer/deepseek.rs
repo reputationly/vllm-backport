@@ -262,21 +262,19 @@ fn resolve_v41_thinking_options(
     let budget = match request.chat_options.reasoning_effort {
         Some(ReasoningEffort::None) => {
             thinking = false;
-            50
+            75
         }
-        Some(ReasoningEffort::Low) => 25,
-        Some(ReasoningEffort::High) => 50,
-        Some(ReasoningEffort::XHigh) => 75,
+        Some(ReasoningEffort::Low) => 50,
+        Some(ReasoningEffort::High) => 75,
         Some(ReasoningEffort::Max) => 100,
-        Some(ReasoningEffort::Minimal | ReasoningEffort::Medium) => {
-            return Err(invalid_v41_reasoning_effort());
-        }
+        Some(
+            ReasoningEffort::XHigh | ReasoningEffort::Minimal | ReasoningEffort::Medium,
+        ) => return Err(invalid_v41_reasoning_effort()),
         None => match request.chat_options.template_kwargs.get("reasoning_effort") {
-            None | Some(Value::Null) => 50,
+            None | Some(Value::Null) => 75,
             Some(Value::String(effort)) => match effort.as_str() {
-                "low" => 25,
-                "high" => 50,
-                "xhigh" => 75,
+                "low" => 50,
+                "high" => 75,
                 "max" => 100,
                 _ => return Err(invalid_v41_reasoning_effort()),
             },
@@ -301,7 +299,7 @@ fn resolve_v41_thinking_options(
 
 fn invalid_v41_reasoning_effort() -> Error {
     Error::InvalidReasoningEffort(
-        "DeepSeek V4.1 reasoning_effort must be low, high, xhigh, max, or an integer within [1, 100] in chat_template_kwargs".to_string(),
+        "DeepSeek V4.1 reasoning_effort must be low, high, max, or an integer within [1, 100] in chat_template_kwargs".to_string(),
     )
 }
 

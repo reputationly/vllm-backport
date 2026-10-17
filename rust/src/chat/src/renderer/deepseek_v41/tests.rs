@@ -86,10 +86,9 @@ fn inlines_image_placeholder_at_image_part_positions() {
 #[test]
 fn maps_reasoning_effort_to_reference_numeric_budget() {
     for (effort, budget) in [
-        (None, 50),
-        (Some(ReasoningEffort::Low), 25),
-        (Some(ReasoningEffort::High), 50),
-        (Some(ReasoningEffort::XHigh), 75),
+        (None, 75),
+        (Some(ReasoningEffort::Low), 50),
+        (Some(ReasoningEffort::High), 75),
         (Some(ReasoningEffort::Max), 100),
     ] {
         let mut request = request();
@@ -109,13 +108,13 @@ fn accepts_numeric_template_effort_with_top_level_precedence() {
         (json!(1), 1),
         (json!(42), 42),
         (json!(100), 100),
-        (json!("low"), 25),
+        (json!("low"), 50),
     ] {
         let mut request = request();
         request.chat_options.template_kwargs.insert("reasoning_effort".into(), effort);
         assert!(render(&request).contains(&format!("Reasoning Effort: {budget} (range 1-100")));
 
-        request.chat_options.reasoning_effort = Some(ReasoningEffort::XHigh);
+        request.chat_options.reasoning_effort = Some(ReasoningEffort::High);
         assert!(render(&request).contains("Reasoning Effort: 75 (range 1-100"));
     }
 }
@@ -125,6 +124,7 @@ fn rejects_undefined_effort_names_and_invalid_numeric_budgets() {
     for effort in [
         json!("medium"),
         json!("minimal"),
+        json!("xhigh"),
         json!(-1),
         json!(0),
         json!(101),
