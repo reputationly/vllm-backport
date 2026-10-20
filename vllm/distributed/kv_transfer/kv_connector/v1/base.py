@@ -481,6 +481,16 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def get_loaded_kv_cache_group_ids(self, request: "Request") -> tuple[int, ...]:
+        """KV cache groups restored by this connector's load for ``request``.
+
+        Called after ``get_num_new_matched_tokens`` returned a positive count.
+        Defaults to the prefix-cacheable groups, all a hash-addressed store
+        holds; a connector transferring the request's own blocks restores
+        every transfer group.
+        """
+        return self._kv_cache_config.prefix_cacheable_group_ids
+
     @abstractmethod
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
