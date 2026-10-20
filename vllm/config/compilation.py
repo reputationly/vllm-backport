@@ -649,6 +649,22 @@ class CompilationConfig:
     """Sizes to capture cudagraph.
     - None (default): capture sizes are inferred from vllm config.
     - list[int]: capture sizes are specified as given."""
+    cudagraph_decoder_replay: bool = True
+    """Run the decoder replay layers of YOCO models (e.g. DeepSeek-V4.1) in CUDA
+    graphs of their own, and trim them in PIECEWISE graph steps. Requires
+    breakable PIECEWISE graphs; off under LoRA, prompt embeddings and non-first
+    PP ranks."""
+
+    decoder_replay_cudagraph_capture_sizes: list[int] = field(default_factory=list)
+    """Decoder replay CUDA graph sizes for YOCO models (e.g. DeepSeek-V4.1), at
+    most max_num_batched_tokens. If empty: multiples of sliding_window up to
+    min(max_cudagraph_capture_size, max_num_seqs * sliding_window), coarser past
+    16 * sliding_window. Larger replay batches run eagerly."""
+
+    decoder_replay_trim_threshold: int = Field(default=768, ge=0)
+    """PIECEWISE model graphs of this many tokens or more break out to the
+    decoder replay batch; smaller ones keep the replay layers on the batch."""
+
     cudagraph_copy_inputs: bool = False
     """Whether to copy input tensors for
     cudagraph. If the caller can guarantee that the same input buffers
@@ -1035,6 +1051,11 @@ class CompilationConfig:
         ]:
             raise ValueError(
                 f"Invalid backend for piecewise compilation: {self.backend}"
+            )
+
+        if any(s <= 0 for s in self.decoder_replay_cudagraph_capture_sizes):
+            raise ValueError(
+                "All decoder_replay_cudagraph_capture_sizes must be positive"
             )
 
         # Validate encoder CUDA graph configuration
