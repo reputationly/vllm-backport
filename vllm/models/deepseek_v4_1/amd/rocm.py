@@ -7,6 +7,7 @@ from typing import cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -784,6 +785,18 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             source._topk_ragged_cache = {}
         cached = source._topk_ragged_cache.get(self.compress_ratio)
         if cached is not None:
+            if envs.VLLM_DSV41_CHECK_TOPK_RAGGED_REUSE:
+                # Self-test only: the consumer must agree with a fresh build.
+                rebuilt = compute_global_topk_ragged_indices_and_indptr(
+                    self.topk_indices_buffer[:num_decode_tokens],
+                    swa_metadata.token_to_req_indices,
+                    attn_metadata.block_table[:num_decodes],
+                    attn_metadata.block_size // self.compress_ratio,
+                    swa_metadata.is_valid_token[:num_decode_tokens],
+                )
+                assert all(
+                    torch.equal(a, b) for a, b in zip(rebuilt, cached)
+                ), "topk ragged reuse disagrees with a fresh build"
             return cached
 
         built = compute_global_topk_ragged_indices_and_indptr(

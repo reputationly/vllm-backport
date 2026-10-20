@@ -223,6 +223,8 @@ if TYPE_CHECKING:
     # DeepSeek-V4.1 frontend: encode a long prompt in parallel chunks and cache
     # chunk token ids across turns. Set to 0 to fall back to whole-string encode.
     VLLM_DSV41_SEGMENTED_ENCODE: bool = True
+    # Self-test only: rebuild consumer topk ragged metadata and compare.
+    VLLM_DSV41_CHECK_TOPK_RAGGED_REUSE: bool = False
     VLLM_DSV41_ENCODE_CACHE_TOKENS: int = 50_000_000
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_MOE_SKIP_PADDING: bool = True
@@ -1782,6 +1784,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DSV41_SEGMENTED_ENCODE": lambda: bool(
         int(os.getenv("VLLM_DSV41_SEGMENTED_ENCODE", "1"))
+    ),
+    "VLLM_DSV41_CHECK_TOPK_RAGGED_REUSE": lambda: bool(
+        int(os.getenv("VLLM_DSV41_CHECK_TOPK_RAGGED_REUSE", "0"))
     ),
     "VLLM_DSV41_ENCODE_CACHE_TOKENS": lambda: int(
         os.getenv("VLLM_DSV41_ENCODE_CACHE_TOKENS", "50000000")
