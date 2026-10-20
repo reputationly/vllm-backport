@@ -220,6 +220,10 @@ if TYPE_CHECKING:
         "relax",
     ] = "relax"
     VLLM_STARTUP_WARMUP_TOKENS: int = 0
+    # DeepSeek-V4.1 frontend: encode a long prompt in parallel chunks and cache
+    # chunk token ids across turns. Set to 0 to fall back to whole-string encode.
+    VLLM_DSV41_SEGMENTED_ENCODE: bool = True
+    VLLM_DSV41_ENCODE_CACHE_TOKENS: int = 50_000_000
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_MOE_SKIP_PADDING: bool = True
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
@@ -1775,6 +1779,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # For GLM a short warmup does not cover long requests: use >= 131072.
     "VLLM_STARTUP_WARMUP_TOKENS": lambda: int(
         os.getenv("VLLM_STARTUP_WARMUP_TOKENS", "0")
+    ),
+    "VLLM_DSV41_SEGMENTED_ENCODE": lambda: bool(
+        int(os.getenv("VLLM_DSV41_SEGMENTED_ENCODE", "1"))
+    ),
+    "VLLM_DSV41_ENCODE_CACHE_TOKENS": lambda: int(
+        os.getenv("VLLM_DSV41_ENCODE_CACHE_TOKENS", "50000000")
     ),
     # Whether to use fused grouped_topk used for MoE expert selection.
     "VLLM_USE_FUSED_MOE_GROUPED_TOPK": lambda: bool(
