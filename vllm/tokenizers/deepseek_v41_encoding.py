@@ -89,6 +89,7 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "type": "tool_result",
                 "tool_use_id": msg.get("tool_call_id", ""),
                 "content": msg.get("content", ""),
+                "_image_indices": msg.get("_image_indices", []),
             }
             # Merge into previous message if it's already a user (merged tool)
             if (
@@ -107,7 +108,13 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         elif role == "user":
             content_blocks = msg.get("content_blocks")
             if content_blocks is None:
-                content_blocks = [{"type": "text", "text": msg.get("content", "")}]
+                content_blocks = [
+                    {
+                        "type": "text",
+                        "text": msg.get("content", ""),
+                        "_image_indices": msg.get("_image_indices", []),
+                    }
+                ]
             if (
                 merged
                 and merged[-1].get("role") == "user"
@@ -181,8 +188,15 @@ REASONING_EFFORT_TEMPLATE = (
     "(range 1-100, the higher the value, the more thorough the reasoning)\n\n"
 )
 REASONING_EFFORT_MAPPINGS: Dict[str, int] = {
+    # Aliases follow deepseek-recipe's RequestReasoningEffort ->
+    # ReasoningEffort mapping (minimal/low -> 50, medium/high/xhigh -> 75,
+    # ultra/max -> 100).
+    "minimal": 50,
     "low": 50,
+    "medium": 75,
     "high": 75,
+    "xhigh": 75,
+    "ultra": 100,
     "max": 100,
 }
 
@@ -295,11 +309,18 @@ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
 
     V4.1 supports mid-conversation system messages, which count as user
     messages for the purposes of the assistant generation header.
+    User messages containing only tool results do not start a new turn.
     """
     last_user_index = -1
     for idx in range(len(messages) - 1, -1, -1):
         role = messages[idx].get("role")
         if role in ["user", "developer"] or (role == "system" and idx > 0):
+            content_blocks = messages[idx].get("content_blocks")
+            if content_blocks and not any(
+                block.get("type") in ("text", "image", "image_url")
+                for block in content_blocks
+            ):
+                continue
             last_user_index = idx
             break
     return last_user_index
@@ -311,6 +332,7 @@ def render_message(
     thinking_mode: str,
     drop_thinking: bool = True,
     reasoning_effort: Union[str, int, None] = None,
+    image_order: Optional[List[int]] = None,
 ) -> str:
     """
     Render a single message at the given index into its V4.1 encoded string form.
@@ -330,6 +352,15 @@ def render_message(
     tool_calls = msg.get("tool_calls")
     reasoning_content = msg.get("reasoning_content")
     wo_eos = msg.get("wo_eos", False)
+
+    # Collect source indices only from content that survives preprocessing.
+    if image_order is not None:
+        if role == "user" and msg.get("content_blocks"):
+            for block in msg["content_blocks"]:
+                if block.get("type") in ("text", "tool_result"):
+                    image_order.extend(block.get("_image_indices", []))
+        else:
+            image_order.extend(msg.get("_image_indices", []))
 
     if tools:
         tools = tools_from_openai_format(tools)
@@ -536,6 +567,7 @@ def encode_messages(
     drop_thinking: bool = True,
     add_default_bos_token: bool = True,
     reasoning_effort: Union[str, int, None] = None,
+    image_order: Optional[List[int]] = None,
 ) -> str:
     """Encode preprocessed (text-only) messages into the V4.1 prompt format."""
     context = context if context else []
@@ -571,6 +603,7 @@ def encode_messages(
             thinking_mode=thinking_mode,
             drop_thinking=effective_drop_thinking,
             reasoning_effort=reasoning_effort,
+            image_order=image_order,
         )
 
     return prompt
