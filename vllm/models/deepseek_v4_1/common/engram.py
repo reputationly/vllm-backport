@@ -690,6 +690,10 @@ class ParallelEngramEmbedding(nn.Module):
                 },
             )
         if cpu_offload:
+            # Constant dummy values avoid randomizing huge CPU lookup tables.
+            set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
+            # The ue8m0 encoding of scale 1.0 is exponent byte 127.
+            set_weight_attrs(self.weight_scale_inv, {"dummy_weight_value": 127})
             logger.info(
                 "Engram table offloaded to pinned host memory: %d rows x %d, "
                 "%.2f GiB per rank",
@@ -729,8 +733,11 @@ class ParallelEngramEmbedding(nn.Module):
         weight, scales = self._storage()
         # The table dwarfs TLB reach, so a persistent grid near the SM count
         # beats one program per row; halve it to leave SMs for the main stream.
-        tiles = triton.cdiv(rows, 16)
-        grid = min(tiles, self._num_sms // 2 if background else self._num_sms)
+        # GRID is a constexpr of the lookup kernel, so deriving it from the
+        # token count would JIT a fresh kernel on every new batch shape
+        # (observed as a first-request stall in production). Keep the grid
+        # shape-independent; extra programs simply run zero loop iterations.
+        grid = self._num_sms // 2 if background else self._num_sms
         _engram_lookup_kernel[(grid,)](
             weight.view(torch.uint8),
             scales,
