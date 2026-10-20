@@ -1674,7 +1674,7 @@ class MooncakeStoreWorker:
                     group.kv_cache_spec, self.dcp_size
                 ),
             )
-            for group in kv_cache_config.transfer_groups
+            for group in kv_cache_config.prefix_cacheable_groups
         ]
         spec_cfg = getattr(vllm_config, "speculative_config", None)
         use_eagle_block_drop = bool(
@@ -1912,10 +1912,17 @@ class MooncakeStoreWorker:
         assert self.cache_config.num_gpu_blocks is not None
         self.num_blocks = self.cache_config.num_gpu_blocks
 
+        store_layer_names = {
+            layer_name
+            for group in self._kv_cache_groups
+            for layer_name in group.layer_names
+        }
         seen_storage_ptrs: set[int] = set()
         cache_tensors: list[torch.Tensor] = []
 
-        for cache in kv_caches.values():
+        for layer_name, cache in kv_caches.items():
+            if layer_name not in store_layer_names:
+                continue
             cache = group_kernel_blocks(cache, self.num_blocks)
             cache_tensors.append(cache)
             cache_storage = cache.untyped_storage()
