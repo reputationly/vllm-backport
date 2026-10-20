@@ -194,7 +194,7 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
                 cache = _SegmentTokenCache(
                     int(envs.VLLM_DSV41_ENCODE_CACHE_TOKENS)
                 )
-                setattr(self, "_vllm_dsv41_segment_cache", cache)
+                self._vllm_dsv41_segment_cache = cache
             return cache
 
         def _dsv41_encode(

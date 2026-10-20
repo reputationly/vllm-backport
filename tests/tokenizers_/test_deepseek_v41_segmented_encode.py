@@ -55,7 +55,8 @@ def test_segmented_encode_matches_whole_string():
 
     tokenizer = DeepseekV41Tokenizer.from_pretrained(TOKENIZER_PATH)
     prompt = "".join(
-        f"## turn {i}\n\nquestion {i} with 12345 and punctuation.\n" for i in range(30_000)
+        f"## turn {i}\n\nquestion {i} with 12345 and punctuation.\n"
+        for i in range(30_000)
     )
     assert len(prompt) > _SEGMENT_MAX_CHARS
 

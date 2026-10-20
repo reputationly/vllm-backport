@@ -194,7 +194,7 @@ def test_fused_indexer_q_rope_quant_matches_unfused(
                 torch.empty_like(q_ref),
                 torch.empty_like(q_scale_ref)
                 .view(torch.uint8)
-                .reshape(num_tokens, N_HEAD, -1),
+                .reshape(num_tokens, n_head, -1),
                 torch.empty_like(weights_ref),
             )
         else:

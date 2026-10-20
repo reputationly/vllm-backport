@@ -113,7 +113,11 @@ def test_torch_and_triton_agree_when_gather_covers_window(compress_ratio, topk, 
     query_lens = [1, 4, 7]
     prefix_lens = [0, 2 * WINDOW + 17, WINDOW]
     seq_lens_list = [q + p for q, p in zip(query_lens, prefix_lens)]
-    gather_lens = [min(seq_lens_list[0], WINDOW), min(seq_lens_list[1], WINDOW + 5), seq_lens_list[2]]
+    gather_lens = [
+        min(seq_lens_list[0], WINDOW),
+        min(seq_lens_list[1], WINDOW + 5),
+        seq_lens_list[2],
+    ]
     M, N = 96, 4096
     topk_indices, qsl, seqlens, gathers = _make_inputs(
         num_reqs=num_reqs,
