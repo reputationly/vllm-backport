@@ -5,6 +5,7 @@
 # (vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/).
 """Data classes for MooncakeStoreConnector."""
 
+import typing
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import cast
@@ -115,6 +116,25 @@ class KeyMetadata:
     # Complete namespace for an opt-in Store payload format. Empty keeps
     # historical keys byte-identical.
     store_namespace: str = ""
+
+
+def store_group_layout_signature(kv_cache_config: typing.Any) -> str:
+    """Namespace tag for this store's KV-cache group projection.
+
+    Every key embeds the group's index in the store projection
+    (``@group:{i}``); changing which groups the store holds (a non-cacheable
+    ring, or the SWA groups under bounded replay) renumbers them. Tagging all
+    keys with the projection keeps replicas of different layouts from reading
+    each other's keys on a shared master.
+    """
+    groups = []
+    for group_id in kv_cache_config.prefix_cacheable_group_ids:
+        spec = kv_cache_config.kv_cache_groups[group_id].kv_cache_spec
+        groups.append(
+            f"{group_id}:{spec.block_size}:"
+            f"{int(getattr(spec, 'prefix_replay_tokens', 0))}"
+        )
+    return f"store_groups:v2:{','.join(groups)}"
 
 
 @dataclass(order=True)

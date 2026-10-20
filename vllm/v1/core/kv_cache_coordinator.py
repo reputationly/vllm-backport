@@ -63,7 +63,6 @@ def _validate_prefix_cache_retention_interval(
         )
 
 
-
 def replay_boundaries(
     num_prompt_tokens: int, scheduler_block_size: int, use_eagle: bool
 ) -> tuple[int, ...]:

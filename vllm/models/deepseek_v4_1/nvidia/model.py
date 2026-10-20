@@ -26,7 +26,6 @@ from vllm.model_executor.kernels.mhc.triton import hc_collapse_triton
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
-from vllm.model_executor.layers.fused_moe.moe_output import MoEOutput
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -533,10 +532,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.decoder_replay_start = self.end_layer
         kv_source_ids = getattr(config, "kv_source_layer_ids", None) or ()
         cut = max(kv_source_ids) if kv_source_ids else -1
+        replay_source = (
+            typing.cast(DeepseekV4DecoderLayer, self.layers[cut])
+            if 0 <= cut < len(self.layers)
+            else None
+        )
         if (
-            self.start_layer <= cut < self.end_layer - 1
+            replay_source is not None
+            and self.start_layer <= cut < self.end_layer - 1
             and self._decoder_replay_supported(vllm_config, cut)
-            and self.layers[cut].attn.swa_cache_layer.bounded_replay
+            and replay_source.attn.swa_cache_layer.bounded_replay
         ):
             self.decoder_replay_start = cut + 1
             # The attention metadata keys the replay layers read.
@@ -799,7 +804,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         engram_hashes: torch.Tensor | None = None,
         engram_mask: torch.Tensor | None = None,
     ) -> tuple[
-        torch.Tensor | MoEOutput,
+        torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -836,7 +841,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
     def _collapse(
         self,
-        hidden_states: torch.Tensor | MoEOutput,
+        hidden_states: torch.Tensor,
         residual: torch.Tensor,
         post_mix: torch.Tensor,
         res_mix: torch.Tensor,
@@ -929,9 +934,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 "the replay-layer batch shrinks per rank, which sequence and "
                 "prefill-context parallelism and microbatching cannot follow"
             )
-        elif any(
-            i > cut for i in getattr(self.config, "engram_layer_ids", ()) or ()
-        ):
+        elif any(i > cut for i in getattr(self.config, "engram_layer_ids", ()) or ()):
             reason = "an Engram layer sits after the last KV source layer"
         elif draft_config is not None and (
             draft_window is None

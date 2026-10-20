@@ -786,7 +786,8 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
         cached = source._topk_ragged_cache.get(self.compress_ratio)
         if cached is not None:
             if envs.VLLM_DSV41_CHECK_TOPK_RAGGED_REUSE:
-                # Self-test only: the consumer must agree with a fresh build.
+                # Self-test only (torch.equal syncs, so not under a CUDA graph):
+                # the consumer must agree with a fresh build.
                 rebuilt = compute_global_topk_ragged_indices_and_indptr(
                     self.topk_indices_buffer[:num_decode_tokens],
                     swa_metadata.token_to_req_indices,
@@ -794,9 +795,9 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                     attn_metadata.block_size // self.compress_ratio,
                     swa_metadata.is_valid_token[:num_decode_tokens],
                 )
-                assert all(
-                    torch.equal(a, b) for a, b in zip(rebuilt, cached)
-                ), "topk ragged reuse disagrees with a fresh build"
+                assert all(torch.equal(a, b) for a, b in zip(rebuilt, cached)), (
+                    "topk ragged reuse disagrees with a fresh build"
+                )
             return cached
 
         built = compute_global_topk_ragged_indices_and_indptr(

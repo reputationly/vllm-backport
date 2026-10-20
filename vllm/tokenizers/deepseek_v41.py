@@ -47,8 +47,20 @@ def _split_segments(text: str) -> list[str]:
                     cut = pos
                     break
                 pos -= 1
-            if cut > start:
-                end = cut
+            if cut < 0:
+                # No safe boundary in the window (single-line JSON, long digit
+                # runs): keep looking past it instead of cutting mid-token.
+                pos = end
+                while pos < n:
+                    if text[pos - 1] == "\n" and not text[pos].isspace():
+                        cut = pos
+                        break
+                    pos += 1
+            if cut < 0:
+                # No safe boundary in the rest either: keep it as one segment.
+                segments.append(text[start:])
+                break
+            end = cut
         segments.append(text[start:end])
         start = end
     return segments
@@ -168,8 +180,9 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
                 or (isinstance(effort, str) and effort in REASONING_EFFORT_MAPPINGS)
             ):
                 raise ValueError(
-                    "DeepSeek V4.1 reasoning_effort must be low, high, max, "
-                    "or an integer within [1, 100] in chat_template_kwargs"
+                    "DeepSeek V4.1 reasoning_effort must be one of "
+                    f"{sorted(REASONING_EFFORT_MAPPINGS)} or an integer within "
+                    "[1, 100] in chat_template_kwargs"
                 )
 
             prompt = encode_messages(
@@ -191,9 +204,7 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
         def _segment_cache(self) -> "_SegmentTokenCache":
             cache = getattr(self, "_vllm_dsv41_segment_cache", None)
             if cache is None:
-                cache = _SegmentTokenCache(
-                    int(envs.VLLM_DSV41_ENCODE_CACHE_TOKENS)
-                )
+                cache = _SegmentTokenCache(int(envs.VLLM_DSV41_ENCODE_CACHE_TOKENS))
                 self._vllm_dsv41_segment_cache = cache
             return cache
 
@@ -211,22 +222,23 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
                 or tokenizer_kwargs
                 or len(prompt) < _MIN_SEGMENTED_CHARS
             ):
-                return self.encode(
-                    prompt, add_special_tokens=False, **tokenizer_kwargs
-                )
+                return self.encode(prompt, add_special_tokens=False, **tokenizer_kwargs)
             segments = _split_segments(prompt)
             if len(segments) <= 1:
-                return self.encode(
-                    prompt, add_special_tokens=False, **tokenizer_kwargs
-                )
+                return self.encode(prompt, add_special_tokens=False, **tokenizer_kwargs)
 
             cache = self._segment_cache()
             keys = [_segment_key(segment) for segment in segments]
-            missing = [
-                (idx, segment)
-                for idx, (segment, key) in enumerate(zip(segments, keys))
-                if cache.get(key) is None
-            ]
+            # Keep this call's ids locally: a concurrent encode may evict a
+            # segment from the LRU between the lookup and the final assembly.
+            encoded: list[list[int] | None] = [None] * len(segments)
+            missing: list[tuple[int, str]] = []
+            for idx, (segment, key) in enumerate(zip(segments, keys)):
+                cached = cache.get(key)
+                if cached is not None:
+                    encoded[idx] = cached
+                else:
+                    missing.append((idx, segment))
             if missing:
                 backend = getattr(self, "backend_tokenizer", None)
                 if backend is not None and hasattr(backend, "encode_batch"):
@@ -234,18 +246,20 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
                         [segment for _, segment in missing],
                         add_special_tokens=False,
                     )
-                    encoded = [list(encoding.ids) for encoding in encodings]
+                    encoded_missing = [list(encoding.ids) for encoding in encodings]
                 else:
-                    encoded = [
+                    encoded_missing = [
                         list(self.encode(segment, add_special_tokens=False))
                         for _, segment in missing
                     ]
-                for (idx, _), ids in zip(missing, encoded):
-                    cache.put(keys[idx], ids)
+                for (idx, _), chunk_ids in zip(missing, encoded_missing):
+                    encoded[idx] = chunk_ids
+                    cache.put(keys[idx], chunk_ids)
 
             ids: list[int] = []
-            for key in keys:
-                ids.extend(cache.get(key) or ())
+            for chunk in encoded:
+                assert chunk is not None
+                ids.extend(chunk)
             return ids
 
         def num_special_tokens_to_add(self) -> int:

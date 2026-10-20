@@ -55,6 +55,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     StoreShardId,
     TailKeyBoundary,
     TPShardedStoreLayout,
+    store_group_layout_signature,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import (  # noqa: E501
     LOOKUP_MSG,
@@ -1693,6 +1694,11 @@ class MooncakeStoreWorker:
         )
         self.store_tp_size, store_namespace, store_layout_cls = (
             self._select_store_layout(extra_config)
+        )
+        # Keys embed the group's index in the store projection; include that
+        # projection in the namespace so layouts never share keys.
+        store_namespace = (
+            f"{store_namespace}@{store_group_layout_signature(kv_cache_config)}"
         )
         metadata = KeyMetadata(
             model_name=model_config.model.rstrip("/").split("/")[-1],
