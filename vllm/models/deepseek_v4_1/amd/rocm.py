@@ -17,7 +17,10 @@ from vllm.models.deepseek_v4_1.attention import (
     DeepseekV4Attention,
     _replace_layer_index,
 )
-from vllm.models.deepseek_v4_1.common.ops import dequantize_and_gather_k_cache
+from vllm.models.deepseek_v4_1.common.ops import (
+    combine_topk_swa_indices,
+    dequantize_and_gather_k_cache,
+)
 from vllm.models.deepseek_v4_1.sparse_mla import (
     DeepseekV4FlashMLAMetadata,
     DeepseekV4SparseMLABackend,
@@ -166,7 +169,7 @@ def _combine_topk_swa_indices_kernel(
         tl.store(combined_lens_ptr + token_idx, topk_len + swa_len)
 
 
-def combine_topk_swa_indices(
+def _combine_topk_swa_indices_torch(
     topk_indices: torch.Tensor,
     query_start_loc: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -183,8 +186,9 @@ def combine_topk_swa_indices(
     two-dimensional grid with 128 workers per request.  On gfx950 it can issue
     an out-of-bounds access for V4.1's mixed prefill metadata (including the
     synthetic mixed-token warmup).  This path is prefill-only and the tensors
-    are small, so use ordinary Torch indexing until a gfx950-safe fused kernel
-    is available.
+    are small, so ordinary Torch indexing is kept for gfx950 only; everywhere
+    else the shared Triton kernel is used (it also understands the replay
+    lower bound in ``gather_lens``).
     """
     topk_indices = topk_indices.reshape(topk_indices.shape[0], -1).contiguous()
     num_tokens = topk_indices.shape[0]
@@ -931,7 +935,12 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
 
-            combined_indices, combined_lens = combine_topk_swa_indices(
+            combine = (
+                _combine_topk_swa_indices_torch
+                if _ON_GFX950
+                else combine_topk_swa_indices
+            )
+            combined_indices, combined_lens = combine(
                 topk_indices[query_start:query_end],
                 query_start_loc[
                     num_decodes + chunk_start : num_decodes + chunk_end + 1

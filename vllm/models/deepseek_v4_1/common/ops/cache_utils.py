@@ -719,6 +719,10 @@ class CombineTopkSwaIndicesKernel(
                 right = 0
             left_add = tl.maximum(left - (WINDOW_SIZE - 1), 0)
             swa_start = tl.maximum(pos - (WINDOW_SIZE - 1) - left_add, 0)
+            # gather_len already excludes context below the request's replay
+            # start (SWA bounded replay), so the window cannot start before
+            # the gathered buffer does.
+            swa_start = tl.maximum(swa_start, gather_start)
             swa_len = pos + right - swa_start + 1
 
             offset = tl.arange(0, PADDED_TOP_K)
