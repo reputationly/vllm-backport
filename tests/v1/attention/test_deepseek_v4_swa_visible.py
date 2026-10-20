@@ -57,10 +57,13 @@ def ref_left_right(
     return lefts, rights
 
 
-def ref_swa_bounds(pos: int, window: int, left: int, right: int) -> tuple[int, int]:
-    """Reference [start, end) window bounds for one query token."""
+def ref_swa_bounds(
+    pos: int, window: int, left: int, right: int, replay_start: int = 0
+) -> tuple[int, int]:
+    """Reference [start, end) window bounds for one query token. Under SWA
+    bounded replay no window KV exists below ``replay_start``."""
     left_add = max(left - (window - 1), 0)
-    start = max(pos - (window - 1) - left_add, 0)
+    start = max(pos - (window - 1) - left_add, 0, replay_start)
     return start, pos + right + 1
 
 
@@ -97,12 +100,14 @@ def ref_swa_slot_rows(
     window: int,
     max_image_tokens: int,
     width: int,
+    replay_starts: list[int] | None = None,
 ) -> tuple[list[list[int]], list[int]]:
     """Reference paged slot-id rows and lens for every token in the batch."""
     block_table_cpu = block_table.cpu()
     lefts, rights = ref_left_right(
         seq_lens, query_lens, spans_per_req, max_image_tokens
     )
+    replay_starts = replay_starts or [0] * len(seq_lens)
     rows: list[list[int]] = []
     lens: list[int] = []
     token = 0
@@ -110,7 +115,9 @@ def ref_swa_slot_rows(
         prefix_len = seq_len - query_len
         for i in range(query_len):
             pos = prefix_len + i
-            start, end = ref_swa_bounds(pos, window, lefts[token], rights[token])
+            start, end = ref_swa_bounds(
+                pos, window, lefts[token], rights[token], replay_starts[req]
+            )
             row = []
             for p in range(start, end):
                 blk = int(block_table_cpu[req, p // BLOCK_SIZE])
@@ -129,6 +136,7 @@ def run_swa_kernel(
     window: int = WINDOW,
     max_image_tokens: int = MAX_IMG,
     with_image: bool = True,
+    replay_starts: list[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     device = torch.device("cuda")
     query_start_loc, seq_lens_t, token_to_req, slot_mapping, block_table = make_batch(
@@ -139,6 +147,9 @@ def run_swa_kernel(
     swa_indices = torch.zeros(num_tokens, 1, width, dtype=torch.int32, device=device)
     swa_lens = torch.zeros(num_tokens, dtype=torch.int32, device=device)
     is_valid = slot_mapping >= 0
+    replay_start_t = torch.zeros(len(seq_lens), dtype=torch.int32, device=device)
+    if replay_starts is not None:
+        replay_start_t.copy_(torch.tensor(replay_starts, dtype=torch.int32))
 
     if with_image:
         lefts, rights = ref_left_right(
@@ -164,6 +175,7 @@ def run_swa_kernel(
         block_table,
         block_table.stride(0),
         BLOCK_SIZE,
+        replay_start_t,
         token_offset=0,
         HAS_IMAGE=with_image,
         TRITON_BLOCK_SIZE=1024,
@@ -289,10 +301,13 @@ def combine_case(
     query_lens: list[int],
     spans: list[list[tuple[int, int]]],
     with_image: bool,
+    replay_starts: list[int] | None = None,
+    combine_fn=combine_topk_swa_indices,
 ):
     """Run combine_topk_swa_indices and return (indices, lens, expected)."""
     device = torch.device("cuda")
     num_reqs = len(seq_lens)
+    replay_starts = replay_starts or [0] * num_reqs
     query_start_loc = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
     query_start_loc[1:] = torch.tensor(
         query_lens, dtype=torch.int32, device=device
@@ -300,7 +315,10 @@ def combine_case(
     num_tokens = int(query_start_loc[-1])
     seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32, device=device)
     gather_lens = torch.tensor(
-        [q + min(s - q, WINDOW - 1) for s, q in zip(seq_lens, query_lens)],
+        [
+            q + min(max(s - q - r, 0), WINDOW - 1)
+            for s, q, r in zip(seq_lens, query_lens, replay_starts)
+        ],
         dtype=torch.int32,
         device=device,
     )
@@ -319,7 +337,7 @@ def combine_case(
     else:
         left_t = right_t = None
 
-    combined_indices, combined_lens = combine_topk_swa_indices(
+    combined_indices, combined_lens = combine_fn(
         topk_indices,
         query_start_loc,
         seq_lens_t,
@@ -353,7 +371,10 @@ def combine_case(
         for i in range(query_len):
             pos = prefix_len + i
             topk_len = min((pos + 1) // compress_ratio, topk)
-            start, end = ref_swa_bounds(pos, WINDOW, lefts[token], rights[token])
+            start, end = ref_swa_bounds(
+                pos, WINDOW, lefts[token], rights[token], replay_starts[b]
+            )
+            start = max(start, gather_start)
             swa_len = end - start
             row = [-1] * combined_topk
             for j in range(topk_len):
@@ -462,7 +483,9 @@ def test_flashinfer_mixed_sparse_indices_with_image_spans():
     assert actual == exp_rows[1:]
 
 
-def make_builder(vision: bool) -> DeepseekSparseSWAMetadataBuilder:
+def make_builder(
+    vision: bool, bounded_replay: bool = False
+) -> DeepseekSparseSWAMetadataBuilder:
     overrides: dict = {"sliding_window": WINDOW}
     if vision:
         overrides.update(vision_n_layers=2, vision_max_n_token=MAX_IMG)
@@ -480,6 +503,7 @@ def make_builder(vision: bool) -> DeepseekSparseSWAMetadataBuilder:
         sliding_window=WINDOW,
         cache_dtype_str="auto",
         model_version="deepseek_v4",
+        bounded_replay=bounded_replay,
     )
     return DeepseekSparseSWAMetadataBuilder(
         kv_cache_spec=spec,
@@ -494,10 +518,16 @@ def build_metadata(
     seq_lens: list[int],
     query_lens: list[int],
     mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None,
+    replay_starts: list[int] | None = None,
 ):
     device = torch.device("cuda")
     query_start_loc, seq_lens_t, _, slot_mapping, block_table = make_batch(
         seq_lens, query_lens, device
+    )
+    replay_start = (
+        None
+        if replay_starts is None
+        else torch.tensor(replay_starts, dtype=torch.int32, device=device)
     )
     return builder.build(
         0,
@@ -515,6 +545,7 @@ def build_metadata(
             causal=True,
             mm_req_doc_ranges=mm_req_doc_ranges,
         ),
+        replay_start=replay_start,
     )
 
 
@@ -578,3 +609,72 @@ def test_builder_text_model_unchanged():
     )
     assert md.prefill_swa_lens.cpu().tolist() == lens
     assert md.prefill_swa_indices[:, 0].cpu().tolist() == rows
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("cfg", COMBINE_CASES)
+def test_v41_combine_topk_swa_stops_at_replay_start(cfg):
+    """SWA bounded replay: the gathered buffer starts at replay_start, so the
+    window never indexes below it."""
+    from vllm.models.deepseek_v4_1.common.ops.cache_utils import (
+        combine_topk_swa_indices as combine_v41,
+    )
+
+    # Request 0 replays [16, 40): the windows of its first rows would
+    # otherwise reach below 16.
+    indices, lens, rows, exp_lens = combine_case(
+        cfg["compress_ratio"],
+        cfg["topk"],
+        seq_lens=[40, 12],
+        query_lens=[24, 12],
+        spans=[[], []],
+        with_image=False,
+        replay_starts=[16, 0],
+        combine_fn=combine_v41,
+    )
+    assert lens.cpu().tolist() == exp_lens
+    assert indices.cpu().tolist() == rows
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_builder_replay_start_bounds_prefill_window_and_gather():
+    """Paged-direct prefill indices stop at replay_start and the FlashMLA
+    gather only covers the context the request may see."""
+    seq_lens = [40, 12, 30]
+    query_lens = [24, 12, 10]
+    replay_starts = [12, 0, 0]
+    builder = make_builder(vision=False)
+    md = build_metadata(builder, seq_lens, query_lens, None, replay_starts)
+    assert md.replay_start is not None
+    assert md.replay_start.cpu().tolist() == replay_starts
+
+    _, _, _, _, block_table = make_batch(seq_lens, query_lens, torch.device("cuda"))
+    rows, lens = ref_swa_slot_rows(
+        seq_lens,
+        query_lens,
+        [[], [], []],
+        block_table,
+        WINDOW,
+        MAX_IMG,
+        WINDOW,
+        replay_starts=replay_starts,
+    )
+    assert md.prefill_swa_lens.cpu().tolist() == lens
+    assert md.prefill_swa_indices[:, 0].cpu().tolist() == rows
+    assert md.prefill_swa_lens[0].item() == 16 - 12 + 1
+    assert md.prefill_swa_lens[23].item() == WINDOW
+    assert md.prefill_gather_lens.cpu().tolist() == [
+        24 + min(16 - 12, WINDOW - 1),
+        12,
+        10 + min(20, WINDOW - 1),
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_builder_replaying_group_builds_without_replay_start():
+    """Graph captures build without model-specific kwargs: a replaying group's
+    metadata then bounds nothing."""
+    builder = make_builder(vision=False, bounded_replay=True)
+    md = build_metadata(builder, [40, 12], [24, 12], None)
+    assert not md.replay_start.any()
+    assert md.prefill_swa_lens[0].item() == WINDOW
