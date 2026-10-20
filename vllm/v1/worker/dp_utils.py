@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 
 import torch
 import torch.distributed as dist
@@ -17,6 +18,22 @@ from vllm.v1.worker.ubatch_utils import (
 )
 
 logger = init_logger(__name__)
+
+_skip_dp_coordination = ContextVar("skip_dp_coordination", default=False)
+
+
+@contextmanager
+def skip_dp_coordination():
+    """Run without coordinating DP metadata with other DP ranks."""
+    token = _skip_dp_coordination.set(True)
+    try:
+        yield
+    finally:
+        _skip_dp_coordination.reset(token)
+
+
+def should_skip_dp_coordination() -> bool:
+    return _skip_dp_coordination.get()
 
 
 def _get_device_and_group(parallel_config: ParallelConfig):
