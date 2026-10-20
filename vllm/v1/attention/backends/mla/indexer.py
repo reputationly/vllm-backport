@@ -921,6 +921,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.pcp_world_size = parallel_config.prefill_context_parallel_size
         self.use_pcp = self.pcp_world_size > 1
+        self.pcp_rank = get_pcp_group().rank_in_group if self.use_pcp else 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         # TP query-sharding of the (replicated) indexer. Held as size/rank so
         # the chunk partition is a pure function of them, and so size == 1
@@ -1361,10 +1362,18 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 factor = self.kv_cache_spec.block_size // kernel_block_size
                 indexer_block_table = (block_table[:, ::factor] // factor).contiguous()
             padded_num_tokens = num_tokens
-            if self.pcp_world_size > 1:
+            local_slot_mapping = slot_mapping
+            if self.use_pcp:
+                # The gathered layout holds each rank's local tokens, padded, in
+                # rank order, so this rank's segment lines up with query_start_loc.
                 padded_num_tokens = slot_mapping.shape[0] // self.pcp_world_size
+                local_slot_mapping = slot_mapping[
+                    self.pcp_rank * padded_num_tokens : (self.pcp_rank + 1)
+                    * padded_num_tokens
+                ]
             compressed_slot_mapping = get_compressed_slot_mapping(
                 num_tokens,
+                local_slot_mapping,
                 query_start_loc,
                 seq_lens,
                 indexer_block_table,
@@ -1674,6 +1683,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         if self.compress_ratio > 1:
             get_compressed_slot_mapping(
                 metadata.num_decode_tokens,
+                metadata.slot_mapping,
                 self.arange_buffer[: metadata.num_decode_tokens + 1],
                 metadata.seq_lens,
                 decode.block_table,

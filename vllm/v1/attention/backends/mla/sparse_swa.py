@@ -79,9 +79,12 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         cache_config: CacheConfig,
         backend_cls: "type[AttentionBackend] | None" = None,
         block_size: int = 64,
+        bounded_replay: bool = False,
     ):
         super().__init__()
         self.backend_cls = backend_cls or DeepseekSparseSWABackend
+        # DeepSeek-V4.1 SWA bounded replay.
+        self.bounded_replay = bounded_replay
         self.kv_cache = torch.tensor([])
         self.head_dim = head_dim
         self.window_size = window_size
@@ -109,6 +112,7 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         # bf16/fp8 cache uses the natural element-size page.
         uses_fp8_ds_mla_layout = self.cache_config.cache_dtype == "fp8_ds_mla"
         return SlidingWindowMLASpec(
+            bounded_replay=self.bounded_replay,
             block_size=self.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
@@ -194,6 +198,9 @@ class DeepseekSparseSWAMetadata:
     # None when the model is text-only or the batch has no image spans.
     prefill_left_visible: torch.Tensor | None = None
     prefill_right_visible: torch.Tensor | None = None
+    # SWA bounded replay: [num_reqs] lower bound of the positions a request's
+    # window attention may read; zeros when nothing replays.
+    replay_start: torch.Tensor | None = None
 
     # Number of decode/prefill requests/tokens (batch is reordered: decodes first)
     num_decodes: int = 0
@@ -325,6 +332,7 @@ class ComputePrefillMetadataKernel(
         # Inputs
         seq_lens_ptr,
         query_start_loc_ptr,
+        replay_start_ptr,
         num_prefills,
         num_decodes,
         window_size,
@@ -346,7 +354,10 @@ class ComputePrefillMetadataKernel(
 
         query_len = qsl_end - qsl_start
         prefix_len = seq_len - query_len
-        gather_len = query_len + tl.minimum(prefix_len, window_size - 1)
+        # Context below replay_start has no window KV (SWA bounded replay).
+        replay_start = tl.load(replay_start_ptr + num_decodes + safe_offset, mask=mask)
+        visible_prefix = tl.maximum(prefix_len - replay_start, 0)
+        gather_len = query_len + tl.minimum(visible_prefix, window_size - 1)
 
         tl.store(prefill_gather_lens_ptr + offset, gather_len, mask=mask)
 
@@ -378,6 +389,7 @@ class ComputePrefillMetadataKernel(
             prefill_gather_lens=int32_ptr,
             seq_lens=int32_ptr,
             query_start_loc=int32_ptr,
+            replay_start=int32_ptr,
             num_prefills=compile_key.block_size,
             num_decodes=0,
             window_size=1,
@@ -389,6 +401,7 @@ class ComputePrefillMetadataKernel(
         prefill_gather_lens: torch.Tensor,
         seq_lens: torch.Tensor,
         query_start_loc: torch.Tensor,
+        replay_start: torch.Tensor,
         num_prefills: int,
         num_decodes: int,
         window_size: int,
@@ -542,12 +555,19 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         )
         self.decode_swa_indices_noncausal: torch.Tensor | None = None
         self._max_tokens = max_tokens
+        # replay_start when no group replays: no lower bound.
+        self.no_replay_start = torch.zeros(
+            self.vllm_config.scheduler_config.max_num_seqs + 1,
+            dtype=torch.int32,
+            device=self.device,
+        )
 
     def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
+        replay_start: torch.Tensor | None = None,
     ) -> DeepseekSparseSWAMetadata:
         """Build SWA metadata for mixed decode/prefill batches.
 
@@ -579,6 +599,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
         is_valid_token.copy_(slot_mapping >= 0)
+        if replay_start is None:
+            # Graph captures build without it; their dummy batches replay nothing.
+            replay_start = self.no_replay_start
 
         non_causal = not common_attn_metadata.causal
         decode_swa_width = (
@@ -612,6 +635,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                     is_valid_token,
                     block_table,
                     self.block_size,
+                    replay_start,
                     num_tokens=num_decode_tokens,
                     token_offset=0,
                 )
@@ -675,6 +699,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 is_valid_token,
                 block_table,
                 self.block_size,
+                replay_start,
                 num_tokens=num_prefill_tokens,
                 token_offset=num_decode_tokens,
                 has_image=has_image,
@@ -688,6 +713,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             seq_lens_cpu,
             query_start_loc,
             query_start_loc_cpu,
+            replay_start,
         )
 
         # Per-layer-type tile-scheduler plan holders. Empty FlashMLASchedMeta
@@ -719,6 +745,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             ),
             prefill_left_visible=prefill_left_visible,
             prefill_right_visible=prefill_right_visible,
+            replay_start=replay_start,
             block_size=self.block_size,
             num_decodes=num_decodes,
             num_prefills=num_prefills,
@@ -795,6 +822,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         assert metadata.is_valid_token is not None
         assert metadata.decode_swa_indices is not None
         assert metadata.decode_swa_lens is not None
+        assert metadata.replay_start is not None
 
         _COMPUTE_SWA_INDICES_AND_LENS_KERNEL(
             metadata.decode_swa_indices,
@@ -809,6 +837,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             metadata.is_valid_token,
             metadata.block_table,
             self.block_size,
+            metadata.replay_start,
             num_tokens=metadata.num_decode_tokens,
             token_offset=0,
         )
@@ -870,6 +899,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         seq_lens_cpu: torch.Tensor | None,
         query_start_loc: torch.Tensor,
         query_start_loc_cpu: torch.Tensor,
+        replay_start: torch.Tensor,
     ) -> dict[str, torch.Tensor | int | None]:
         """Pre-compute DeepseekV4 prefill metadata during the metadata build phase.
 
@@ -891,6 +921,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 pfx_gather_lens,
                 seq_lens,
                 query_start_loc,
+                replay_start,
                 num_prefills,
                 num_decodes,
                 self.window_size,
@@ -974,6 +1005,7 @@ def _compute_swa_indices_and_lens_kernel(
     left_visible_ptr,
     right_visible_ptr,
     query_start_loc_ptr,
+    replay_start_ptr,
     seq_lens_ptr,
     token_to_req_indices_ptr,
     is_valid_token_ptr,
@@ -1020,6 +1052,8 @@ def _compute_swa_indices_and_lens_kernel(
         right = 0
     left_add = tl.maximum(left - (window_size - 1), 0)
     start_pos = tl.maximum(pos - (window_size - 1) - left_add, 0)
+    # Context below replay_start has no window KV (SWA bounded replay).
+    start_pos = tl.maximum(start_pos, tl.load(replay_start_ptr + req_idx))
     end_pos = pos + right + 1
 
     swa_len = end_pos - start_pos

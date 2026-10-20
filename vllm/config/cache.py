@@ -237,6 +237,12 @@ class CacheConfig:
     NOTE: KV cache sharing is not supported for MRv2 (v2 model runner).
     """
 
+    swa_bounded_replay: bool = False
+    """Keep the sliding-window KV of models that support it (DeepSeek-V4.1)
+    out of prefix caching and rebuild it after a prefix hit by recomputing the
+    hit's last window. Requires model runner V2. This fork keeps it off by
+    default and enables it per deployment."""
+
     kv_cache_memory_bytes: int | None = None
     """Size of KV Cache per GPU in bytes. By default, this is set to None
     and vllm can automatically infer the kv cache size based on
@@ -293,6 +299,7 @@ class CacheConfig:
             "kv_cache_max_concurrency",
             # WIP feature toggle not impacting compiled graph shape
             "kv_sharing_fast_prefill",
+            "swa_bounded_replay",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors
