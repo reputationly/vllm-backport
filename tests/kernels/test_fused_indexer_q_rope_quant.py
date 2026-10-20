@@ -256,7 +256,9 @@ def test_fused_indexer_q_rope_quant_matches_unfused(
     )
 
 
-@pytest.mark.skipif(not has_cutedsl(), reason="cutedsl (cutlass) not installed")
+@pytest.mark.skipif(
+    not is_cutedsl_supported(), reason="cutedsl (cutlass) not installed"
+)
 @pytest.mark.parametrize(
     "use_fp4",
     [
