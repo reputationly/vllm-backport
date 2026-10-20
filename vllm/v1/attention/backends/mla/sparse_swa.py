@@ -635,7 +635,6 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                     is_valid_token,
                     block_table,
                     self.block_size,
-                    replay_start,
                     num_tokens=num_decode_tokens,
                     token_offset=0,
                 )
@@ -653,6 +652,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                     is_valid_token,
                     block_table,
                     self.block_size,
+                    replay_start,
                     num_tokens=num_decode_tokens,
                     token_offset=0,
                 )
@@ -1143,6 +1143,7 @@ class ComputeSWAIndicesAndLensKernel(
             is_valid_token=TritonWarmupTensor(torch.bool),
             block_table=TritonWarmupTensor(torch.int32, shape=(1, 1), strides=(1, 1)),
             block_size=compile_key.block_size,
+            replay_start=int32_ptr,
             num_tokens=1,
             token_offset=0,
             has_image=bool(compile_key.has_image),
@@ -1163,6 +1164,7 @@ class ComputeSWAIndicesAndLensKernel(
         is_valid_token: torch.Tensor,
         block_table: torch.Tensor,
         block_size: int,
+        replay_start: torch.Tensor,
         *,
         num_tokens: int,
         token_offset: int,
