@@ -23,15 +23,11 @@ def _config(
 ) -> SimpleNamespace:
     groups = [
         SimpleNamespace(
-            kv_cache_spec=SimpleNamespace(
-                block_size=128, prefix_replay_tokens=replay
-            )
+            kv_cache_spec=SimpleNamespace(block_size=128, prefix_replay_tokens=replay)
         )
         for replay in replay_tokens
     ]
-    return SimpleNamespace(
-        prefix_cacheable_group_ids=group_ids, kv_cache_groups=groups
-    )
+    return SimpleNamespace(prefix_cacheable_group_ids=group_ids, kv_cache_groups=groups)
 
 
 def _key(namespace: str, group_id: int = 1) -> str:
