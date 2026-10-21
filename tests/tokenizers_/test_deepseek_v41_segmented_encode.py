@@ -49,11 +49,37 @@ def test_split_segments_keeps_short_text_whole():
 
 
 def test_split_segments_never_cuts_without_boundary():
-    """Single-line JSON has no newline: the whole prompt stays one segment."""
-    text = json.dumps({f"k{i}": "v" * 20 for i in range(12_000)})
-    assert "\n" not in text
-    assert len(text) > _SEGMENT_MAX_CHARS
+    """Text with no whitespace at all stays one segment."""
+    text = "a" * (3 * _SEGMENT_MAX_CHARS)
     assert _split_segments(text) == [text]
+
+
+def test_split_segments_cuts_at_whitespace_run_starts():
+    """A cut is either after a newline or right before a whitespace run."""
+    separators = [" ", "  ", "\t", "\u00a0", "\u3000", "\x1c", "\x1f"]
+    text = "".join(
+        f"part{i}," + separators[i % len(separators)] + '"key"' for i in range(20_000)
+    )
+    segments = _split_segments(text)
+    assert "".join(segments) == text
+    assert len(segments) > 1
+    for prev, nxt in zip(segments, segments[1:]):
+        if prev.endswith("\n"):
+            assert not nxt[:1].isspace()
+        else:
+            assert not prev[-1:].isspace()
+            assert nxt[:1].isspace()
+
+
+def test_split_segments_keeps_leading_space_with_next_word():
+    """``" word"`` is one pre-tokenizer unit: the space stays with the word."""
+    text = '", "key" ' * 20_000
+    segments = _split_segments(text)
+    assert "".join(segments) == text
+    assert len(segments) > 1
+    for prev, nxt in zip(segments, segments[1:]):
+        assert not prev.endswith(" ")
+        assert nxt.startswith(" ")
 
 
 def test_split_segments_extends_past_window_to_a_boundary():
@@ -94,7 +120,14 @@ def test_segmented_encode_keeps_ids_when_cache_evicts():
 )
 @pytest.mark.parametrize(
     "case",
-    ["multiline", "single_line_json", "digits", "base64"],
+    [
+        "multiline",
+        "single_line_json",
+        "single_line_json_spaces",
+        "digits",
+        "base64",
+        "space_separated",
+    ],
 )
 def test_segmented_encode_matches_whole_string(case):
     from vllm.tokenizers.deepseek_v41 import DeepseekV41Tokenizer
@@ -106,8 +139,14 @@ def test_segmented_encode_matches_whole_string(case):
         )
     elif case == "single_line_json":
         text = json.dumps({f"k{i}": "v" * 20 for i in range(12_000)})
+    elif case == "single_line_json_spaces":
+        text = json.dumps(
+            {f"field_{i}": "the quick brown fox " * 4 for i in range(4_000)}
+        )
     elif case == "digits":
         text = "1234567890" * 20_000
+    elif case == "space_separated":
+        text = " ".join(f"token{i}" for i in range(40_000))
     else:
         text = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=" * 5_000
     assert len(text) > _SEGMENT_MAX_CHARS

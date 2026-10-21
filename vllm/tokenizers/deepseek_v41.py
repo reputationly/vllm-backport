@@ -3,7 +3,9 @@
 
 import copy
 import hashlib
+import re
 import threading
+import time
 from collections import OrderedDict
 from typing import Any
 
@@ -11,6 +13,7 @@ from transformers import TokenizersBackend
 
 import vllm.envs as envs
 from vllm.entrypoints.chat_utils import ChatCompletionMessageParam
+from vllm.logger import init_logger
 
 from .deepseek_v41_encoding import (
     IMAGE_PLACEHOLDER,
@@ -20,17 +23,74 @@ from .deepseek_v41_encoding import (
 from .hf import HfTokenizer, get_cached_tokenizer
 from .protocol import TokenizerLike
 
+logger = init_logger(__name__)
+
 _SEGMENT_MAX_CHARS = 64 * 1024
 _MIN_SEGMENTED_CHARS = 8 * 1024
+
+# Cut right after a newline whose next character is not whitespace: the word
+# regex never spans it.
+_BOUNDARY_AFTER_NEWLINE = re.compile(r"\n(?=\S)")
+# Cut right before a whitespace run (previous character is non-whitespace).
+# The word regex attaches one leading space to the following word, so the run
+# must stay with the segment that starts at it, never with the one that ends
+# before it. Added tokens contain no whitespace, so this cannot split one.
+_BOUNDARY_BEFORE_WHITESPACE = re.compile(r"(?<=\S)(?=\s)")
+# Only the tail of a window is scanned for a boundary in the common case.
+_BOUNDARY_TAIL_CHARS = 4 * 1024
+
+
+def _last_boundary(
+    pattern: re.Pattern[str], text: str, start: int, end: int, *, after: bool
+) -> int:
+    cut = -1
+    for match in pattern.finditer(text, start, end):
+        cut = match.end() if after else match.start()
+    return cut
+
+
+def _first_boundary(
+    pattern: re.Pattern[str], text: str, start: int, end: int, *, after: bool
+) -> int:
+    match = pattern.search(text, start, end)
+    if match is None:
+        return -1
+    return match.end() if after else match.start()
+
+
+def _find_cut(text: str, start: int, end: int) -> int:
+    """Return a pre-tokenizer-safe cut position in ``(start, len(text))``.
+
+    Boundaries are dense in practice, so scan only the tail of the window first;
+    the full-window scan runs only for long unbroken runs.
+    """
+    n = len(text)
+    tail = max(start, end - _BOUNDARY_TAIL_CHARS)
+    cut = _first_boundary(_BOUNDARY_AFTER_NEWLINE, text, tail, end, after=True)
+    if cut > start:
+        return cut
+    cut = _first_boundary(_BOUNDARY_BEFORE_WHITESPACE, text, tail, end, after=False)
+    if cut > start:
+        return cut
+    cut = _last_boundary(_BOUNDARY_AFTER_NEWLINE, text, start, end, after=True)
+    if cut > start:
+        return cut
+    cut = _last_boundary(_BOUNDARY_BEFORE_WHITESPACE, text, start, end, after=False)
+    if cut > start:
+        return cut
+    cut = _first_boundary(_BOUNDARY_AFTER_NEWLINE, text, end, n, after=True)
+    if cut > start:
+        return cut
+    return _first_boundary(_BOUNDARY_BEFORE_WHITESPACE, text, end, n, after=False)
 
 
 def _split_segments(text: str) -> list[str]:
     """Split ``text`` at pre-tokenizer-safe boundaries, at most 64k chars each.
 
-    The DeepSeek V4.1 pre-tokenizer never lets a token span a newline followed
-    by a non-whitespace character (the optional prefix of the word regex
-    excludes ``\\r``/``\\n``), so both the whole string and every chunk encode
-    to the same ids.
+    Boundaries are a newline followed by a non-whitespace character, or the
+    start of a whitespace run whose previous character is not whitespace.
+    Neither can change how the DeepSeek V4.1 pre-tokenizer groups the text, so
+    the chunks encode to the same ids as the whole string.
     """
     n = len(text)
     if n <= _SEGMENT_MAX_CHARS:
@@ -40,24 +100,9 @@ def _split_segments(text: str) -> list[str]:
     while start < n:
         end = min(start + _SEGMENT_MAX_CHARS, n)
         if end < n:
-            cut = -1
-            pos = end
-            while pos > start:
-                if text[pos - 1] == "\n" and not text[pos].isspace():
-                    cut = pos
-                    break
-                pos -= 1
-            if cut < 0:
-                # No safe boundary in the window (single-line JSON, long digit
-                # runs): keep looking past it instead of cutting mid-token.
-                pos = end
-                while pos < n:
-                    if text[pos - 1] == "\n" and not text[pos].isspace():
-                        cut = pos
-                        break
-                    pos += 1
-            if cut < 0:
-                # No safe boundary in the rest either: keep it as one segment.
+            cut = _find_cut(text, start, end)
+            if cut <= start:
+                # No safe boundary anywhere in the rest: keep it whole.
                 segments.append(text[start:])
                 break
             end = cut
@@ -217,15 +262,32 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
             once and caching it by content makes the first turn pay for the whole
             prompt while later turns only encode the new tail.
             """
+            timing = envs.VLLM_DSV41_FRONTEND_TIMING
+            started = time.monotonic() if timing else 0.0
+
+            def _log_whole_string() -> None:
+                logger.info(
+                    "dsv41 whole-string encode: chars=%d segments=1 "
+                    "cache_miss=0 took_ms=%.1f",
+                    len(prompt),
+                    (time.monotonic() - started) * 1000.0,
+                )
+
             if (
                 not envs.VLLM_DSV41_SEGMENTED_ENCODE
                 or tokenizer_kwargs
                 or len(prompt) < _MIN_SEGMENTED_CHARS
             ):
-                return self.encode(prompt, add_special_tokens=False, **tokenizer_kwargs)
+                ids = self.encode(prompt, add_special_tokens=False, **tokenizer_kwargs)
+                if timing:
+                    _log_whole_string()
+                return ids
             segments = _split_segments(prompt)
             if len(segments) <= 1:
-                return self.encode(prompt, add_special_tokens=False, **tokenizer_kwargs)
+                ids = self.encode(prompt, add_special_tokens=False, **tokenizer_kwargs)
+                if timing:
+                    _log_whole_string()
+                return ids
 
             cache = self._segment_cache()
             keys = [_segment_key(segment) for segment in segments]
@@ -260,6 +322,16 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
             for chunk in encoded:
                 assert chunk is not None
                 ids.extend(chunk)
+            if timing:
+                logger.info(
+                    "dsv41 segmented encode: chars=%d segments=%d longest=%d "
+                    "cache_miss=%d took_ms=%.1f",
+                    len(prompt),
+                    len(segments),
+                    max(len(segment) for segment in segments),
+                    len(missing),
+                    (time.monotonic() - started) * 1000.0,
+                )
             return ids
 
         def num_special_tokens_to_add(self) -> int:

@@ -228,6 +228,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_eps = config.hc_eps
         self.hc_post_alpha = 2.0
         if vllm_config.kernel_config.enable_jit_warmup and current_platform.is_cuda():
+            from vllm.models.deepseek_v4_1.common.ops.cache_utils import (
+                _COMBINE_TOPK_SWA_INDICES_KERNEL,
+            )
+
+            _COMBINE_TOPK_SWA_INDICES_KERNEL.register_warmup()
+
+        if vllm_config.kernel_config.enable_jit_warmup and current_platform.is_cuda():
             from vllm.model_executor.kernels.mhc.warmup import MHC_PRE_NORM_KERNEL
 
             max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
