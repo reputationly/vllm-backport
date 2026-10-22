@@ -698,28 +698,35 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
         aux_hidden_by_layer: dict[int, torch.Tensor] = {}
         final_aux_recon: torch.Tensor | None = None
-        (
-            hidden_states,
-            residual,
-            post_mix,
-            res_mix,
-            pre_mix,
-            final_aux_recon,
-        ) = self._run_layer_range(
-            range(self.start_layer, self.decoder_replay_start),
-            hidden_states,
-            positions,
-            input_ids,
-            pre_mix,
-            post_mix,
-            res_mix,
-            residual,
-            aux_hidden_by_layer,
-            engram_hashes,
-            engram_mask,
-        )
         late_aux: list[torch.Tensor] = []
-        if self.decoder_replay_layers is not None:
+        replay_batch = (
+            self.decoder_replay_layers.replay_batch
+            if self.decoder_replay_layers is not None
+            else None
+        )
+        if self.decoder_replay_layers is not None and replay_batch is not None:
+            # A replay batch trims the layers past the last KV source; the two
+            # segments are unavoidable here.
+            (
+                hidden_states,
+                residual,
+                post_mix,
+                res_mix,
+                pre_mix,
+                final_aux_recon,
+            ) = self._run_layer_range(
+                range(self.start_layer, self.decoder_replay_start),
+                hidden_states,
+                positions,
+                input_ids,
+                pre_mix,
+                post_mix,
+                res_mix,
+                residual,
+                aux_hidden_by_layer,
+                engram_hashes,
+                engram_mask,
+            )
             hidden_states, pre_mix, *late_aux = self.decoder_replay_layers(
                 hidden_states,
                 positions,
@@ -730,6 +737,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 residual,
             )
         else:
+            # Without a replay batch the wrapper only forwards to the same
+            # layers; splitting there would keep the first segment's scratch
+            # alive across the second and cost ~0.4 GiB of measured KV.
             (
                 hidden_states,
                 residual,
@@ -738,7 +748,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 pre_mix,
                 final_aux_recon,
             ) = self._run_layer_range(
-                range(self.decoder_replay_start, self.end_layer),
+                range(self.start_layer, self.end_layer),
                 hidden_states,
                 positions,
                 input_ids,
