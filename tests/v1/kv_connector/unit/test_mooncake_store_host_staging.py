@@ -54,50 +54,51 @@ class _FakePool:
         self.committed = list(copies)
 
 
-def _make_worker(pool):
-    worker = object.__new__(mooncake_worker.MooncakeStoreWorker)
-    worker.store = _FakeStore()
-    worker.replicate_config = object()
-    worker._host_staging = pool
-    return worker
-
-
-def test_put_buffers_stages_and_chunks():
+def test_put_with_staging_chunks_and_rewrites_addrs():
+    store = _FakeStore()
     pool = _FakePool()
-    worker = _make_worker(pool)
     keys = ["k0", "k1", "k2"]
     addrs = [[10], [20], [30]]
     sizes = [[10], [10], [10]]
 
-    assert worker._put_buffers(keys, addrs, sizes) == [0, 0, 0]
+    assert mooncake_worker._batch_put_with_staging(
+        store, pool, keys, addrs, sizes, config=object()
+    ) == [0, 0, 0]
 
     # Capacity 20 fits two 10-byte keys, so the batch is split in two.
-    assert [len(call[0]) for call in worker.store.put_calls] == [2, 1]
-    assert worker.store.put_calls[0][1] == [[1010], [1020]]
-    assert worker.store.put_calls[1][1] == [[1030]]
+    assert [len(call[0]) for call in store.put_calls] == [2, 1]
+    assert store.put_calls[0][1] == [[1010], [1020]]
+    assert store.put_calls[1][1] == [[1030]]
 
 
-def test_get_buffers_stages_and_commits():
+def test_get_with_staging_commits_into_device():
+    store = _FakeStore()
     pool = _FakePool()
-    worker = _make_worker(pool)
     keys = ["k0", "k1"]
     addrs = [[10], [20]]
     sizes = [[10], [10]]
 
-    assert worker._get_buffers(keys, addrs, sizes) == [1, 1]
+    assert mooncake_worker._batch_get_with_staging(store, pool, keys, addrs, sizes) == [
+        1,
+        1,
+    ]
 
-    assert worker.store.get_calls[0][1] == [[1010], [1020]]
+    assert store.get_calls[0][1] == [[1010], [1020]]
     assert pool.committed == [(10, 1010, 10), (20, 1020, 10)]
 
 
-def test_buffers_without_staging_call_store_directly():
-    worker = _make_worker(None)
+def test_without_staging_calls_store_directly():
+    store = _FakeStore()
     keys = ["k0"]
     addrs = [[10]]
     sizes = [[10]]
 
-    assert worker._put_buffers(keys, addrs, sizes) == [0]
-    assert worker.store.put_calls[0][1] == [[10]]
+    assert mooncake_worker._batch_put_with_staging(
+        store, None, keys, addrs, sizes, config=object()
+    ) == [0]
+    assert store.put_calls[0][1] == [[10]]
 
-    assert worker._get_buffers(keys, addrs, sizes) == [1]
-    assert worker.store.get_calls[0][1] == [[10]]
+    assert mooncake_worker._batch_get_with_staging(store, None, keys, addrs, sizes) == [
+        1
+    ]
+    assert store.get_calls[0][1] == [[10]]

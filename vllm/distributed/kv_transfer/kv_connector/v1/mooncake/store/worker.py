@@ -291,6 +291,51 @@ def _split_by_capacity(
     return chunks
 
 
+# cudaMemcpyKind values from the CUDA runtime API.
+_CUDA_MEMCPY_HOST_TO_DEVICE = 1
+_CUDA_MEMCPY_DEVICE_TO_HOST = 2
+
+
+def _load_cudart_memcpy() -> Callable[..., int]:
+    """Resolve cudaMemcpy directly from libcudart via ctypes.
+
+    torch's cudart binding does not expose cudaMemcpy on every version, so the
+    staging pool calls the runtime library itself.
+    """
+    import ctypes
+    import glob
+
+    candidates: list[str] = []
+    cuda_version = getattr(torch.version, "cuda", None)
+    if cuda_version:
+        candidates.append(f"libcudart.so.{cuda_version.split('.')[0]}")
+    candidates.append("libcudart.so")
+    candidates.extend(
+        glob.glob("/usr/local/cuda*/lib64/libcudart.so*")
+        + glob.glob("/usr/lib/aarch64-linux-gnu/libcudart.so*")
+    )
+
+    library = None
+    for name in candidates:
+        try:
+            library = ctypes.CDLL(name)
+            break
+        except OSError:
+            continue
+    if library is None:
+        raise RuntimeError("libcudart not found; cannot stage KV through host")
+
+    memcpy = library.cudaMemcpy
+    memcpy.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+    ]
+    memcpy.restype = ctypes.c_int
+    return memcpy
+
+
 class HostStagingPool:
     """Pinned host buffer registered with Mooncake for staging KV payloads.
 
@@ -311,10 +356,10 @@ class HostStagingPool:
                 f"register_buffer failed for host staging buffer "
                 f"(addr={self.base_addr:#x}, len={capacity_bytes}): {ret}"
             )
-        self._cudart = torch.cuda.cudart()
+        self._memcpy_fn = _load_cudart_memcpy()
 
     def _memcpy(self, dst: int, src: int, size: int, kind: int) -> None:
-        err = self._cudart.cudaMemcpy(dst, src, size, kind)
+        err = self._memcpy_fn(dst, src, size, kind)
         if err != 0:
             raise RuntimeError(
                 f"cudaMemcpy failed (dst={dst:#x}, src={src:#x}, "
@@ -331,7 +376,7 @@ class HostStagingPool:
             key_host: list[int] = []
             for addr, size in zip(key_addrs, key_sizes, strict=True):
                 dst = self.base_addr + offset
-                self._memcpy(dst, addr, size, self._cudart.cudaMemcpyDeviceToHost)
+                self._memcpy(dst, addr, size, _CUDA_MEMCPY_DEVICE_TO_HOST)
                 key_host.append(dst)
                 offset += size
             host_addrs.append(key_host)
@@ -357,7 +402,51 @@ class HostStagingPool:
     def commit_in(self, copies: list[tuple[int, int, int]]) -> None:
         """Copy staged payloads back into device buffers."""
         for gpu_addr, host_addr, size in copies:
-            self._memcpy(gpu_addr, host_addr, size, self._cudart.cudaMemcpyHostToDevice)
+            self._memcpy(gpu_addr, host_addr, size, _CUDA_MEMCPY_HOST_TO_DEVICE)
+
+
+def _batch_put_with_staging(
+    store: Any,
+    pool: HostStagingPool | None,
+    keys: list[str],
+    addrs: list[list[int]],
+    sizes: list[list[int]],
+    config: Any,
+) -> list[int]:
+    if pool is None:
+        return store.batch_put_from_multi_buffers(keys, addrs, sizes, config)
+    results: list[int] = []
+    for start, end in _split_by_capacity(sizes, pool.capacity_bytes):
+        host_addrs = pool.stage_out(addrs[start:end], sizes[start:end])
+        results.extend(
+            store.batch_put_from_multi_buffers(
+                keys[start:end], host_addrs, sizes[start:end], config
+            )
+        )
+    return results
+
+
+def _batch_get_with_staging(
+    store: Any,
+    pool: HostStagingPool | None,
+    keys: list[str],
+    addrs: list[list[int]],
+    sizes: list[list[int]],
+) -> list[int]:
+    if pool is None:
+        return store.batch_get_into_multi_buffers(keys, addrs, sizes)
+    results: list[int] = []
+    for start, end in _split_by_capacity(sizes, pool.capacity_bytes):
+        host_addrs, copies = pool.stage_in(addrs[start:end], sizes[start:end])
+        chunk = store.batch_get_into_multi_buffers(
+            keys[start:end], host_addrs, sizes[start:end]
+        )
+        # Failed keys are not consumed; copying their staging contents is
+        # harmless and keeps the copy plan identical to the success path.
+        if any(value >= 0 for value in chunk):
+            pool.commit_in(copies)
+        results.extend(chunk)
+    return results
 
 
 def _get_usable_disk_offload_buffer_budget_bytes(raw_budget_bytes: int) -> int:
@@ -617,6 +706,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         supports_group_ids: bool = False,
         record_operation: Callable[..., None] | None = None,
         group_participates: Sequence[bool] | None = None,
+        host_staging: HostStagingPool | None = None,
     ):
         super().__init__(
             store,
@@ -627,6 +717,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             name="KVCacheStoreSendingThread",
             record_operation=record_operation,
         )
+        self.host_staging = host_staging
         # Only ranks with identical group bytes may stripe PUTs (e.g., MLA).
         self.group_put_steps = group_put_steps
         self.coord = coord
@@ -1221,7 +1312,14 @@ class KVCacheStoreSendingThread(KVTransferThread):
             batch_bytes = _sum_batch_bytes(sizes)
             put_start = time.perf_counter()
             try:
-                res = self._put_buffers(keys, addrs, sizes)
+                res = _batch_put_with_staging(
+                    self.store,
+                    self.host_staging,
+                    keys,
+                    addrs,
+                    sizes,
+                    self.replicate_config,
+                )
             except Exception as e:
                 self._record_operation(
                     "save_put",
@@ -1352,6 +1450,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         record_operation: Callable[..., None] | None = None,
         request_queue: queue.Queue[Any] | None = None,
         group_participates: Sequence[bool] | None = None,
+        host_staging: HostStagingPool | None = None,
     ):
         super().__init__(
             store,
@@ -1363,6 +1462,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             record_operation=record_operation,
             request_queue=request_queue,
         )
+        self.host_staging = host_staging
         self.group_participates = (
             list(group_participates)
             if group_participates is not None
@@ -1529,7 +1629,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     tiers_by_key = _get_replica_tiers_by_key(self.store, batch_keys)
                 # Reset so the recorded RPC duration excludes tier lookup.
                 load_get_start = time.perf_counter()
-                res = self._get_buffers(batch_keys, batch_addrs, batch_sizes)
+                res = _batch_get_with_staging(
+                    self.store, self.host_staging, batch_keys, batch_addrs, batch_sizes
+                )
                 if tiers_by_key is not None:
                     _log_mooncake_load_tier_summary(
                         req_id, batch_keys, res, tiers_by_key
@@ -2005,52 +2107,6 @@ class MooncakeStoreWorker:
             for g_idx, db in enumerate(self.token_dbs)
         )
 
-    def _put_buffers(
-        self,
-        keys: list[str],
-        addrs: list[list[int]],
-        sizes: list[list[int]],
-    ) -> list[int]:
-        pool = self._host_staging
-        if pool is None:
-            return self.store.batch_put_from_multi_buffers(
-                keys, addrs, sizes, self.replicate_config
-            )
-        results: list[int] = []
-        for start, end in _split_by_capacity(sizes, pool.capacity_bytes):
-            host_addrs = pool.stage_out(addrs[start:end], sizes[start:end])
-            results.extend(
-                self.store.batch_put_from_multi_buffers(
-                    keys[start:end],
-                    host_addrs,
-                    sizes[start:end],
-                    self.replicate_config,
-                )
-            )
-        return results
-
-    def _get_buffers(
-        self,
-        keys: list[str],
-        addrs: list[list[int]],
-        sizes: list[list[int]],
-    ) -> list[int]:
-        pool = self._host_staging
-        if pool is None:
-            return self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
-        results: list[int] = []
-        for start, end in _split_by_capacity(sizes, pool.capacity_bytes):
-            host_addrs, copies = pool.stage_in(addrs[start:end], sizes[start:end])
-            chunk = self.store.batch_get_into_multi_buffers(
-                keys[start:end], host_addrs, sizes[start:end]
-            )
-            # Failed keys are not consumed; copying their staging contents is
-            # harmless and keeps the copy plan identical to the success path.
-            if any(value >= 0 for value in chunk):
-                pool.commit_in(copies)
-            results.extend(chunk)
-        return results
-
     def register_kv_caches(
         self,
         kv_caches: dict[str, torch.Tensor],
@@ -2141,6 +2197,7 @@ class MooncakeStoreWorker:
                     group.kv_cache_spec.prefix_cacheable
                     for group in self._kv_cache_groups
                 ],
+                host_staging=self._host_staging,
             )
             self.kv_send_thread.start()
 
@@ -2162,6 +2219,7 @@ class MooncakeStoreWorker:
                     group.kv_cache_spec.prefix_cacheable
                     for group in self._kv_cache_groups
                 ],
+                host_staging=self._host_staging,
             )
             recv_thread.name = f"KVCacheStoreRecvingThread-{i}"
             recv_thread.start()
