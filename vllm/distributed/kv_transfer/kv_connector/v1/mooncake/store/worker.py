@@ -268,6 +268,98 @@ def _sum_batch_bytes(sizes: list[list[int]]) -> int:
     return sum(sum(size) for size in sizes)
 
 
+def _split_by_capacity(
+    sizes: list[list[int]], capacity_bytes: int
+) -> list[tuple[int, int]]:
+    """Split key ranges so each chunk's total payload fits the capacity."""
+    chunks: list[tuple[int, int]] = []
+    start = 0
+    used = 0
+    for index, key_sizes in enumerate(sizes):
+        key_bytes = sum(key_sizes)
+        if key_bytes > capacity_bytes:
+            raise ValueError(
+                f"Key payload {key_bytes} exceeds staging capacity {capacity_bytes}"
+            )
+        if used and used + key_bytes > capacity_bytes:
+            chunks.append((start, index))
+            start = index
+            used = 0
+        used += key_bytes
+    if start < len(sizes):
+        chunks.append((start, len(sizes)))
+    return chunks
+
+
+class HostStagingPool:
+    """Pinned host buffer registered with Mooncake for staging KV payloads.
+
+    Mooncake's GPUDirect path is not usable on every platform; staging copies
+    KV slices to host memory and transfers those instead, trading a copy for a
+    working RDMA data path.
+    """
+
+    def __init__(self, store: Any, capacity_bytes: int) -> None:
+        if capacity_bytes <= 0:
+            raise ValueError("host_staging_bytes must be positive")
+        self.capacity_bytes = capacity_bytes
+        self.buffer = torch.empty(capacity_bytes, dtype=torch.uint8, pin_memory=True)
+        self.base_addr = self.buffer.data_ptr()
+        ret = store.register_buffer(self.base_addr, capacity_bytes)
+        if ret != 0:
+            raise RuntimeError(
+                f"register_buffer failed for host staging buffer "
+                f"(addr={self.base_addr:#x}, len={capacity_bytes}): {ret}"
+            )
+        self._cudart = torch.cuda.cudart()
+
+    def _memcpy(self, dst: int, src: int, size: int, kind: int) -> None:
+        err = self._cudart.cudaMemcpy(dst, src, size, kind)
+        if err != 0:
+            raise RuntimeError(
+                f"cudaMemcpy failed (dst={dst:#x}, src={src:#x}, "
+                f"size={size}, kind={kind}): {err}"
+            )
+
+    def stage_out(
+        self, addrs: list[list[int]], sizes: list[list[int]]
+    ) -> list[list[int]]:
+        """Copy device payloads to the staging buffer and return its addrs."""
+        host_addrs: list[list[int]] = []
+        offset = 0
+        for key_addrs, key_sizes in zip(addrs, sizes, strict=True):
+            key_host: list[int] = []
+            for addr, size in zip(key_addrs, key_sizes, strict=True):
+                dst = self.base_addr + offset
+                self._memcpy(dst, addr, size, self._cudart.cudaMemcpyDeviceToHost)
+                key_host.append(dst)
+                offset += size
+            host_addrs.append(key_host)
+        return host_addrs
+
+    def stage_in(
+        self, addrs: list[list[int]], sizes: list[list[int]]
+    ) -> tuple[list[list[int]], list[tuple[int, int, int]]]:
+        """Allocate staging addrs and return copies to run after the transfer."""
+        host_addrs: list[list[int]] = []
+        copies: list[tuple[int, int, int]] = []
+        offset = 0
+        for key_addrs, key_sizes in zip(addrs, sizes, strict=True):
+            key_host: list[int] = []
+            for addr, size in zip(key_addrs, key_sizes, strict=True):
+                host_addr = self.base_addr + offset
+                key_host.append(host_addr)
+                copies.append((addr, host_addr, size))
+                offset += size
+            host_addrs.append(key_host)
+        return host_addrs, copies
+
+    def commit_in(self, copies: list[tuple[int, int, int]]) -> None:
+        """Copy staged payloads back into device buffers."""
+        for gpu_addr, host_addr, size in copies:
+            self._memcpy(gpu_addr, host_addr, size, self._cudart.cudaMemcpyHostToDevice)
+
+
 def _get_usable_disk_offload_buffer_budget_bytes(raw_budget_bytes: int) -> int:
     return max(1, int(raw_budget_bytes * envs.VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO))
 
@@ -1129,12 +1221,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             batch_bytes = _sum_batch_bytes(sizes)
             put_start = time.perf_counter()
             try:
-                res = self.store.batch_put_from_multi_buffers(
-                    keys,
-                    addrs,
-                    sizes,
-                    self.replicate_config,
-                )
+                res = self._put_buffers(keys, addrs, sizes)
             except Exception as e:
                 self._record_operation(
                     "save_put",
@@ -1442,9 +1529,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     tiers_by_key = _get_replica_tiers_by_key(self.store, batch_keys)
                 # Reset so the recorded RPC duration excludes tier lookup.
                 load_get_start = time.perf_counter()
-                res = self.store.batch_get_into_multi_buffers(
-                    batch_keys, batch_addrs, batch_sizes
-                )
+                res = self._get_buffers(batch_keys, batch_addrs, batch_sizes)
                 if tiers_by_key is not None:
                     _log_mooncake_load_tier_summary(
                         req_id, batch_keys, res, tiers_by_key
@@ -1544,6 +1629,22 @@ class MooncakeStoreWorker:
             extra_config.get("save_decode_cache", False)
         )
         self.load_async = extra_config.get("load_async", True)
+        staging_enabled = extra_config.get("host_staging", False)
+        if isinstance(staging_enabled, str):
+            staging_enabled = staging_enabled.strip().lower() in ("1", "true", "yes")
+        self.host_staging_bytes = 0
+        if staging_enabled:
+            try:
+                self.host_staging_bytes = _parse_size(
+                    extra_config.get("host_staging_bytes", "1GB")
+                )
+            except (TypeError, ValueError) as e:
+                logger.warning(
+                    "Invalid host_staging_bytes=%r (%s); host staging disabled",
+                    extra_config.get("host_staging_bytes"),
+                    e,
+                )
+        self._host_staging: HostStagingPool | None = None
         # Mirrors MooncakeStoreConnector._capacity_only.
         self._capacity_only = (
             self.kv_role == "kv_consumer"
@@ -1904,6 +2005,52 @@ class MooncakeStoreWorker:
             for g_idx, db in enumerate(self.token_dbs)
         )
 
+    def _put_buffers(
+        self,
+        keys: list[str],
+        addrs: list[list[int]],
+        sizes: list[list[int]],
+    ) -> list[int]:
+        pool = self._host_staging
+        if pool is None:
+            return self.store.batch_put_from_multi_buffers(
+                keys, addrs, sizes, self.replicate_config
+            )
+        results: list[int] = []
+        for start, end in _split_by_capacity(sizes, pool.capacity_bytes):
+            host_addrs = pool.stage_out(addrs[start:end], sizes[start:end])
+            results.extend(
+                self.store.batch_put_from_multi_buffers(
+                    keys[start:end],
+                    host_addrs,
+                    sizes[start:end],
+                    self.replicate_config,
+                )
+            )
+        return results
+
+    def _get_buffers(
+        self,
+        keys: list[str],
+        addrs: list[list[int]],
+        sizes: list[list[int]],
+    ) -> list[int]:
+        pool = self._host_staging
+        if pool is None:
+            return self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
+        results: list[int] = []
+        for start, end in _split_by_capacity(sizes, pool.capacity_bytes):
+            host_addrs, copies = pool.stage_in(addrs[start:end], sizes[start:end])
+            chunk = self.store.batch_get_into_multi_buffers(
+                keys[start:end], host_addrs, sizes[start:end]
+            )
+            # Failed keys are not consumed; copying their staging contents is
+            # harmless and keeps the copy plan identical to the success path.
+            if any(value >= 0 for value in chunk):
+                pool.commit_in(copies)
+            results.extend(chunk)
+        return results
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, torch.Tensor],
@@ -1952,6 +2099,23 @@ class MooncakeStoreWorker:
             len(cache_tensors),
             self.num_blocks,
         )
+
+        if self.host_staging_bytes > 0:
+            try:
+                self._host_staging = HostStagingPool(
+                    self.store, self.host_staging_bytes
+                )
+                logger.info(
+                    "Mooncake host staging enabled: %d bytes",
+                    self.host_staging_bytes,
+                )
+            except Exception as e:
+                self._host_staging = None
+                logger.error(
+                    "Failed to enable Mooncake host staging (%d bytes): %s",
+                    self.host_staging_bytes,
+                    e,
+                )
 
         for db in self.token_dbs:
             db.store_layout.register_kv_caches(cache_tensors, self.num_blocks)
