@@ -55,7 +55,10 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from vllm.model_executor.models.deepseek_v2 import _get_moe_router_dtype
+from vllm.model_executor.models.deepseek_v2 import (
+    _get_moe_router_dtype,
+    load_block_correction,
+)
 from vllm.model_executor.models.glm4_1v import (
     Glm4vDummyInputsBuilder,
     Glm4vForConditionalGeneration,
@@ -690,6 +693,8 @@ class Glm5NextModel(nn.Module):
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            # Installed by load_weights only for QuaRot-R1 checkpoints.
+            self.norm.register_buffer("mtp_input_correction", None, persistent=False)
         else:
             self.norm = PPMissingLayer()
 
@@ -847,6 +852,24 @@ class Glm5NextModel(nn.Module):
             name, loaded_weight = args[:2]
             kwargs: dict = args[2] if len(args) > 2 else {}
             if "rotary_emb.inv_freq" in name:
+                continue
+
+            # QuaRot-R1: correction buffers are not nn.Parameters, so they are
+            # absent from params_dict; install them on the owning module.
+            if name.endswith(".mtp_input_correction.blocks"):
+                if not is_pp_missing_parameter(name, self):
+                    load_block_correction(
+                        self.norm,
+                        "mtp_input_correction",
+                        loaded_weight,
+                        self.config.hidden_size,
+                    )
+                    logger.info_once(
+                        "Loaded QuaRot-R1 mtp_input_correction (%d blocks of %d).",
+                        loaded_weight.shape[0],
+                        loaded_weight.shape[1],
+                    )
+                loaded_params.add(name)
                 continue
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
@@ -1402,3 +1425,4 @@ def _install_r4_moe_hooks(model: nn.Module) -> None:
 
 Glm5NextForCausalLM.process_weights_after_loading = _install_r4_moe_hooks
 Glm5NextForConditionalGeneration.process_weights_after_loading = _install_r4_moe_hooks
+

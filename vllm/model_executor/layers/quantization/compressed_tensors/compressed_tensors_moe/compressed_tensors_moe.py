@@ -188,15 +188,26 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                 # with VLLM_MARLIN_INPUT_DTYPE=int8, otherwise the activations
                 # stay bf16 and this degrades to weight-only W4A16).
                 # CompressedTensorsW4A8Int8MoEMethod below is CPU/Arm-only.
+                # The checkpoint declares int8 (per-token) activations, so the
+                # Marlin kernels must quantize activations to int8 without
+                # requiring the user to set VLLM_MARLIN_INPUT_DTYPE.
+                import os as _os
+
                 from .compressed_tensors_moe_wna16 import (
                     CompressedTensorsWNA16MoEMethod,
                 )
 
+                _os.environ.setdefault("VLLM_MARLIN_INPUT_DTYPE", "int8")
                 logger.info_once(
-                    "Using CompressedTensorsWNA16MoEMethod for W4A8-INT MoE"
+                    "Using CompressedTensorsWNA16MoEMethod for W4A8-INT MoE "
+                    "(int8 activations enabled from the checkpoint config)"
                 )
                 return CompressedTensorsWNA16MoEMethod(
-                    weight_quant, input_quant, layer.moe_config, layer_name
+                    weight_quant,
+                    input_quant,
+                    layer.moe_config,
+                    layer_name,
+                    input_dtype_override=torch.int8,
                 )
 
             from .compressed_tensors_moe_w4a8_int8 import (

@@ -20,8 +20,12 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.deepseek_mtp import SharedHead
-from vllm.model_executor.models.deepseek_v2 import DeepseekV2MixtureOfExperts
+from vllm.model_executor.models.deepseek_v2 import (
+    DeepseekV2MixtureOfExperts,
+    apply_block_correction,
+)
 from vllm.model_executor.models.utils import get_pp_missing_layer_names, maybe_prefix
+from vllm.models.glm5next import r4
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
@@ -107,7 +111,12 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
             positions=positions, hidden_states=hidden_states, residual=None
         )
         hidden_states, _ = self.shared_head.norm(hidden_states, residual=residual)
-        return hidden_states, hidden_states
+        # QuaRot-R1: the recycled hidden needs the MTP final-norm gain
+        # restored; the logits path applies its own correction later.
+        hidden_recycle = apply_block_correction(
+            hidden_states, self.shared_head.recycle_correction
+        )
+        return hidden_states, hidden_recycle
 
 
 class Glm5NextMultiTokenPredictor(nn.Module):
@@ -186,7 +195,8 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         mtp_layer = self._mtp_layers[current_step_idx]
         # hidden_states is already post-final-norm (produced in the layer
         # forward and recycled as-is); apply the LM head only, without a
-        # second RMSNorm.
+        # second RMSNorm. QuaRot-R1: restore the MTP final-norm gain first.
+        hidden_states = mtp_layer.shared_head.apply_final_correction(hidden_states)
         return self.logits_processor(mtp_layer.shared_head.head, hidden_states)
 
     def get_top_tokens(
@@ -202,12 +212,17 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         # step. Tie-breaking matches the full argmax (shards are contiguous
         # and rank-ordered, so the lowest-rank winner is the lowest global
         # index), so greedy draft tokens are unchanged.
+        hidden_states = mtp_layer.shared_head.apply_final_correction(hidden_states)
         return self.logits_processor.get_top_tokens(
             mtp_layer.shared_head.head, hidden_states
         )
 
 
 class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
+    def process_weights_after_loading(self) -> None:
+        # QuaRot-R4: the draft model's MoE layer is folded like the target's.
+        r4.install_moe_hooks(self)
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -317,6 +332,26 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             kv_a_pad_size = self.config.qk_rope_head_dim
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+            if name.endswith("shared_head.final_correction.blocks") or name.endswith(
+                "shared_head.recycle_correction.blocks"
+            ):
+                target = (
+                    self.model.layers
+                    if hasattr(self, "model") and hasattr(self.model, "layers")
+                    else None
+                )
+                if target is not None:
+                    for layer in target.values():
+                        head = getattr(layer, "shared_head", None)
+                        if head is None:
+                            continue
+                        if name.endswith("final_correction.blocks"):
+                            head.load_final_correction(loaded_weight)
+                        else:
+                            head.load_recycle_correction(loaded_weight)
+                        break
+                loaded_params.add(name)
                 continue
             # Multimodal (Glm5NextForConditionalGeneration) checkpoints prefix
             # the text-tower weights with "model.language_model."; the MTP head

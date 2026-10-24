@@ -859,7 +859,10 @@ def _try_load_fp8_indexer_wk(
     """
     if "indexer.wk." not in name or "wk_weights" in name:
         return False  # Weight is not an isolated WK weight for the indexer, ignore.
-    is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
+    is_weight = name.endswith(".weight") and tensor.dtype in (
+        torch.float8_e4m3fn,
+        torch.int8,
+    )
     is_scale = "weight_scale" in name
     if not is_weight and not is_scale:
         return False  # WK is not in FP8 format, ignore.
@@ -905,6 +908,44 @@ def _try_load_fp8_indexer_wk(
     param.weight_loader(param, weight_bf16, 0)
     loaded_params.add(fused_name)
     return True
+
+
+# QuaRot-R1 block-diagonal corrections. A rotated checkpoint zeroes the gain of
+# every RMSNorm and folds it into the following Linear. That works while a norm
+# feeds a Linear, but `model.norm` and the MTP's `shared_head.norm` each feed a
+# second consumer (another RMSNorm), which cannot absorb a per-channel gain.
+# For those the gain comes back as Q @ diag(gamma) @ Q.T and is applied to the
+# tensor itself.
+def load_block_correction(
+    module: nn.Module, attr: str, blocks: torch.Tensor, hidden_size: int
+) -> None:
+    """Validate and install a correction buffer pre-registered as None."""
+    if blocks.ndim != 3 or blocks.shape[1] != blocks.shape[2]:
+        raise ValueError(
+            f"{attr}.blocks must be [num_blocks, block, block], "
+            f"got {tuple(blocks.shape)}"
+        )
+    covered = blocks.shape[0] * blocks.shape[1]
+    if covered != hidden_size:
+        raise ValueError(
+            f"{attr}.blocks covers {covered} channels but hidden_size "
+            f"is {hidden_size}"
+        )
+    ref = next(module.parameters())
+    setattr(module, attr, blocks.to(device=ref.device, dtype=ref.dtype))
+
+
+def apply_block_correction(
+    hidden_states: torch.Tensor, blocks: torch.Tensor | None
+) -> torch.Tensor:
+    """Multiply by a block-diagonal correction; no-op when it is absent."""
+    if blocks is None:
+        return hidden_states
+    num_blocks, block_size, _ = blocks.shape
+    shape = hidden_states.shape
+    h = hidden_states.reshape(-1, num_blocks, block_size).transpose(0, 1)
+    out = torch.bmm(h, blocks.transpose(1, 2))
+    return out.transpose(0, 1).reshape(shape)
 
 
 def _min_latency_fused_qkv_a_proj_impl(
@@ -1462,6 +1503,8 @@ class DeepseekV2Model(nn.Module):
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+            # Installed by load_weights only for QuaRot-R1 checkpoints.
+            self.norm.register_buffer("mtp_input_correction", None, persistent=False)
         else:
             self.norm = PPMissingLayer()
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
@@ -1626,6 +1669,24 @@ class DeepseekV2Model(nn.Module):
         }
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+
+            # QuaRot-R1: correction buffers are not nn.Parameters, so they are
+            # absent from params_dict; install them on the owning module.
+            if name.endswith(".mtp_input_correction.blocks"):
+                if not is_pp_missing_parameter(name, self):
+                    load_block_correction(
+                        self.norm,
+                        "mtp_input_correction",
+                        loaded_weight,
+                        self.hidden_size,
+                    )
+                    logger.info_once(
+                        "Loaded QuaRot-R1 mtp_input_correction (%d blocks of %d).",
+                        loaded_weight.shape[0],
+                        loaded_weight.shape[1],
+                    )
+                loaded_params.add(name)
                 continue
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
@@ -1958,6 +2019,16 @@ class DeepseekV2ForCausalLM(
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
+
+    def get_mtp_target_hidden_states(
+        self, hidden_states: torch.Tensor | None = None
+    ) -> torch.Tensor | None:
+        # QuaRot-R1: the drafter's step-0 input is the main model's
+        # post-final-norm hidden, whose per-channel gain is restored here.
+        mtp_correction = getattr(self.model.norm, "mtp_input_correction", None)
+        if mtp_correction is None or hidden_states is None:
+            return None
+        return apply_block_correction(hidden_states, mtp_correction)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales

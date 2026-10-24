@@ -10,6 +10,7 @@ from transformers import PretrainedConfig
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import tensor_model_parallel_all_gather
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
@@ -38,12 +39,16 @@ from .deepseek_v2 import (
     DeepseekV2MixtureOfExperts,
     DeepseekV2MoE,
     _try_load_fp8_indexer_wk,
+    apply_block_correction,
+    load_block_correction,
 )
 from .utils import (
     get_pp_missing_layer_names,
     get_spec_layer_idx_from_weight_name,
     maybe_prefix,
 )
+
+logger = init_logger(__name__)
 
 
 class SharedHead(nn.Module):
@@ -61,9 +66,25 @@ class SharedHead(nn.Module):
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "head"),
         )
+        # QuaRot-R1 corrections; registered by load_weights only when present.
+        self.register_buffer("final_correction", None, persistent=False)
+        self.register_buffer("recycle_correction", None, persistent=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.norm(hidden_states)
+
+    def load_final_correction(self, blocks: torch.Tensor) -> None:
+        load_block_correction(
+            self, "final_correction", blocks, self.norm.weight.shape[0]
+        )
+
+    def load_recycle_correction(self, blocks: torch.Tensor) -> None:
+        load_block_correction(
+            self, "recycle_correction", blocks, self.norm.weight.shape[0]
+        )
+
+    def apply_final_correction(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return apply_block_correction(hidden_states, self.final_correction)
 
 
 class DeepSeekMultiTokenPredictorLayer(nn.Module):
@@ -134,7 +155,10 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         # compute_logits applies shared_head (== final norm) to the pre-norm
         # element, so logits and the recycle each get exactly one final-norm.
         # Matches SGLang's deepseek_nextn.
-        return hidden_states, self.shared_head(hidden_states)
+        hidden_recycle = apply_block_correction(
+            self.shared_head(hidden_states), self.shared_head.recycle_correction
+        )
+        return hidden_states, hidden_recycle
 
 
 class DeepSeekMultiTokenPredictor(nn.Module):
@@ -223,10 +247,10 @@ class DeepSeekMultiTokenPredictor(nn.Module):
     ) -> torch.Tensor:
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
-        logits = self.logits_processor(
-            mtp_layer.shared_head.head, mtp_layer.shared_head(hidden_states)
+        hidden_states = mtp_layer.shared_head.apply_final_correction(
+            mtp_layer.shared_head(hidden_states)
         )
-        return logits
+        return self.logits_processor(mtp_layer.shared_head.head, hidden_states)
 
 
 @support_torch_compile
@@ -346,6 +370,21 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 self.is_fused_shared_expert_enabled and ("mlp.shared_experts" in name)
             )
             name = self._rewrite_spec_layer_name(spec_layer, name)
+
+            if name.endswith("shared_head.final_correction.blocks"):
+                if str(spec_layer) in self.model.layers:
+                    self.model.layers[
+                        str(spec_layer)
+                    ].shared_head.load_final_correction(loaded_weight)
+                loaded_params.add(name)
+                continue
+            if name.endswith("shared_head.recycle_correction.blocks"):
+                if str(spec_layer) in self.model.layers:
+                    self.model.layers[
+                        str(spec_layer)
+                    ].shared_head.load_recycle_correction(loaded_weight)
+                loaded_params.add(name)
+                continue
 
             if _try_load_fp8_indexer_wk(
                 name,

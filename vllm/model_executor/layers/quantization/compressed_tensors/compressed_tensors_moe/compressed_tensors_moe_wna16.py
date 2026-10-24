@@ -58,6 +58,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         input_quant: QuantizationArgs | None,
         moe: FusedMoEConfig,
         layer_name: str | None = None,
+        input_dtype_override: torch.dtype | None = None,
     ):
         super().__init__(moe)
         self.weight_quant = weight_quant
@@ -110,6 +111,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             allow_tile_padding=True,
         )
 
+        self._input_dtype_override = input_dtype_override
         self.is_marlin = self.wna16_backend in [
             WNA16MoEBackend.MARLIN,
             WNA16MoEBackend.BATCHED_MARLIN,
@@ -123,7 +125,11 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             assert check_moe_marlin_supports_config(
                 self.moe, self.group_size, allow_tile_padding=True
             )
-            self.input_dtype = get_marlin_input_dtype(layer_name)
+            self.input_dtype = (
+                input_dtype_override
+                if input_dtype_override is not None
+                else get_marlin_input_dtype(layer_name)
+            )
         else:
             # channelwise is not supported by this kernel
             assert weight_quant.strategy == "group"
