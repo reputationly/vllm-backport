@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import re
 from collections.abc import Iterable
 from typing import ClassVar, Literal
 
@@ -80,6 +81,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_reduce_scatter,
     sp_shard,
 )
+from vllm.models.glm5next import r4
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -95,6 +97,11 @@ from .multimodal import (
 
 logger = init_logger(__name__)
 
+# QuaRot-R1 MTP corrections are only loaded once MTP is ported.
+_MTP_CORRECTION_KEYS = re.compile(
+    r"mtp_input_correction|final_correction|recycle_correction"
+)
+
 
 class Glm5NextMLP(nn.Module):
     def __init__(
@@ -107,6 +114,7 @@ class Glm5NextMLP(nn.Module):
         is_sequence_parallel=False,
         prefix: str = "",
         swiglu_limit: float | None = None,
+        r4_role: str | None = None,
     ) -> None:
         super().__init__()
 
@@ -142,9 +150,26 @@ class Glm5NextMLP(nn.Module):
         else:
             self.act_fn = SiluAndMul()
 
+        # QuaRot-R4: the checkpoint's down_proj was folded with a
+        # block-diagonal Hadamard over its input (the SwiGLU activation).
+        # Re-apply it online, after the activation and before down_proj.
+        self._r4_rotation = None
+        self._r4_offset = 0
+        if r4_role is not None:
+            dim = r4.role_dim(r4_role)
+            if dim is not None and dim == intermediate_size:
+                self._r4_rotation = r4.rotation_for_dim(dim)
+        if self._r4_rotation is not None:
+            local = self.down_proj.input_size_per_partition
+            self._r4_offset = (
+                0 if local == intermediate_size else self.down_proj.tp_rank * local
+            )
+
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
+        if self._r4_rotation is not None:
+            x = self._r4_rotation.apply(x, offset=self._r4_offset)
         x, _ = self.down_proj(x)
         return x
 
@@ -169,6 +194,10 @@ class Glm5NextMoE(nn.Module):
         self.ep_size = self.ep_group.size()
         self.n_routed_experts: int = config.n_routed_experts
         self.n_shared_experts: int = config.n_shared_experts
+
+        # QuaRot-R4 manifest (idempotent; no-op without it).
+        r4.configure(config)
+        self._r4_routed_dim = r4.role_dim("routed_experts")
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
@@ -221,6 +250,7 @@ class Glm5NextMoE(nn.Module):
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
                 swiglu_limit=swiglu_limit,
+                r4_role="shared_experts",
             )
 
         self.experts = FusedMoEFactory(
@@ -358,6 +388,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
                 swiglu_limit=config.swiglu_limit,
+                r4_role="dense_mlp",
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # Cached for the hot forward path (isinstance per layer per step).
@@ -582,6 +613,26 @@ class Glm5NextModel(nn.Module):
 
         config = vllm_config.model_config.hf_config
         self.config = config
+        # QuaRot-R4 manifest lives in the top-level config.json; the text
+        # sub-config handed to the model does not carry it.
+        r4.configure(config)
+        if not r4.enabled():
+            try:
+                import json as _json
+                import os as _os
+
+                _cfg_path = _os.path.join(vllm_config.model_config.model, "config.json")
+                with open(_cfg_path) as _f:
+                    _raw = _json.load(_f)
+                if "kunlun_online_transforms" in _raw:
+                    r4.configure(_raw)
+            except (OSError, ValueError):
+                pass
+        if r4.enabled():
+            logger.info(
+                "R4 online Hadamard active for routed_experts dim=%s",
+                r4.role_dim("routed_experts"),
+            )
 
         self.vocab_size = config.vocab_size
         self.device = current_platform.device_type
@@ -914,18 +965,35 @@ class Glm5NextModel(nn.Module):
                     if is_pp_missing_parameter(name, self):
                         continue
 
-                    param = params_dict[name]
+                    try:
+                        param = params_dict[name]
+                    except KeyError:
+                        if _MTP_CORRECTION_KEYS.search(name):
+                            logger.warning_once(
+                                "Skipping MTP-only correction tensor %s", name
+                            )
+                            continue
+                        raise
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
+
         return loaded_params
 
 
 class Glm5NextForCausalLM(
     nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid
 ):
+    # GLM-5.3 checkpoints store dense-MLP gate/up and MLA q_a/kv_a as separate
+    # tensors; the fused modules must expand to the real shard names so the
+    # per-layer quant scheme resolves to the quantized variant.
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+    }
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.model_config = vllm_config.model_config
@@ -1027,6 +1095,11 @@ class Glm5NextForCausalLM(
 class Glm5NextForConditionalGeneration(
     Glm4vForConditionalGeneration, HasInnerState, IsHybrid, MixtureOfExperts
 ):
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+    }
+
     # The text model (KDA + dense-MLA + MoE) is a hybrid mamba model. The
     # multimodal wrapper must declare the same interfaces so vLLM treats it as
     # hybrid (auto-aligns mamba/attention block sizes, sizes the mamba state
@@ -1268,8 +1341,20 @@ def _try_load_fp8_attn_proj(
     if matched is None:
         return False
     suffix, (key, target_base, shard_id, is_kva) = matched
+    layer_prefix = name.rsplit(suffix, 1)[0]
+    target_w = f"{layer_prefix}.{target_base}.weight"
+    # If the model kept this projection quantized, let the normal path load the
+    # weight and its scale. FP8 modules carry ``weight_scale_inv``; INT8/W8A8
+    # modules carry ``weight_scale``. Intercepting an INT8 scale here would
+    # drop it silently and leave the layer with uninitialized scales.
+    if (
+        f"{layer_prefix}.{target_base}.weight_scale_inv" in params_dict
+        or f"{layer_prefix}.{target_base}.weight_scale" in params_dict
+    ):
+        return False
+
     is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
-    is_scale = "weight_scale_inv" in name
+    is_scale = "weight_scale_inv" in name or name.endswith(".weight_scale")
     if not is_weight and not is_scale:
         return False
     if any(
@@ -1277,14 +1362,6 @@ def _try_load_fp8_attn_proj(
         for missing_layer_name in pp_missing_layer_names
     ):
         return True
-
-    layer_prefix = name.rsplit(suffix, 1)[0]
-    target_w = f"{layer_prefix}.{target_base}.weight"
-    target_s = f"{layer_prefix}.{target_base}.weight_scale_inv"
-    # If the model actually kept this projection in FP8, let the normal path
-    # handle it (it has a weight_scale_inv param).
-    if target_s in params_dict:
-        return False
 
     entry = buf.setdefault(layer_prefix, {}).setdefault(key, {})
     entry["weight" if is_weight else "scale"] = tensor
@@ -1312,3 +1389,16 @@ def _try_load_fp8_attn_proj(
         param.weight_loader(param, weight_bf16, shard_id)
     loaded_params.add(target_w)
     return True
+
+
+def _install_r4_moe_hooks(model: nn.Module) -> None:
+    """Attach the online R4 Hadamard to modular routed-experts kernels."""
+    try:
+        installed = r4.install_moe_hooks(model)
+        logger.info("R4 diag: routed-expert hooks installed=%d", installed)
+    except RuntimeError as exc:  # noqa: BLE001 - surfaced as a warning
+        logger.warning("R4 routed-experts hook not installed: %s", exc)
+
+
+Glm5NextForCausalLM.process_weights_after_loading = _install_r4_moe_hooks
+Glm5NextForConditionalGeneration.process_weights_after_loading = _install_r4_moe_hooks
