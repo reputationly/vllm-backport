@@ -9,6 +9,7 @@ import torch
 
 import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     ApplyMoEActivationConfig,
     MoEActivation,
@@ -55,6 +56,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
+
+logger = init_logger(__name__)
 
 
 def _fused_marlin_moe(
@@ -122,6 +125,11 @@ def _fused_marlin_moe(
     a_scales1 = None
     gate_up_input = hidden_states
     if input_dtype == torch.int8:
+        logger.info_once(
+            "Marlin MoE quantizing activations to int8 (per-token), "
+            "global_scale=%s",
+            input_global_scale1 is not None,
+        )
         gate_up_input, a_scales1 = marlin_quant_input(hidden_states, input_dtype)
         if input_global_scale1 is not None:
             a_scales1 = a_scales1 * input_global_scale1
