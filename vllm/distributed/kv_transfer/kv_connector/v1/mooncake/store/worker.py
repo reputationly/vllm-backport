@@ -146,17 +146,24 @@ _DIRECT_IO_ALIGNMENT = 4096
 _DIRECT_IO_PADDING_BYTES = 2 * _DIRECT_IO_ALIGNMENT
 
 
-MooncakeMode = Literal["embedded", "standalone-store"]
+MooncakeMode = Literal["embedded", "standalone-store", "dummy"]
 
 
 @dataclass
 class MooncakeStoreConfig:
     """Configuration for MooncakeDistributedStore.
 
-    ``mode`` selects the topology: ``embedded`` (each rank contributes
-    ``global_segment_size`` in-process) or ``standalone-store`` (rank
-    contributes 0; an external ``mooncake_client`` process owns the pool
-    and the SSD tier).
+    ``mode`` selects the topology:
+
+    * ``embedded`` - each rank contributes ``global_segment_size`` in-process;
+    * ``standalone-store`` - the rank contributes 0 and an external
+      ``mooncake_client`` owns the pool and the SSD tier, but the rank still
+      issues the data-plane operations from its own process;
+    * ``dummy`` - the rank attaches to a node-local ``mooncake_client`` through
+      ``setup_dummy()``, so the client relays every store operation and
+      same-host saves/loads never become a cross-process RDMA WRITE from the
+      inference process. ``global_segment_size`` is ignored in this mode and
+      ``client_server_address`` points at the node-local client's RPC endpoint.
     """
 
     metadata_server: str
@@ -168,9 +175,15 @@ class MooncakeStoreConfig:
     local_buffer_size: int = DEFAULT_LOCAL_BUFFER_SIZE
     enable_offload: bool = False
     tenant_id: str = DEFAULT_TENANT_ID
+    # ``dummy`` mode only: RPC endpoint of the node-local mooncake_client.
+    client_server_address: str = ""
+    # ``dummy`` mode only: sizes handed to setup_dummy(). The mem pool backs
+    # every buffer the client has to map, including the host staging pool.
+    dummy_mem_pool_size: int = DEFAULT_LOCAL_BUFFER_SIZE
+    dummy_local_buffer_size: int = DEFAULT_LOCAL_BUFFER_SIZE
 
     def __post_init__(self) -> None:
-        if self.mode not in ("embedded", "standalone-store"):
+        if self.mode not in ("embedded", "standalone-store", "dummy"):
             raise ValueError(f"unknown Mooncake mode: {self.mode!r}")
         if self.local_buffer_size <= 0:
             raise ValueError("local_buffer_size must be > 0")
@@ -178,6 +191,16 @@ class MooncakeStoreConfig:
             raise ValueError("embedded mode requires global_segment_size > 0")
         if self.mode == "standalone-store" and self.global_segment_size != 0:
             raise ValueError("standalone-store mode requires global_segment_size == 0")
+        if self.mode == "dummy":
+            if not self.client_server_address:
+                raise ValueError(
+                    "dummy mode requires client_server_address, e.g. "
+                    "'127.0.0.1:50052' for the node-local mooncake_client"
+                )
+            if self.dummy_mem_pool_size <= 0:
+                raise ValueError("dummy_mem_pool_size must be > 0")
+            if self.dummy_local_buffer_size <= 0:
+                raise ValueError("dummy_local_buffer_size must be > 0")
 
     @staticmethod
     def from_file(file_path: str) -> "MooncakeStoreConfig":
@@ -197,6 +220,13 @@ class MooncakeStoreConfig:
             ),
             enable_offload=bool(config.get("enable_offload", False)),
             tenant_id=_normalize_tenant_id(config.get("tenant_id", DEFAULT_TENANT_ID)),
+            client_server_address=config.get("client_server_address", ""),
+            dummy_mem_pool_size=_parse_size(
+                config.get("dummy_mem_pool_size", DEFAULT_LOCAL_BUFFER_SIZE)
+            ),
+            dummy_local_buffer_size=_parse_size(
+                config.get("dummy_local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE)
+            ),
         )
 
     @staticmethod
@@ -337,19 +367,38 @@ def _load_cudart_memcpy() -> Callable[..., int]:
 
 
 class HostStagingPool:
-    """Pinned host buffer registered with Mooncake for staging KV payloads.
+    """Host buffer registered with Mooncake for staging KV payloads.
 
     Mooncake's GPUDirect path is not usable on every platform; staging copies
     KV slices to host memory and transfers those instead, trading a copy for a
     working RDMA data path.
+
+    ``from_mem_pool`` is used by ``mode: dummy``: the dummy client can only map
+    shared-memory segments it was told about, so the pool is allocated from
+    Mooncake's mem pool (``alloc_from_mem_pool``) and registered there instead
+    of being a torch pinned allocation.
     """
 
-    def __init__(self, store: Any, capacity_bytes: int) -> None:
+    def __init__(
+        self, store: Any, capacity_bytes: int, from_mem_pool: bool = False
+    ) -> None:
         if capacity_bytes <= 0:
             raise ValueError("host_staging_bytes must be positive")
         self.capacity_bytes = capacity_bytes
-        self.buffer = torch.empty(capacity_bytes, dtype=torch.uint8, pin_memory=True)
-        self.base_addr = self.buffer.data_ptr()
+        if from_mem_pool:
+            addr = int(store.alloc_from_mem_pool(capacity_bytes))
+            if addr == 0:
+                raise RuntimeError(
+                    f"alloc_from_mem_pool({capacity_bytes}) failed for the "
+                    f"host staging pool"
+                )
+            self.buffer = None
+            self.base_addr = addr
+        else:
+            self.buffer = torch.empty(
+                capacity_bytes, dtype=torch.uint8, pin_memory=True
+            )
+            self.base_addr = self.buffer.data_ptr()
         ret = store.register_buffer(self.base_addr, capacity_bytes)
         if ret != 0:
             raise RuntimeError(
@@ -1061,8 +1110,16 @@ class KVCacheStoreSendingThread(KVTransferThread):
         batch_bytes = _sum_batch_bytes(sizes)
         put_start = time.perf_counter()
         try:
-            res = self.store.batch_put_from_multi_buffers(
-                keys, addrs, sizes, self.replicate_config
+            # Route through the staging pool as well: these payloads still live
+            # in the KV cache buffers, which a dummy client cannot map, and
+            # staging keeps the write path identical to the regular save path.
+            res = _batch_put_with_staging(
+                self.store,
+                getattr(self, "host_staging", None),
+                keys,
+                addrs,
+                sizes,
+                self.replicate_config,
             )
         except Exception as e:
             self._record_operation(
@@ -1764,21 +1821,40 @@ class MooncakeStoreWorker:
         # Initialize MooncakeDistributedStore with its own TransferEngine
         store_config = MooncakeStoreConfig.load_from_config()
         self.store = MooncakeDistributedStore()
+        self._dummy_mode = store_config.mode == "dummy"
         local_ip = get_ip()
         local_hostname = rdma_utils.get_requester_local_hostname(local_ip)
         setup_kwargs: dict[str, str] = {}
         if store_config.tenant_id != DEFAULT_TENANT_ID:
             setup_kwargs["tenant_id"] = store_config.tenant_id
-        ret = self.store.setup(
-            local_hostname,
-            store_config.metadata_server,
-            store_config.global_segment_size,
-            store_config.local_buffer_size,
-            store_config.protocol,
-            store_config.device_name,
-            store_config.master_server_address,
-            **setup_kwargs,
-        )
+        if self._dummy_mode:
+            # Attach to the node-local mooncake_client instead of owning a
+            # segment: the client then relays every store operation, so a
+            # same-host save/load never becomes a cross-process RDMA WRITE
+            # issued by the inference process.
+            ret = self.store.setup_dummy(
+                store_config.dummy_mem_pool_size,
+                store_config.dummy_local_buffer_size,
+                store_config.client_server_address,
+            )
+            logger.info(
+                "Mooncake dummy mode: attached to client %s "
+                "(mem_pool=%d, local_buffer=%d)",
+                store_config.client_server_address,
+                store_config.dummy_mem_pool_size,
+                store_config.dummy_local_buffer_size,
+            )
+        else:
+            ret = self.store.setup(
+                local_hostname,
+                store_config.metadata_server,
+                store_config.global_segment_size,
+                store_config.local_buffer_size,
+                store_config.protocol,
+                store_config.device_name,
+                store_config.master_server_address,
+                **setup_kwargs,
+            )
         if ret != 0:
             msg = "Initialize MooncakeDistributedStore failed."
             logger.error(msg)
@@ -2128,6 +2204,7 @@ class MooncakeStoreWorker:
         }
         seen_storage_ptrs: set[int] = set()
         cache_tensors: list[torch.Tensor] = []
+        skipped_device_registration = False
 
         for layer_name, cache in kv_caches.items():
             if layer_name not in store_layer_names:
@@ -2137,6 +2214,14 @@ class MooncakeStoreWorker:
             cache_storage = cache.untyped_storage()
             base_addr = cache_storage.data_ptr()
             region_len = cache_storage.nbytes()
+
+            if self._dummy_mode:
+                # Mooncake 0.3.13's dummy client can only map shared-memory
+                # buffers, so device-resident KV tensors cannot be registered
+                # there. Every put/get goes through the host staging pool
+                # instead, so the registration is not needed.
+                skipped_device_registration = True
+                continue
 
             if base_addr not in seen_storage_ptrs:
                 seen_storage_ptrs.add(base_addr)
@@ -2149,6 +2234,12 @@ class MooncakeStoreWorker:
                         ret,
                     )
 
+        if skipped_device_registration:
+            logger.info(
+                "Mooncake dummy mode: skipping device KV registration "
+                "(all payloads are staged through the host pool)"
+            )
+
         logger.info(
             "Registered KV caches: num_groups=%d, num_tensors=%d, num_blocks=%d",
             len(self.token_dbs),
@@ -2159,11 +2250,14 @@ class MooncakeStoreWorker:
         if self.host_staging_bytes > 0:
             try:
                 self._host_staging = HostStagingPool(
-                    self.store, self.host_staging_bytes
+                    self.store,
+                    self.host_staging_bytes,
+                    from_mem_pool=self._dummy_mode,
                 )
                 logger.info(
-                    "Mooncake host staging enabled: %d bytes",
+                    "Mooncake host staging enabled: %d bytes%s",
                     self.host_staging_bytes,
+                    " (mem pool)" if self._dummy_mode else "",
                 )
             except Exception as e:
                 self._host_staging = None
