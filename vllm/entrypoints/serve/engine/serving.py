@@ -25,6 +25,9 @@ from vllm.renderers.inputs.preprocess import (
 from vllm.sampling_params import BeamSearchParams
 from vllm.utils import random_uuid
 
+# Custom header; gateways such as Higress/Envoy rewrite X-Request-Id but leave it alone.
+ONEAPI_REQUEST_ID_HEADER = "X-Oneapi-Request-Id"
+
 
 class BaseServing:
     def __init__(
@@ -118,10 +121,11 @@ class BaseServing:
         raw_request: Request | None, default: str | None = None
     ) -> str | None:
         """Pulls the request id to use from a header, if provided"""
-        if raw_request is not None and (
-            (req_id := raw_request.headers.get("X-Request-Id")) is not None
-        ):
-            return req_id
+        if raw_request is not None:
+            if req_id := raw_request.headers.get(ONEAPI_REQUEST_ID_HEADER, "").strip():
+                return req_id
+            if (req_id := raw_request.headers.get("X-Request-Id")) is not None:
+                return req_id
 
         return random_uuid() if default is None else default
 
