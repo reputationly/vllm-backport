@@ -181,6 +181,10 @@ class MooncakeStoreConfig:
     # every buffer the client has to map, including the host staging pool.
     dummy_mem_pool_size: int = DEFAULT_LOCAL_BUFFER_SIZE
     dummy_local_buffer_size: int = DEFAULT_LOCAL_BUFFER_SIZE
+    # ``dummy`` mode only: how long a worker keeps retrying setup_dummy() while
+    # the node-local client is still starting/restarting, and the interval.
+    dummy_connect_timeout_s: float = 300.0
+    dummy_connect_retry_s: float = 2.0
 
     def __post_init__(self) -> None:
         if self.mode not in ("embedded", "standalone-store", "dummy"):
@@ -227,6 +231,8 @@ class MooncakeStoreConfig:
             dummy_local_buffer_size=_parse_size(
                 config.get("dummy_local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE)
             ),
+            dummy_connect_timeout_s=float(config.get("dummy_connect_timeout_s", 300)),
+            dummy_connect_retry_s=float(config.get("dummy_connect_retry_s", 2)),
         )
 
     @staticmethod
@@ -1832,18 +1838,54 @@ class MooncakeStoreWorker:
             # segment: the client then relays every store operation, so a
             # same-host save/load never becomes a cross-process RDMA WRITE
             # issued by the inference process.
-            ret = self.store.setup_dummy(
-                store_config.dummy_mem_pool_size,
-                store_config.dummy_local_buffer_size,
-                store_config.client_server_address,
-            )
-            logger.info(
-                "Mooncake dummy mode: attached to client %s "
-                "(mem_pool=%d, local_buffer=%d)",
-                store_config.client_server_address,
-                store_config.dummy_mem_pool_size,
-                store_config.dummy_local_buffer_size,
-            )
+            #
+            # The client is a separate process that may still be starting (or
+            # restarting) when the workers come up, and setup_dummy() fails
+            # immediately if the client's IPC socket / RPC endpoint is not
+            # there yet. Retry with backoff instead of killing the engine: a
+            # worker that starts before the client is a normal deployment
+            # ordering, not a fatal error.
+            deadline = time.monotonic() + store_config.dummy_connect_timeout_s
+            attempt = 0
+            while True:
+                attempt += 1
+                ret = self.store.setup_dummy(
+                    store_config.dummy_mem_pool_size,
+                    store_config.dummy_local_buffer_size,
+                    store_config.client_server_address,
+                )
+                if ret == 0:
+                    break
+                if time.monotonic() >= deadline:
+                    logger.error(
+                        "Mooncake dummy mode: client %s still unreachable "
+                        "after %d attempt(s) in %.0fs (rc=%d)",
+                        store_config.client_server_address,
+                        attempt,
+                        store_config.dummy_connect_timeout_s,
+                        ret,
+                    )
+                    break
+                if attempt == 1 or attempt % 10 == 0:
+                    logger.warning(
+                        "Mooncake dummy mode: client %s not reachable yet "
+                        "(attempt %d, rc=%d); retrying every %.1fs up to %.0fs",
+                        store_config.client_server_address,
+                        attempt,
+                        ret,
+                        store_config.dummy_connect_retry_s,
+                        store_config.dummy_connect_timeout_s,
+                    )
+                time.sleep(store_config.dummy_connect_retry_s)
+            if ret == 0:
+                logger.info(
+                    "Mooncake dummy mode: attached to client %s "
+                    "(mem_pool=%d, local_buffer=%d, attempts=%d)",
+                    store_config.client_server_address,
+                    store_config.dummy_mem_pool_size,
+                    store_config.dummy_local_buffer_size,
+                    attempt,
+                )
         else:
             ret = self.store.setup(
                 local_hostname,
