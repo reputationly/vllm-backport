@@ -201,6 +201,11 @@ class MooncakeStoreConfig:
                     "dummy mode requires client_server_address, e.g. "
                     "'127.0.0.1:50052' for the node-local mooncake_client"
                 )
+            if "$" in self.client_server_address:
+                raise ValueError(
+                    "dummy mode client_server_address has an unexpanded "
+                    f"environment variable: {self.client_server_address!r}"
+                )
             if self.dummy_mem_pool_size <= 0:
                 raise ValueError("dummy_mem_pool_size must be > 0")
             if self.dummy_local_buffer_size <= 0:
@@ -224,7 +229,9 @@ class MooncakeStoreConfig:
             ),
             enable_offload=bool(config.get("enable_offload", False)),
             tenant_id=_normalize_tenant_id(config.get("tenant_id", DEFAULT_TENANT_ID)),
-            client_server_address=config.get("client_server_address", ""),
+            client_server_address=os.path.expandvars(
+                config.get("client_server_address", "")
+            ),
             dummy_mem_pool_size=_parse_size(
                 config.get("dummy_mem_pool_size", DEFAULT_LOCAL_BUFFER_SIZE)
             ),

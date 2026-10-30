@@ -4223,6 +4223,57 @@ def test_config_zero_local_buffer():
         _make_config(local_buffer_size=0)
 
 
+def test_config_dummy_expands_env_in_client_server_address(tmp_path, monkeypatch):
+    config_path = _write_mooncake_config(
+        tmp_path,
+        {
+            "mode": "dummy",
+            "metadata_server": "P2PHANDSHAKE",
+            "master_server_address": "10.0.0.7:50051",
+            "client_server_address": "${VLLM_HOST_IP}:50052",
+        },
+    )
+    monkeypatch.setenv("VLLM_HOST_IP", "10.0.0.5")
+
+    cfg = worker.MooncakeStoreConfig.from_file(config_path)
+
+    assert cfg.client_server_address == "10.0.0.5:50052"
+
+
+def test_config_dummy_rejects_unexpanded_env_in_client_server_address(
+    tmp_path, monkeypatch
+):
+    config_path = _write_mooncake_config(
+        tmp_path,
+        {
+            "mode": "dummy",
+            "metadata_server": "P2PHANDSHAKE",
+            "master_server_address": "10.0.0.7:50051",
+            "client_server_address": "${VLLM_HOST_IP}:50052",
+        },
+    )
+    monkeypatch.delenv("VLLM_HOST_IP", raising=False)
+
+    with pytest.raises(ValueError, match="unexpanded"):
+        worker.MooncakeStoreConfig.from_file(config_path)
+
+
+def test_config_dummy_literal_client_server_address_unchanged(tmp_path):
+    config_path = _write_mooncake_config(
+        tmp_path,
+        {
+            "mode": "dummy",
+            "metadata_server": "P2PHANDSHAKE",
+            "master_server_address": "10.0.0.7:50051",
+            "client_server_address": "127.0.0.1:50052",
+        },
+    )
+
+    cfg = worker.MooncakeStoreConfig.from_file(config_path)
+
+    assert cfg.client_server_address == "127.0.0.1:50052"
+
+
 # ---------------------------------------------------------------------------
 # End-to-end topology tests
 # Covers the two supported recipes:
