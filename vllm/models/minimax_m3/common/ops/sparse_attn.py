@@ -26,6 +26,7 @@ from vllm.v1.attention.ops.fp8_sm80 import (
     native_fp8_cast_supported,
 )
 
+
 @triton.jit
 def _decode_e4m3fn_bf16_lut(u, lut_ptr):
     # Same contract as triton_mla_sparse_kernel._decode_e4m3fn_bf16_lut: SM80

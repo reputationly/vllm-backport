@@ -551,12 +551,15 @@ def test_sparse_attn_fp8_e4m3_kv_matches_bf16_reference(
     cu_seqlens = torch.zeros(batch + 1, device="cuda", dtype=torch.int32)
     cu_seqlens[1:] = q_lens.cumsum(0)
     prefix_lens = seq_lens - q_lens
-    block_table = torch.randperm(
-        num_pages, device="cuda", dtype=torch.int32
-    ).reshape(batch, max_blocks)
+    block_table = torch.randperm(num_pages, device="cuda", dtype=torch.int32).reshape(
+        batch, max_blocks
+    )
 
     kv_bf16 = torch.randn(
-        num_pages, num_kv_heads, BLOCK_SIZE, 2 * head_dim,
+        num_pages,
+        num_kv_heads,
+        BLOCK_SIZE,
+        2 * head_dim,
         device="cuda",
         dtype=torch.bfloat16,
     )
@@ -593,23 +596,61 @@ def test_sparse_attn_fp8_e4m3_kv_matches_bf16_reference(
 
     if kernel == "prefill":
         minimax_m3_sparse_attn(
-            q, kv_fp8, topk_idx, block_table, cu_seqlens, seq_lens,
-            prefix_lens, int(q_lens.max()), num_kv_heads, SM_SCALE,
-            out_fp8, k_scale, v_scale,
+            q,
+            kv_fp8,
+            topk_idx,
+            block_table,
+            cu_seqlens,
+            seq_lens,
+            prefix_lens,
+            int(q_lens.max()),
+            num_kv_heads,
+            SM_SCALE,
+            out_fp8,
+            k_scale,
+            v_scale,
         )
         minimax_m3_sparse_attn(
-            q, kv_fp8_dq, topk_idx, block_table, cu_seqlens, seq_lens,
-            prefix_lens, int(q_lens.max()), num_kv_heads, SM_SCALE,
-            out_ref, k_scale, v_scale,
+            q,
+            kv_fp8_dq,
+            topk_idx,
+            block_table,
+            cu_seqlens,
+            seq_lens,
+            prefix_lens,
+            int(q_lens.max()),
+            num_kv_heads,
+            SM_SCALE,
+            out_ref,
+            k_scale,
+            v_scale,
         )
     else:
         minimax_m3_sparse_attn_decode(
-            q, kv_fp8, topk_idx, block_table, seq_lens, num_kv_heads,
-            SM_SCALE, out_fp8, 1, k_scale, v_scale,
+            q,
+            kv_fp8,
+            topk_idx,
+            block_table,
+            seq_lens,
+            num_kv_heads,
+            SM_SCALE,
+            out_fp8,
+            1,
+            k_scale,
+            v_scale,
         )
         minimax_m3_sparse_attn_decode(
-            q, kv_fp8_dq, topk_idx, block_table, seq_lens, num_kv_heads,
-            SM_SCALE, out_ref, 1, k_scale, v_scale,
+            q,
+            kv_fp8_dq,
+            topk_idx,
+            block_table,
+            seq_lens,
+            num_kv_heads,
+            SM_SCALE,
+            out_ref,
+            1,
+            k_scale,
+            v_scale,
         )
 
     torch.testing.assert_close(out_fp8, out_ref, rtol=0.1, atol=0.1)
