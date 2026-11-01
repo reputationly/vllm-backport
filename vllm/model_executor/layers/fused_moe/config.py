@@ -15,7 +15,10 @@ from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
     OCP_MX_DTYPES,
     OCP_MX_Scheme,
 )
-from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    GroupShape,
+    QuantKey,
+)
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_triton_kernels
 from vllm.utils.math_utils import cdiv
@@ -1334,6 +1337,13 @@ class FusedMoEConfig:
     # SituGLU parameters used by Kimi sit(u/v2) activations.
     activation_situ_beta: float | None = None
     activation_situ_linear_beta: float | None = None
+
+    # Activation scheme the routed experts were trained (QAT) against, when the
+    # checkpoint does not record it. Quant methods use it in place of their
+    # default: MiniMax-M3.1 quantizes the FC1 input per token and ships a 1.0
+    # ``input_global_scale`` placeholder, which is indistinguishable from a
+    # calibrated per-tensor scale of 1.0.
+    qat_activation_key: QuantKey | None = None
 
     max_capture_size: int = 0
 
