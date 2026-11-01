@@ -11,7 +11,7 @@ from transformers import BatchFeature
 from transformers.video_utils import VideoMetadata
 
 from vllm.config.multimodal import (
-    MultiModalDummyOptions,
+    BaseDummyOptions,
 )
 from vllm.inputs import MultiModalDataDict
 from vllm.multimodal.inputs import (
@@ -30,7 +30,6 @@ from vllm.multimodal.processing import (
     PromptUpdate,
     PromptUpdateDetails,
 )
-from vllm.multimodal.processing.processor import HFMultiModalInputs
 from vllm.multimodal.video import (
     VIDEO_LOADER_REGISTRY,
     VideoBackend,
@@ -282,7 +281,7 @@ class MiniMaxM3VLDummyInputsBuilder(BaseDummyInputsBuilder[MiniMaxM3VLProcessing
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: MultiModalDummyOptions,
+        mm_options: Mapping[str, BaseDummyOptions],
     ) -> MultiModalDataDict:
         size = self.info.get_image_size_with_most_features()
         video_size = self.info.get_video_size_with_most_features()
@@ -307,58 +306,77 @@ class MiniMaxM3VLDummyInputsBuilder(BaseDummyInputsBuilder[MiniMaxM3VLProcessing
 class MiniMaxM3VLMultiModalProcessor(
     BaseMultiModalProcessor[MiniMaxM3VLProcessingInfo]
 ):
-    def _get_hf_mm_text(self, mm_counts: Mapping[str, int]) -> str:
+    def _get_hf_processor_text(self, mm_counts: Mapping[str, int]) -> str:
         return self.dummy_inputs.get_dummy_text(mm_counts)
 
-    def _get_hf_mm_inputs(
+    def _apply_hf_processor_main(
         self,
         mm_items: MultiModalDataItems,
-        hf_kwargs: Mapping[str, object],
-    ) -> HFMultiModalInputs:
-        hf_inputs = super()._get_hf_mm_inputs(mm_items, hf_kwargs)
-        hf_data = hf_inputs.hf_data
-
-        # With ``video_needs_metadata=True`` each video arrives as a
-        # ``(frames, metadata)`` tuple. Split the frames back out and forward the
-        # metadata as ``VideoMetadata`` so the processor emits timestamps.
-        videos = cast(list | None, hf_data.get("videos"))
-        video_metadata: list[VideoMetadata] | None = None
-        if videos:
-            frames_only = []
-            video_metadata = []
-            for item in videos:
-                if isinstance(item, tuple) and len(item) == 2:
-                    frames, meta = item
-                else:
-                    frames, meta = item, {}
-                frames_only.append(frames)
-                meta = {
-                    k: v for k, v in (meta or {}).items() if k != "do_sample_frames"
-                }
-                # VideoMetadata requires total_num_frames; derive it for
-                # dummy/profiling videos whose metadata omits it. fps and
-                # frames_indices default to None there → no timestamps, which
-                # stays consistent with _get_prompt_updates.
-                meta.setdefault("total_num_frames", len(frames))
-                video_metadata.append(VideoMetadata(**meta))
-            hf_data["videos"] = frames_only
-
-        if video_metadata is not None:
-            hf_data["video_metadata"] = video_metadata
-
-        return hf_inputs
-
-    def _call_hf_processor(
-        self,
-        hf_data: Mapping[str, object],
-        hf_kwargs: Mapping[str, object],
+        hf_processor_mm_kwargs: Mapping[str, object],
     ) -> BatchFeature:
-        # Override the video processor's default for vLLM's raw-frame inputs.
-        merged = dict(do_resize=True, **hf_kwargs)
-        return self.info.ctx.call_hf_processor(
-            self.info.get_hf_processor(**hf_kwargs),
+        valid_mm_items = mm_items.select(
+            {k for k, c in mm_items.get_all_counts().items() if c > 0}
+        )
+        hf_data, passthrough_data = self._get_hf_mm_data(valid_mm_items)
+
+        if hf_data:
+            prompt_text = self._get_hf_processor_text(mm_items.get_all_counts())
+            if prompt_text is not None:
+                hf_data = dict(text=prompt_text, **hf_data)
+                # vLLM needs the untruncated sequence to keep placeholder
+                # tokens aligned.
+                hf_processor_mm_kwargs = {
+                    "truncation": False,
+                    **hf_processor_mm_kwargs,
+                }
+
+            # With ``video_needs_metadata=True`` each video arrives as a
+            # ``(frames, metadata)`` tuple. Split the frames back out and
+            # forward the metadata as ``VideoMetadata`` so the processor
+            # emits timestamps.
+            videos = cast(list | None, hf_data.get("videos"))
+            video_metadata: list[VideoMetadata] | None = None
+            if videos:
+                frames_only = []
+                video_metadata = []
+                for item in videos:
+                    if isinstance(item, tuple) and len(item) == 2:
+                        frames, meta = item
+                    else:
+                        frames, meta = item, {}
+                    frames_only.append(frames)
+                    meta = {
+                        k: v
+                        for k, v in (meta or {}).items()
+                        if k != "do_sample_frames"
+                    }
+                    # VideoMetadata requires total_num_frames; derive it for
+                    # dummy/profiling videos whose metadata omits it. fps and
+                    # frames_indices default to None there → no timestamps,
+                    # which stays consistent with _get_prompt_updates.
+                    meta.setdefault("total_num_frames", len(frames))
+                    video_metadata.append(VideoMetadata(**meta))
+                hf_data["videos"] = frames_only
+
+            if video_metadata is not None:
+                hf_data["video_metadata"] = video_metadata
+
+            # Override the video processor's default for vLLM's raw-frame
+            # inputs.
+            merged = dict(do_resize=True, **hf_processor_mm_kwargs)
+            processed_data = self.info.ctx.call_hf_processor(
+                self.info.get_hf_processor(**hf_processor_mm_kwargs),
+                hf_data,
+                merged,
+            )
+            processed_data.update(passthrough_data)
+        else:
+            processed_data = BatchFeature(dict(passthrough_data))
+
+        return self._postprocess_hf_mm_data(
             hf_data,
-            merged,
+            hf_processor_mm_kwargs,
+            processed_data,
         )
 
     def _get_mm_fields_config(

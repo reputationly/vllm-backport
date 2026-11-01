@@ -9,16 +9,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.warmup.attention_warmup import (
     mixed_batch_attention_warmup,
 )
-from vllm.models.minimax_m3.nvidia.indexer_msa import MiniMaxM3IndexerMSAImpl
-from vllm.models.minimax_m3.nvidia.indexer_nvfp4 import MiniMaxM3IndexerNvfp4Impl
 from vllm.models.minimax_m3.nvidia.model import MiniMaxM3SparseAttention
-from vllm.models.minimax_m3.nvidia.msa_cutlass_sparse_decode import (
-    NVFP4_BLOCK_SCALE_SHIFT,
-    uses_q8kv4_decode,
-)
-from vllm.models.minimax_m3.nvidia.sparse_attention_msa import (
-    MiniMaxM3SparseMSABaseImpl,
-)
 from vllm.platforms import current_platform
 from vllm.tracing import instrument
 
@@ -36,6 +27,20 @@ def _msa_prebuild_kwargs(
     vllm_config: "VllmConfig", module: MiniMaxM3SparseAttention
 ) -> dict[str, Any] | None:
     """``fmha_sm100.warmup`` arguments for the kernels this rank can request."""
+    # Lazy: the MSA/NVFP4 impls need cute-dsl and fmha_sm100 (SM100); this
+    # module must stay importable so kernel_warmup() can scan any model.
+    from vllm.models.minimax_m3.nvidia.indexer_msa import MiniMaxM3IndexerMSAImpl
+    from vllm.models.minimax_m3.nvidia.indexer_nvfp4 import (
+        MiniMaxM3IndexerNvfp4Impl,
+    )
+    from vllm.models.minimax_m3.nvidia.msa_cutlass_sparse_decode import (
+        NVFP4_BLOCK_SCALE_SHIFT,
+        uses_q8kv4_decode,
+    )
+    from vllm.models.minimax_m3.nvidia.sparse_attention_msa import (
+        MiniMaxM3SparseMSABaseImpl,
+    )
+
     impl = module.impl
     indexer = module.indexer.impl
     msa = (

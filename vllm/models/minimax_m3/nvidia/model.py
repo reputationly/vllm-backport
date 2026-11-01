@@ -42,11 +42,6 @@ from vllm.model_executor.layers.fused_moe import (
     GateLinear,
     fused_moe_make_expert_params_mapping,
 )
-from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
-    MEGA_MOE_NVFP4,
-    DeepGemmMegaMoEExperts,
-    MegaMoEActivation,
-)
 from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
     TrtLlmNvFp4ExpertsModular,
     TrtLlmNvFp4ExpertsMonolithic,
@@ -467,6 +462,12 @@ class MiniMaxM3MoE(nn.Module):
         quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> None:
+        from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
+            MEGA_MOE_NVFP4,
+            DeepGemmMegaMoEExperts,
+            MegaMoEActivation,
+        )
+
         if config.hidden_act != "swigluoai":
             raise ValueError(
                 f"MiniMax M3 MegaMoE requires swigluoai, got {config.hidden_act}."
@@ -545,7 +546,13 @@ class MiniMaxM3MoE(nn.Module):
         if experts_cls not in (TrtLlmNvFp4ExpertsMonolithic, TrtLlmNvFp4ExpertsModular):
             return False
         moe_config = self.experts.moe_config
-        moe_config.defer_moe_finalize(max_num_tokens)
+        moe_config.defer_moe_finalize = True
+        # HEAD's FusedMoEConfig exposes defer_moe_finalize as a field rather
+        # than upstream's defer_moe_finalize()/limit_deferred_moe_finalize()
+        # methods; replicate the cap-only-goes-down semantics here.
+        cap = moe_config.defer_moe_finalize_max_num_tokens
+        if max_num_tokens >= 0 and (cap < 0 or max_num_tokens < cap):
+            moe_config.defer_moe_finalize_max_num_tokens = max_num_tokens
         return moe_config.use_deferred_moe_finalize
 
     def defers_finalize(self, num_tokens: int) -> bool:
