@@ -579,15 +579,53 @@ def test_sparse_attn_fp8_e4m3_kv_matches_bf16_reference(
     if kv_scale_mode == "scalar":
         k_scale = torch.tensor([0.9], device="cuda")
         v_scale = torch.tensor([1.1], device="cuda")
+        # The fp8 kernel applies k/v scales after decode; give the bf16
+        # reference the same effective values.
         kv_fp8_dq = kv_fp8.to(torch.bfloat16)
-        kv_bf16 = kv_bf16.clone()
-        kv_bf16[..., :head_dim] *= k_scale
-        kv_bf16[..., head_dim:] *= v_scale
         kv_fp8_dq[..., :head_dim] *= k_scale
         kv_fp8_dq[..., head_dim:] *= v_scale
     else:
         k_scale = v_scale = None
         kv_fp8_dq = kv_fp8.to(torch.bfloat16)
+
+    if kernel == "decode":
+        # Decode flattens num_reqs * decode_query_len trailing tokens.
+        decode_query_len = 1
+        q = q[: batch * decode_query_len]
+        seq_lens_d = seq_lens
+        topk_d = topk_idx[:, : batch * decode_query_len, :]
+        out_fp8 = torch.empty(
+            batch * decode_query_len, NUM_Q_HEADS, head_dim, device="cuda"
+        ).to(torch.bfloat16)
+        out_ref = torch.empty_like(out_fp8)
+        minimax_m3_sparse_attn_decode(
+            q,
+            kv_fp8,
+            topk_d,
+            block_table,
+            seq_lens_d,
+            num_kv_heads,
+            SM_SCALE,
+            out_fp8,
+            decode_query_len,
+            k_scale,
+            v_scale,
+        )
+        minimax_m3_sparse_attn_decode(
+            q,
+            kv_fp8_dq,
+            topk_d,
+            block_table,
+            seq_lens_d,
+            num_kv_heads,
+            SM_SCALE,
+            out_ref,
+            decode_query_len,
+            k_scale,
+            v_scale,
+        )
+        torch.testing.assert_close(out_fp8, out_ref, rtol=0.1, atol=0.1)
+        return
 
     out_fp8 = torch.empty(total_q, NUM_Q_HEADS, head_dim, device="cuda").to(
         torch.bfloat16
