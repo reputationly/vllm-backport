@@ -1352,6 +1352,9 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         in BF16, so the last layer keeps its own finalize. Builds a collective
         kernel: every TP rank decides alike.
         """
+        if not current_platform.is_device_capability_family(100):
+            # finalize_allreduce_norm needs cute-dsl/moe_tail_fusion (SM100).
+            return
         from vllm.models.minimax_m3.nvidia.ops.finalize_allreduce_norm import (
             init_fused_moe_finalize,
             supports_fused_moe_finalize,
