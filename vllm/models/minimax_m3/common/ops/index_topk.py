@@ -19,6 +19,10 @@ import torch
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import round_up
+from vllm.v1.attention.ops.fp8_sm80 import (
+    get_e4m3fn_bf16_lut,
+    native_fp8_cast_supported,
+)
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
@@ -27,6 +31,39 @@ SPARSE_BLOCK_SIZE = 128
 # ---------------------------------------------------------------------------
 # Bitonic top-k helpers (layout-agnostic).
 # ---------------------------------------------------------------------------
+@triton.jit
+def _decode_e4m3fn_bf16_lut(u, lut_ptr):
+    # Same contract as triton_mla_sparse_kernel._decode_e4m3fn_bf16_lut: SM80
+    # has no native fp8e4nv convert, so uint8 rows decode through the LUT.
+    return tl.load(lut_ptr + u.to(tl.uint32))
+
+
+def _fp8_sm80_score_args(
+    idx_q: torch.Tensor, index_kv_cache: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    """SM80 fp8e4nv workaround for the index-score kernels.
+
+    Pre-SM89 Triton cannot convert fp8e4nv: an e4m3fn index cache is passed as
+    raw uint8 for the in-kernel LUT decode, and an e4m3fn query is dequantized
+    on the host (the dot then runs bf16 -- fp8 MMA needs SM89+ anyway). e5m2
+    and fnuz keep the native paths.
+    """
+    if native_fp8_cast_supported():
+        lut = idx_q.new_empty(0, dtype=torch.bfloat16)
+        return idx_q, index_kv_cache, lut, False
+    if idx_q.dtype == torch.float8_e4m3fn:
+        idx_q = idx_q.to(torch.bfloat16)
+    if index_kv_cache.dtype == torch.float8_e4m3fn:
+        return (
+            idx_q,
+            index_kv_cache.view(torch.uint8),
+            get_e4m3fn_bf16_lut(index_kv_cache.device),
+            True,
+        )
+    lut = idx_q.new_empty(0, dtype=torch.bfloat16)
+    return idx_q, index_kv_cache, lut, False
+
+
 @triton.jit
 def _compare_and_swap(x, ids, flip, i: tl.constexpr, n_dims: tl.constexpr):
     n_outer: tl.constexpr = x.numel >> n_dims
@@ -82,6 +119,7 @@ def _bitonic_merge(
 def _index_block_score_kernel(
     q_ptr,  # idx_q: [total_q, num_idx_heads, head_dim]
     ik_cache_ptr,  # index-K cache: [num_blocks, 128, head_dim]
+    fp8_lut_ptr,  # e4m3fn->bf16 LUT; read only when FP8_SW_DECODE
     score_ptr,  # [num_idx_heads, total_q, max_block]
     block_table_ptr,  # [num_reqs, max_blocks]
     cu_seqlens,  # [batch+1] query start offsets
@@ -102,6 +140,7 @@ def _index_block_score_kernel(
     BLOCK_SIZE_Q: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
     USE_SPLIT_K: tl.constexpr,
+    FP8_SW_DECODE: tl.constexpr,  # e4m3fn bytes via LUT (SM80); pruned elsewhere
 ):
     pid_q = tl.program_id(0)
     pid_bh = tl.program_id(1)
@@ -166,6 +205,8 @@ def _index_block_score_kernel(
             + off_k[None, :] * stride_ik_pos
             + off_d[:, None] * stride_ik_d,
         )
+        if FP8_SW_DECODE:
+            k = _decode_e4m3fn_bf16_lut(k, fp8_lut_ptr)
         if k.dtype.is_fp8() and k.dtype != q.dtype:
             k = k.to(tl.bfloat16)
         qk = tl.dot(q, k, out_dtype=tl.float32)
@@ -317,6 +358,7 @@ def _topk_index_kernel(
 def _decode_index_score_kernel(
     q_ptr,  # idx_q: [total_q, num_idx_heads, head_dim]
     ik_cache_ptr,  # index-K cache: [num_blocks, 128, head_dim]
+    fp8_lut_ptr,  # e4m3fn->bf16 LUT; read only when FP8_SW_DECODE
     score_ptr,  # [num_idx_heads, total_q, max_block]
     block_table_ptr,  # [num_reqs, max_blocks]
     seq_lens,  # [num_reqs]
@@ -339,6 +381,7 @@ def _decode_index_score_kernel(
     BLOCK_SIZE_Q: tl.constexpr,
     num_kv_chunks,
     USE_PDL: tl.constexpr,
+    FP8_SW_DECODE: tl.constexpr,  # e4m3fn bytes via LUT (SM80); pruned elsewhere
 ):
     BLOCK_SIZE_HQ: tl.constexpr = num_idx_heads * BLOCK_SIZE_Q
     pid_r = tl.program_id(0)
@@ -400,6 +443,8 @@ def _decode_index_score_kernel(
         # Matched fp8 operands keep the native FP8 MMA; any mismatch upcasts,
         # since no mixed-dtype fp8 MMA exists. FP32 accumulation preserves
         # score accuracy either way. BF16/FP32 loads stay as stored.
+        if FP8_SW_DECODE:
+            k = _decode_e4m3fn_bf16_lut(k, fp8_lut_ptr)
         if k.dtype.is_fp8() and k.dtype != q.dtype:
             k = k.to(tl.bfloat16)
         kq = tl.dot(k, q, out_dtype=tl.float32)  # [N,HQ]
@@ -693,6 +738,9 @@ def minimax_m3_index_score(
     )
     batch = cu_seqlens_q.shape[0] - 1
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
+    idx_q, index_kv_cache, fp8_lut, sw_decode = _fp8_sm80_score_args(
+        idx_q, index_kv_cache
+    )
 
     # Keep score strides 16-divisible to avoid Triton recompiles.
     score_block_stride = round_up(max_block, 16)
@@ -720,6 +768,7 @@ def minimax_m3_index_score(
     _index_block_score_kernel[grid_score](
         idx_q,
         index_kv_cache,
+        fp8_lut,
         score,
         block_table,
         cu_seqlens_q,
@@ -740,6 +789,7 @@ def minimax_m3_index_score(
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         USE_SPLIT_K=split_k > 1,
+        FP8_SW_DECODE=sw_decode,
     )
     return score
 
@@ -826,6 +876,9 @@ def minimax_m3_index_decode_score(
     assert decode_query_len <= max_decode_query_len
     assert total_q == seq_lens.shape[0] * decode_query_len
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
+    idx_q, index_kv_cache, fp8_lut, sw_decode = _fp8_sm80_score_args(
+        idx_q, index_kv_cache
+    )
     use_pdl = current_platform.is_arch_support_pdl()
     # `launch_pdl` is a Triton runtime kwarg only some backends accept (CUDA
     # SM9+); this ROCm Triton rejects it even when False ("Keyword argument
@@ -868,6 +921,7 @@ def minimax_m3_index_decode_score(
     _decode_index_score_kernel[grid_score](
         idx_q,
         index_kv_cache,
+        fp8_lut,
         score,
         block_table,
         seq_lens,
@@ -890,6 +944,7 @@ def minimax_m3_index_decode_score(
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
         num_kv_chunks=num_kv_chunks,
         USE_PDL=use_pdl,
+        FP8_SW_DECODE=sw_decode,
         **score_kwargs,
     )
     return score

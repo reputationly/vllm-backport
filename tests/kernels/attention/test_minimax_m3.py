@@ -526,6 +526,95 @@ def test_sparse_kernels_recognize_fp8_dtypes(dtype: torch.dtype):
     assert dtype in _FP8_DTYPES
 
 
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="sparse-attn fp8 kernels need CUDA"
+)
+@pytest.mark.parametrize("kv_scale_mode", ["none", "scalar"])
+@pytest.mark.parametrize("kernel", ["prefill", "decode"])
+def test_sparse_attn_fp8_e4m3_kv_matches_bf16_reference(
+    kernel: str, kv_scale_mode: str
+):
+    """fp8 e4m3 KV cache (LUT-decoded on SM80, native elsewhere) vs the same
+    kernel on the dequantized bf16 cache. Tolerance covers the e4m3 rounding.
+    """
+    set_random_seed(0)
+    num_reqs, max_blocks, num_kv_heads, head_dim = 3, 4, NUM_KV_HEADS, HEAD_DIM
+    batch = num_reqs
+    num_pages = batch * max_blocks
+    seq_lens = torch.tensor(
+        [BLOCK_SIZE * 2 + 37, BLOCK_SIZE + 5, BLOCK_SIZE * max_blocks],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    q_lens = torch.tensor([4, 1, 2], device="cuda", dtype=torch.int32)
+    total_q = int(q_lens.sum())
+    cu_seqlens = torch.zeros(batch + 1, device="cuda", dtype=torch.int32)
+    cu_seqlens[1:] = q_lens.cumsum(0)
+    prefix_lens = seq_lens - q_lens
+    block_table = torch.randperm(
+        num_pages, device="cuda", dtype=torch.int32
+    ).reshape(batch, max_blocks)
+
+    kv_bf16 = torch.randn(
+        num_pages, num_kv_heads, BLOCK_SIZE, 2 * head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    kv_fp8 = kv_bf16.to(torch.float8_e4m3fn)
+    q = torch.randn(total_q, NUM_Q_HEADS, head_dim, device="cuda").to(torch.bfloat16)
+    topk = 2
+    topk_idx = torch.zeros(
+        num_kv_heads, total_q, topk, device="cuda", dtype=torch.int32
+    )
+    offs = 0
+    for b in range(batch):
+        for t in range(q_lens[b]):
+            for h in range(num_kv_heads):
+                topk_idx[h, offs + t, :] = torch.arange(topk, device="cuda")
+        offs += q_lens[b]
+
+    if kv_scale_mode == "scalar":
+        k_scale = torch.tensor([0.9], device="cuda")
+        v_scale = torch.tensor([1.1], device="cuda")
+        kv_fp8_dq = kv_fp8.to(torch.bfloat16)
+        kv_bf16 = kv_bf16.clone()
+        kv_bf16[..., :head_dim] *= k_scale
+        kv_bf16[..., head_dim:] *= v_scale
+        kv_fp8_dq[..., :head_dim] *= k_scale
+        kv_fp8_dq[..., head_dim:] *= v_scale
+    else:
+        k_scale = v_scale = None
+        kv_fp8_dq = kv_fp8.to(torch.bfloat16)
+
+    out_fp8 = torch.empty(total_q, NUM_Q_HEADS, head_dim, device="cuda").to(
+        torch.bfloat16
+    )
+    out_ref = torch.empty_like(out_fp8)
+
+    if kernel == "prefill":
+        minimax_m3_sparse_attn(
+            q, kv_fp8, topk_idx, block_table, cu_seqlens, seq_lens,
+            prefix_lens, int(q_lens.max()), num_kv_heads, SM_SCALE,
+            out_fp8, k_scale, v_scale,
+        )
+        minimax_m3_sparse_attn(
+            q, kv_fp8_dq, topk_idx, block_table, cu_seqlens, seq_lens,
+            prefix_lens, int(q_lens.max()), num_kv_heads, SM_SCALE,
+            out_ref, k_scale, v_scale,
+        )
+    else:
+        minimax_m3_sparse_attn_decode(
+            q, kv_fp8, topk_idx, block_table, seq_lens, num_kv_heads,
+            SM_SCALE, out_fp8, 1, k_scale, v_scale,
+        )
+        minimax_m3_sparse_attn_decode(
+            q, kv_fp8_dq, topk_idx, block_table, seq_lens, num_kv_heads,
+            SM_SCALE, out_ref, 1, k_scale, v_scale,
+        )
+
+    torch.testing.assert_close(out_fp8, out_ref, rtol=0.1, atol=0.1)
+
+
 # Index top-k kernels.
 def _reference_index_topk(
     idx_q: torch.Tensor,
