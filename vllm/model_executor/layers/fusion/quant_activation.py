@@ -62,6 +62,13 @@ def expose_input_quant_key(layer: torch.nn.Module, kernel) -> None:
         layer.input_quant_key = key
 
 
+def get_input_quant_key(layer: torch.nn.Module) -> QuantKey | None:
+    """Return the pre-quantized input key the complete layer can consume."""
+    if getattr(layer, "requires_unquantized_input", False):
+        return None
+    return getattr(layer, "input_quant_key", None)
+
+
 def as_quantized_activation(
     x: "torch.Tensor | QuantizedActivation", expected_key: QuantKey | None
 ) -> "QuantizedActivation | None":

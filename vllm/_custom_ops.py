@@ -2665,6 +2665,9 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
     skip_index_branch: bool = False,
     q_fp8_out: torch.Tensor | None = None,
     q_fp8_scale: float = 1.0,
+    kv_k_scale: torch.Tensor | None = None,
+    kv_v_scale: torch.Tensor | None = None,
+    write_qkv: bool = True,
 ) -> None:
     """Fused MiniMax-M3 attention pre-processing (in-place).
 
@@ -2719,6 +2722,40 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
         skip_index_branch,
         q_fp8_out,
         q_fp8_scale,
+        kv_k_scale,
+        kv_v_scale,
+        write_qkv,
+    )
+
+
+def fused_minimax_m3_dspark_context_kv(
+    all_kv: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache: torch.Tensor,
+    cache_offsets: torch.Tensor,
+    k_scale: torch.Tensor,
+    scale_offsets: torch.Tensor,
+    rotary_dim: int,
+    eps: float,
+    kv_cache_dtype: str,
+) -> None:
+    """Store the MiniMax-M3 DSpark draft's context K/V for every layer."""
+    torch.ops._C.fused_minimax_m3_dspark_context_kv(
+        all_kv,
+        k_norm_weight,
+        cos_sin_cache,
+        positions,
+        slot_mapping,
+        kv_cache,
+        cache_offsets,
+        k_scale,
+        scale_offsets,
+        rotary_dim,
+        eps,
+        kv_cache_dtype,
     )
 
 
