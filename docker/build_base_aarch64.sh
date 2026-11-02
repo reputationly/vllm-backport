@@ -171,6 +171,24 @@ if [ -n "${PIP_INDEX_URL}" ]; then
                --build-arg "UV_INDEX_URL=${PIP_INDEX_URL}")
 fi
 
+# 隔离网/镜像源覆盖:只在显式设置时覆盖默认值(默认行为不变)。
+# 离线构建示例(本地文件服务器 + mkindex 生成的 PEP503 索引):
+#   PIP_INDEX_URL=http://<host>:<port>/simple/
+#   PYTORCH_CUDA_INDEX_BASE_URL=http://<host>:<port>/simple
+#   FLASHINFER_INDEX_BASE_URL=http://<host>:<port>/simple
+#   CARGO_REGISTRY_MIRROR=sparse+https://mirrors.aliyun.com/crates.io-index/
+#   RUSTUP_DIST_SERVER=https://rsproxy.cn RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+[ -n "${PYTORCH_CUDA_INDEX_BASE_URL}" ] \
+  && EXTRA_ARGS+=(--build-arg "PYTORCH_CUDA_INDEX_BASE_URL=${PYTORCH_CUDA_INDEX_BASE_URL}")
+[ -n "${FLASHINFER_INDEX_BASE_URL}" ] \
+  && EXTRA_ARGS+=(--build-arg "FLASHINFER_INDEX_BASE_URL=${FLASHINFER_INDEX_BASE_URL}")
+[ -n "${RUSTUP_DIST_SERVER}" ] \
+  && EXTRA_ARGS+=(--build-arg "RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER}")
+[ -n "${RUSTUP_UPDATE_ROOT}" ] \
+  && EXTRA_ARGS+=(--build-arg "RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT}")
+[ -n "${CARGO_REGISTRY_MIRROR}" ] \
+  && EXTRA_ARGS+=(--build-arg "CARGO_REGISTRY_MIRROR=${CARGO_REGISTRY_MIRROR}")
+
 docker buildx build \
   --file docker/Dockerfile \
   --target "${BUILD_TARGET}" \
