@@ -22,7 +22,18 @@ def prepare_build_environment() -> str | None:
     version = os.getenv(VLLM_RS_BUILD_VERSION) or None
     if version is None:
         try:
-            version = get_version(root=ROOT_DIR)
+            version = get_version(
+                root=ROOT_DIR,
+                git_describe_command=[
+                    "git",
+                    "describe",
+                    "--dirty",
+                    "--tags",
+                    "--long",
+                    "--match",
+                    "v[0-9]*",
+                ],
+            )
         except LookupError:
             return None
 
