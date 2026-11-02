@@ -78,7 +78,7 @@ def main() -> None:
                 + "</body></html>\n"
             )
 
-    print(f"{len(pkgs)} projects indexed under {roots[0]}")
+    print(f"{len(pkgs)} projects indexed under {roots[0][0]}")
 
 
 if __name__ == "__main__":
