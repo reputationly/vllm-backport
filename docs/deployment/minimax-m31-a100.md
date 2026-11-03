@@ -205,8 +205,25 @@ gpustack 内置后端的自定义版本名**必须以 `-custom` 结尾**。新�
 - **DSv4.1-Flash**：功能、KV 容量（1,251,508）、dspark 接受长度、大海捞针、告警
   都一致；GSM8K 95.8% vs 94.4%。新镜像吞吐低约 2.6–2.9%，没到 3% 的门槛，但方向
   一致，**未复核**（用户决定不做）。
-- **包含视觉修复的镜像在 Qwen3.8 上的对比尚未完成**。在 na20+na38 上测试时 na20
-  整机宕机（见 7.1），随后决定暂缓。
+- **Qwen3.8-Flash-Next，正式全量包 `6bd0b071`（含 mrope 修复）**：第一次在 na20+na38
+  上用 docker 直接起服务时，na20 整机宕机（见 7.1）。后来改用 gpustack 临时测试模型
+  （`qwen3.8-ab-test`，线上配置去掉 Mooncake），在同一对节点上先测线上镜像、再测
+  新镜像，两轮都很稳定：
+
+  | 项 | 线上 `c14d2fbf` | 新 `6bd0b071` |
+  |---|---|---|
+  | KV | 21.91 GiB | 21.91 GiB |
+  | 20 条固定提问逐字对比（温度 0） | 自己跑两遍有 12/20 不一致 | 与线上 11/20 不一致，在同一范围内 |
+  | 工具调用 | 2/2 | 2/2 |
+  | GSM8K 500 | 92.8% | 92.6% |
+  | MTP 接受长度 | 约 3.0–3.7 | 约 3.0 |
+  | 并发 1 吞吐 | 90.4 tok/s | 92.8 tok/s（+2.65%） |
+  | 并发 16 吞吐 | 287.9 tok/s | 280.3 tok/s（−2.65%，3 遍 273.8→281.1→285.9） |
+  | 20 万 token 大海捞针 | 找到 | 找到 |
+  | 文字密集图片 / 照片 | 读对 | 与线上读出的内容完全一致 |
+  | 日志告警 | 基线 | 无新增 |
+
+  两种并发下的差距方向相反，且都不到 3%，判定通过。并发 16 是需要留意的一项。
 
 ### 4.3 `reasoning_effort` 的行为（M3.1）
 
@@ -282,8 +299,22 @@ gpustack 内置后端的自定义版本名**必须以 `-custom` 结尾**。新�
 - 已同步到 Docker Hub：`arronlee/vllm-backport:arm64-sm80-base-20261102-1338-6bd0b071`。
 - 校验：镜像里 2542 个 `.py` 文件与 `6bd0b07116` 逐个比对一致；`import vllm`
   正常；M3.1 融合算子带 `write_qkv`；DSpark 算子存在。
-- **浮动 tag（`arm64-sm80-base`、`arm64-sm80-latest`）都没有切换**：切换会影响之后
-  master 出的 DSv4.1、Qwen3.8 镜像，需在 Qwen3.8 对比完成后再决定。
+- M3.1 分支已合入 master（`92a339955e`），合并后的代码与分支完全一致。
+- Qwen3.8 对比通过后，**ACR 和 Docker Hub 的浮动 tag `arm64-sm80-base` 已切到
+  `sha256:5359bfadc7d4…`**（即上面这个 base）。之后 master 的 app 流水线默认基于它
+  出包。`arm64-sm80-latest` 只在 app 流水线出包时移动，这次没动。
+- 回滚：旧的 base（`sha256:69bf05711b31…`）保留为固定 tag
+  `arm64-sm80-base-prev-20261030-c14d2fbf`（ACR 和 Docker Hub 都有）。回滚时把
+  `arm64-sm80-base` 复制回这个 tag，再跑一次 `sync-base-to-dockerhub.yml`：
+  ```bash
+  # 在 devm 上（已登录 ACR）
+  A=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/vllm-backport
+  skopeo copy --authfile ~/.docker/config.json \
+    docker://$A:arm64-sm80-base-prev-20261030-c14d2fbf docker://$A:arm64-sm80-base
+  gh workflow run sync-base-to-dockerhub.yml -f base_tag=arm64-sm80-base
+  ```
+- 现网 DSv4.1、Qwen3.8、M3.1 的 gpustack 后端版本都没有改动，切 tag 不影响正在运行
+  的服务。
 - 编译机文件保留在 `gpu12:/root/m31/`（本地 wheel 索引、llguidance vendor 包、
   日志）；临时文件服务和容器已停。
 
@@ -319,10 +350,14 @@ gpustack 内置后端的自定义版本名**必须以 `-custom` 结尾**。新�
 
 用 GitHub 的 `build-arm64-app.yml`：
 
-- `base_image`：用与当前代码匹配的 base（Docker Hub 上带时间戳的 tag，例如
-  `arronlee/vllm-backport:arm64-sm80-base-20261102-1338-6bd0b071`）。
-- `base_commit`：填 base 对应的提交（例如 `6bd0b07116`）。流水线会检查之后
-  `csrc`/`cmake`/依赖有没有被改动，改了就必须重编 base。
+- `base_image`：默认的 `arronlee/vllm-backport:arm64-sm80-base` 现在就是
+  `6bd0b071` 的 base；也可以写成带时间戳的固定 tag
+  `arronlee/vllm-backport:arm64-sm80-base-20261102-1338-6bd0b071`。
+- `base_commit`：填 base 对应的提交 `6bd0b07116`。流水线会检查之后 `csrc`、`cmake`、
+  `setup.py`、`requirements`、`docker/Dockerfile` 有没有被改动，改了就要求重编 base。
+  注意：`a163f78cb7` 改过 `docker/Dockerfile` 和 `setup.py`，但只是构建参数和版本号
+  逻辑，不影响编出来的 C++，所以这道检查会报警。在下一次重编 base 之前，可以把
+  `base_commit` 留空跳过检查，前提是确认之后确实没有人改过 `csrc`、`cmake` 和依赖。
 - `dest_tag`：如果不想移动 `arm64-sm80-latest`，填一个专用的浮动 tag。
 
 ### 8.2 改了 C++ / CMake / 依赖：重编 base
@@ -409,11 +444,12 @@ gpustack 内置后端的自定义版本名**必须以 `-custom` 结尾**。新�
 
 ### 8.5 待办
 
-- [ ] Qwen3.8 在包含 `12ed760d60`（mrope）的镜像上做新旧对比；通过之前 Qwen3.8 继续
-      用 `reputationly-backport-custom`。
+- [x] Qwen3.8 在正式全量包 `6bd0b071` 上做新旧对比：通过（见 4.2）。
+- [x] 浮动 tag `arm64-sm80-base` 切到新 base：已完成（见第 6 节）。
+- [ ] 现网 Qwen3.8 / DSv4.1 是否迁移到基于新 base 的镜像：要迁移时，先出 master 的 app
+      镜像，新增一个 `*-custom` 后端版本，再逐个切换并观察。
 - [ ] DSv4.1 约 3% 的吞吐差距：如需复核，在同一组节点上按"线上 → 新 → 线上"交替
       压测，并用"新镜像 + 线上 C++ 扩展"的混合镜像区分 C++ 和 Python 的影响。
-- [ ] 浮动 tag `arm64-sm80-base` 是否切到新 base。
 - [ ] na20 的硬件排查（BMC SEL）。
 - [ ] 轮换本次暴露过的 SWR 密码和 gpustack token。
 - [ ] 如需让 M3.1 支持关闭思考，评估定制 chat template（4.3）。
