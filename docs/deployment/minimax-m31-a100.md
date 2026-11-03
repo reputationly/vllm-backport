@@ -4,6 +4,9 @@
 重编 base 镜像的全过程。重点是踩过的坑、根因和解决办法，以及下次可以照着做的
 操作指南（第 8 节）。
 
+合入 master、Qwen3.8 回归、base 浮动 tag 切换、影响面分析和 na20 排查，见
+[M3.1 合入 master、Qwen3.8 回归与 base 浮动 tag 切换记录](minimax-m31-master-merge-and-base-switch.md)。
+
 **结论**
 
 - 分支 `minimax-m31-a100`：从 `master`（`c14d2fbf9c`）切出，**没有整体 merge
