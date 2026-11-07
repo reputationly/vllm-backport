@@ -206,3 +206,18 @@ RUN VLLM_PKG=$(python3 -c 'import vllm,os;print(os.path.dirname(vllm.__file__))'
 ```
 
 这样镜像里 `.so` 与 Python 都来自**同一棵树**（本分支），三个模型才能同时正确加载。
+
+### 10.8 网络可达性实测（决定 FetchContent 能不能过）
+
+| 目标 | dev gpu12 结果 |
+|---|---|
+| `github.com`（HTTPS 网页） | 000（不可用） |
+| `raw.githubusercontent.com` | 000 |
+| **`git ls-remote https://github.com/NVIDIA/cutlass.git`** | ✅ 返回 HEAD sha |
+| **`codeload.github.com`** | ✅ 200 |
+| `crates.io` | 403（不可用） |
+| `mirrors.aliyun.com/crates.io-index/` | ✅ 200 |
+| `pypi.org` / `mirrors.aliyun.com/pypi` | ✅ 200 |
+
+⇒ CMake FetchContent 走 **git 协议**，可用；rust（llguidance）走 aliyun crates 镜像，可用 —— 所以 gpu12 全量编 wheel 这条路成立，
+只是 `requirements/cuda.txt`（198 个包，含 z3-solver / tilelang / llguidance 等源码构建）在隔离网里非常慢。
