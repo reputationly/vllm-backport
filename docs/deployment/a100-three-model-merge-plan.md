@@ -247,3 +247,26 @@ RUN VLLM_PKG=$(python3 -c 'import vllm,os;print(os.path.dirname(vllm.__file__))'
 | MiniMax（候选镜像） | 1.58 s | 2263 tok/s | 0.28 s | 12.7k tok/s | 65–67 tok/s |
 | DeepSeek V4.1（现网镜像基线） | 5.0–7.1 s | 472 tok/s | 0.44–0.60 s | 5.6–7.6k tok/s | 46–53 tok/s |
 | Qwen3.8（现网镜像基线） | 3.70 s | 907 tok/s | 0.36–0.71 s | 4.7–9.3k tok/s | 72–75 tok/s |
+
+### 10.10 三模型在同一镜像上全部验收通过（`repro/vllm-backport:dev-app-m31base`）
+
+| 模型 | 拓扑 | KV 容量 | T=1.8 + RAG ×12 | 空 content | 其它 |
+|---|---|---|---|---|---|
+| deepseek-v4-1-flash | TP8×PP2（4 节点） | 6.62 GiB / 1,595,582 tok | **0/12** | 0/12 | 三行启动日志齐 |
+| minimax-m3.1-flash | TP4×PP4（4 节点） | 19.78 GiB / 2,496,256 tok | **0/12** | 0/12 | 思考中位 1514（正常） |
+| qwen3.8-flash-fp8 | TP2×PP4（2 节点） | 22.86 GiB / 6,626,242 tok | **0/12** | 0/12 | 思考中位 274 |
+
+（判据为稀有字符占比 >0.5% 或 16 字符重复 ≥4；旧的中文占比判据对 MiniMax/Qwen 的英文思考会误报。）
+
+**冷/热性能对照（单流，4K 输入 / 256 输出）**
+
+| 模型 | 冷 TTFT | 冷 prefill | 热 TTFT | 热 prefill | decode |
+|---|---|---|---|---|---|
+| DeepSeek 现网 | 5.0–7.1 s | 472 tok/s | 0.44–0.60 s | 5.6–7.6k | 46–53 tok/s |
+| **DeepSeek 候选** | **5.30 s** | **630 tok/s** | 0.45–0.61 s | 5.5–7.4k | 38–44 tok/s |
+| Qwen 现网 | 3.70 s | 907 tok/s | 0.36–0.71 s | 4.7–9.3k | 72–75 tok/s |
+| **Qwen 候选** | **0.65 / 0.52 s** | **5.2–6.5k tok/s** | 0.35 s | 9.6k | 75 tok/s |
+| MiniMax 候选 | 1.58 s | 2263 tok/s | 0.28 s | 12.7k | 65–67 tok/s |
+
+> Qwen 现网那组冷启动 3.70s 是模型刚 ready 的首发（含 JIT/页缓存冷），候选这组是在跑完一轮后测的；
+> 两边同口径的稳态指标（热 TTFT、decode）一致，没有回归。
