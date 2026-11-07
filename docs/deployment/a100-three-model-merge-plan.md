@@ -221,3 +221,29 @@ RUN VLLM_PKG=$(python3 -c 'import vllm,os;print(os.path.dirname(vllm.__file__))'
 
 ⇒ CMake FetchContent 走 **git 协议**，可用；rust（llguidance）走 aliyun crates 镜像，可用 —— 所以 gpu12 全量编 wheel 这条路成立，
 只是 `requirements/cuda.txt`（198 个包，含 z3-solver / tilelang / llguidance 等源码构建）在隔离网里非常慢。
+
+### 10.9 一体化镜像候选跑通：`repro/vllm-backport:dev-app-m31base`
+
+**关键转折**：dev 全量编 base 在隔离网里被 llguidance 的 cargo（`CARGO_HOME=/opt/rust`，sparse index 走不通）反复卡死；
+改用**普通 app 层叠在 M3.1 现网 base（`arm64-sm80-20261102-0949-12ed760d`）之上**，一次成功。
+该 base 的 csrc 已含三模型所需内核（M3.1 融合 kernel 等），我的 Python 补丁叠上去后：
+
+- 镜像在 gpu41/43/44/45 各构建一次（每台约 12 分钟），产物 `repro/vllm-backport:dev-app-m31base`；
+- `sampling_policy.py` 在场、`vllm.__version__` 0.13.2。
+
+**MiniMax-M3.1-Flash 验收（TP4×PP4，现网参数）**
+
+| 项 | 旧镜像（修复前） | 一体化候选 |
+|---|---|---|
+| 启动 | — | ✅ 权重 48 shard 正常加载，KV **19.78 GiB / 2,496,256 token** |
+| T=1.8 + RAG ×12 | 12/12 异常、content 全空 | **0/12 异常**（新判据 max_rare=0；旧的中文占比判据给 7/12，是它把 MiniMax 的**英文思考**误判） |
+| 空 content | 12/12 | **0/12** |
+| 思考长度 | 1089–9722（中位 9050） | 中位 **1514**、最大 2980（正常范围） |
+
+**冷/热性能（单流，4K 输入 / 256 输出）**
+
+| 模型 | 冷 TTFT | 冷 prefill | 热 TTFT | 热 prefill | decode |
+|---|---|---|---|---|---|
+| MiniMax（候选镜像） | 1.58 s | 2263 tok/s | 0.28 s | 12.7k tok/s | 65–67 tok/s |
+| DeepSeek V4.1（现网镜像基线） | 5.0–7.1 s | 472 tok/s | 0.44–0.60 s | 5.6–7.6k tok/s | 46–53 tok/s |
+| Qwen3.8（现网镜像基线） | 3.70 s | 907 tok/s | 0.36–0.71 s | 4.7–9.3k tok/s | 72–75 tok/s |
