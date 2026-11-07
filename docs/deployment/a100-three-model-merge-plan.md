@@ -57,3 +57,25 @@
 
 当前 base 线：ACR/Docker Hub 浮动 tag `arm64-sm80-base` = `arm64-sm80-base-20261102-1338-6bd0b071`；
 回滚点 `arm64-sm80-base-prev-20261030-c14d2fbf`（见 `minimax-m31-a100.md` §306–310）。
+
+### 10.1 里程碑：app 层镜像已在本机流水线上跑通（dev 验证）
+
+用产物分支 `release/a100-app`（= master + 采样语义 + 全部纯 Python 正确性项，**不含 csrc 改动**，
+Guard 检查通过：`git diff --name-only origin/master..HEAD -- csrc CMakeLists.txt cmake setup.py requirements docker/Dockerfile` 为空），
+在 dev 节点上用**现网镜像作 BASE**（`arm64-sm80-20261021-1441-b5558c8f`，base digest `dc509aed33b5`）执行
+`docker build -f docker/Dockerfile.aarch64_app`，产物 `repro/vllm-backport:dev-app-a`（35.8 GB，构建约 12 分钟）。
+
+镜像自检：`vllm.__version__` 正常、`arch_list` 含 `sm_80`、策略表四族（deepseek-v4 / minimax-m3 / qwen3.8 / glm-5.3）在场、
+`BlockTables.gather_block_tables` 含 `mask_sliding_window`（#60767 生效）。
+
+**DeepSeek V4.1（TP8×PP2，四节点，现网参数）验收**：
+
+| 项 | 结果 |
+|---|---|
+| 启动日志三行 | V2 Model Runner ✓、fp8_ds_mla ✓、Marlin/mxfp4 ✓ |
+| KV 容量 | **6.62 GiB / 1,595,582 token**（与基线一致，±5% 内） |
+| T=1.8 + RAG ×12 | **0/12**（旧判据与新判据都是 0） |
+| T=0.7 + 裸 prompt ×12 | 旧判据 5/12、**新判据 0/12**（已知的英文思考/markdown 误报） |
+
+⇒ 纯 Python 批（采样语义 + #58231/#62046/#60613/#59945/#58489/#58961/#60767）在现网 base 上**可跑且行为达标**。
+下一步：MiniMax-M3.1 与 Qwen3.8 用同一镜像各跑一遍 §6 的门槛；带 #63475 的 base 重建另行安排。
