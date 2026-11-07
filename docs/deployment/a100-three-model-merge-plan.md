@@ -97,3 +97,24 @@ RuntimeError: _C::fused_minimax_m3_qknorm_rope_kv_insert() expected at most 23 a
 app 层叠现网 base 这条路对 MiniMax 走不通。这也正是 `build-arm64-app.yml` 的 Guard 想拦的事：
 `release/a100-app` 相对 `origin/master` 通过 Guard，但相对**现网 base 的 commit** 不通过（csrc 早已在 master 上变过）。
 后续出包必须以 `base_commit = 实测所基于的 base` 为准，或直接重建 base。
+
+### 10.3 当前阻塞与所需授权（出包关键路径）
+
+| 项 | 状态 | 说明 |
+|---|---|---|
+| DeepSeek V4.1（app 层镜像） | ✅ 已验收 | T=1.8 RAG 0/12、KV 6.62 GiB、三行日志齐 |
+| MiniMax-M3.1（app 层镜像） | ⛔ 阻塞 | 需要含 master csrc 的 base（`fused_minimax_m3_qknorm_rope_kv_insert` 26 vs 23 参） |
+| Qwen3.8（app 层镜像） | ⚠️ 未测成 | dev 上 4 节点 `mp` rendezvous 失败（`DistNetworkError` / `assert remote_message_queue`），不是镜像问题；现网该模型走 gpustack 分布式（ray），dev 侧还需调启动方式或改 ray |
+| base 重建 | ⛔ 阻塞 | 见下 |
+
+**base 重建的两条路都卡在基础设施：**
+
+1. **GitHub Actions `docker-publish.yml`**（`runs-on: self-hosted`，timeout 2880 min）：当前仓库
+   **没有任何在线 runner**（`GET /actions/runners` → `total_count: 0`）。历史上 2026-11-02 那次 M3.1 合并跑过 24h 后被取消。
+   → 需要把自建 builder 上线，然后 `gh workflow run docker-publish.yml --ref merge/a100-three-model`。
+2. **dev 本地跑 `docker/build_base_aarch64.sh`**：脚本默认 `BUILD_BASE_IMAGE=pytorch/manylinuxaarch64-builder:cuda13.0-b8b5f17a…`，
+   而 dev 节点 **Docker Hub 不通**（`registry-1.docker.io` 超时）。ACR 里有 `reputationly/nvidia-cuda:13.0.3-base-ubuntu24.04`（可拉 ✅），
+   但 **`reputationly/manylinuxaarch64-builder` 不在 ACR**（tag `cuda13.0-b8b5f17a` 与长 tag 都 404）。
+   → 需要先跑一次 `mirror-build-base-to-acr.yml` 把该 builder 镜像搬进 ACR，或在有 Docker Hub 的机器上构建。
+
+分支已推送：`origin/merge/a100-three-model`（`8c7ea29f3a`）、`origin/release/a100-app`（`3542f4078e`）。
