@@ -288,3 +288,24 @@ CI 流水线（`build-arm64-app.yml`，`--ref merge/a100-three-model`，`base_im
 **gpustack 侧**：已在 vLLM 后端注册新版本 `rep-backport-sampling-fix-custom`（image 指向上面的不可变 tag，
 其余字段与 `reputationly-backport-custom` 一致）。**尚未切换任何模型的 backend_version**——切换会让该模型的全部
 副本按新镜像重启（MiniMax 1 副本 / Qwen 3 / DeepSeek 6），回滚方式是改回原版本名。
+
+### 10.12 现网灰度：MiniMax-M3.1 已切到新镜像并通过验收
+
+切换方式（gpustack 只改 `backend_version` 不会重启实例，需要一次 0→1 的重新部署）：
+
+1. `PUT /v2/models/86`，`backend_version` → `rep-backport-sampling-fix-custom`；
+2. `PUT /v2/models/86`，`replicas` 1→0（等实例销毁）；
+3. `PUT /v2/models/86`，`replicas` 0→1（新实例用新镜像创建）；
+4. 回滚同样三步，把 `backend_version` 改回 `reputationly-backport-m31-custom` 即可。
+
+结果：新实例 `minimax-m3.1-flash-3erhr-f1` 落在 `newapi-A100-0008`，容器镜像 `187b1c1e1930`
+（= 发布 digest `sha256:187b1c1e…`），约 9 分钟 ready。
+
+**经 MaaS 网关（真实客户路径）验收**：
+
+| 项 | 结果 |
+|---|---|
+| T=1.8 + RAG ×12 | **0/12 异常**（旧判据也是 0，`max_rare=0`） |
+| content | 中位 291 字、**空 0/12**（切换前是 12/12 空） |
+| 思考长度 | 中位 770 字符、最大 2388（正常） |
+| 冷/热（含网关开销） | 冷 TTFT 2.24 s / 1596 tok/s；热 TTFT 0.36 s / 9978 tok/s；decode 70 tok/s |
