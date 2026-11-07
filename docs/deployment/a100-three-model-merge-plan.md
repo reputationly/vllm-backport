@@ -389,3 +389,21 @@ Domains=~.
 验证：`getent hosts` 解析 `crpi-…` / `aliregistry-…-oss` / `dockerauth…` 全部成功，
 两台都能 `docker pull …:arm64-sm80-v41-sampling-fix`；运行中的模型容器未受影响。
 （`docker.io` 仍不可达，这是整个集群的既有策略，与 DNS 无关。）
+
+### 10.16 补入另一 Agent 的哨兵修复并重新出包
+
+**发现**：现网镜像 `arm64-sm80-20261107-1737-1a1e6798` **不含** `f842989922`
+（fix(dsv41): 文本字面哨兵拼写按纯文本编码，消除会话级 400）。
+本分支从 `5b1e90ebe0`（11-03）切出，而该修复 11-07 19:36 才经 PR #1 落 master（`0588ddddb0`）；
+出包用的 `1a1e6798` 不含它（`git merge-base --is-ancestor` 为 NO，容器内 `vllm/tokenizers/deepseek_v41.py`
+也没有 `ue001` 标记 / literal-sentinel 逻辑）。
+
+影响：agent 客户端全量回放历史时，工具输出/报错文本中的字面哨兵拼写会让 DeepSeek-V4.1 会话永久 400。
+
+处理：
+1. `merge origin/master`（`0588ddddb0`）进 `merge/a100-three-model` → `a6b4fb9c6e`，仅带入
+   `deepseek_v41.py` tokenizer + 测试 + 评审文档（无其它变更混入）；
+2. 重跑 `build-arm64-app.yml`（同 M3.1 base），dest_tag `arm64-sm80-sampling-plus-sentinel`；
+3. 新镜像验证后替换三模型。
+
+另外确认：`minimax-m31-a100` 本地的同名 commit `fa283ccdb3` 已在远端（`origin/minimax-m31-a100` 指向它），无需再推。
