@@ -135,6 +135,21 @@ app 层叠现网 base 这条路对 MiniMax 走不通。这也正是 `build-arm64
    RUSTUP_DIST_SERVER=https://rsproxy.cn RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup bash docker/build_base_aarch64.sh`
 - 日志：`/root/base_build2.log`（**小时级**，nvcc 全量编译）。
 
+
+**隔离网的两个额外修补（上一轮 M3.1 出包时没记录的坑）**
+
+1. `PYTORCH_CUDA_INDEX_BASE_URL` 会被 Dockerfile 拼成 `${BASE}/cu130`，所以它必须是"根"，
+   不能直接填 `.../pytorch-wheels/cu130`（会变成 `.../cu130/cu130` 404）。而 aliyun 的
+   `pytorch-wheels/cu130/` 只是文件目录，不是 PEP503 索引，uv 解析不了。
+   实测 **`torch==2.13.0` 在 aliyun PyPI 镜像里就有**（aarch64 wheel 齐全），
+   所以在 gpu12 上起了一个 30 行的本地代理 `pypi_proxy.py`（`:8917`）：
+   `/cu130/<pkg>/`、`/simple/<pkg>/` → `https://mirrors.aliyun.com/pypi/simple/<pkg>/`，
+   `/packages/...` → `.../pypi/packages/...`，支持 HEAD（uv 会先 HEAD 再 GET）。
+2. `FLASHINFER_INDEX_BASE_URL` 必须显式 export，否则 `build_base_aarch64.sh:183` 因 `set -u` 直接退出；
+   `flashinfer.ai/whl` 在 dev 网内可达（200），保持默认即可。
+
+最终命令：`/root/run_base_build3.sh`，日志 `/root/base_build5.log`。
+
 **顺带修掉一个出包阻断**：`vllm-runtime-base` 阶段的 `curl ${GET_PIP_URL} | python3.12` 在 Ubuntu 24.04 上必然失败
 （`ModuleNotFoundError: No module named 'distutils'`，get-pip 自带 pip 依赖已被移除的 distutils），实测 aliyun 与
 bootstrap.pypa.io 两个源都一样。改为 `apt-get install python3-pip`（pip 24.0 / python3.12，无需网络引导），commit `e7eaf2e79a`。
