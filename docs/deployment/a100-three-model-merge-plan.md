@@ -309,3 +309,26 @@ CI 流水线（`build-arm64-app.yml`，`--ref merge/a100-three-model`，`base_im
 | content | 中位 291 字、**空 0/12**（切换前是 12/12 空） |
 | 思考长度 | 中位 770 字符、最大 2388（正常） |
 | 冷/热（含网关开销） | 冷 TTFT 2.24 s / 1596 tok/s；热 TTFT 0.36 s / 9978 tok/s；decode 70 tok/s |
+
+### 10.13 现网三模型全部切到新镜像并验收通过（2026-11-08）
+
+**镜像**：ACR `arm64-sm80-20261107-1737-1a1e6798` / digest `sha256:187b1c1e1930aebd0fdd375970d7335bf7fda95e2354076efe626274ad80a682`
+**gpustack 后端版本**：`rep-backport-sampling-fix-custom`
+**容器实检**：`llm03/07/08/11/16/17/21/25/na29/na34` 上的三模型容器 `docker ps` 镜像 ID 均为 `187b1c1e1930` ✓
+
+| 模型 | 副本 | T=1.8 + RAG ×12（经 MaaS 网关） | content | 思考长度 |
+|---|---|---|---|---|
+| deepseek-v4-1-flash | 6（5 ready + 1 启动中） | **0/12** | 中位 234 字、空 0 | 中位 459 |
+| qwen3.8-flash-fp8 | 3/3 | **0/12** | 中位 244 字、空 0 | 中位 361 |
+| minimax-m3.1-flash | 1/1 | **0/12** | 中位 291 字、空 0 | 中位 770 |
+
+**冷/热（经网关，含网关开销；4K 输入 / 256 输出）**
+
+| 模型 | 冷 TTFT | 冷 prefill | 热 TTFT | 热 prefill | decode |
+|---|---|---|---|---|---|
+| deepseek-v4-1-flash | 2.96 / 4.59 s | 728–1129 tok/s | 1.19–1.60 s | 2.1–2.8k | 199–420（流式口径偏差，见下） |
+| qwen3.8-flash-fp8 | 2.44 s | 1377 tok/s | 0.49–0.82 s | 4.1–6.9k | 106–107 |
+| minimax-m3.1-flash | 1.48 s | 2425 tok/s | 0.36–0.37 s | 9.6–9.9k | 70 |
+
+> DeepSeek 的 decode 数值偏高是**流式口径**造成的：它的 `reasoning` 不是逐 delta 下发，`ttot-ttft` 只覆盖正文阶段，
+> 用 `completion_tokens/(ttot-ttft)` 会虚高；同口径横向比较请用热 TTFT 与 prefill。
