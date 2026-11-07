@@ -357,3 +357,35 @@ gpustack 只能在它上面创建出 `-pause` 占位容器（`Created` 状态）
 
 最终：deepseek-v4-1-flash **6/6**、qwen3.8-flash-fp8 **3/3**、minimax-m3.1-flash **1/1**，
 全部 `backend_version=rep-backport-sampling-fix-custom`；经网关复测 DeepSeek T=1.8 + RAG ×12 仍是 **0/12**。
+
+### 10.15 llm02 / llm13 的 DNS 已修复（持久化）
+
+根因：两台节点的 `systemd-resolved` 虽然 active，但**没有任何上游 DNS**
+（`resolvectl status` 里 `enp131s0f0` 显示 `Current Scopes: none`，全局也没有 DNS Servers），
+对比健康节点 llm18 是 `enp131s0f0 → 100.125.0.25 / openstacklocal`。
+网络由 NetworkManager 管理（`Wired connection 1`），DHCP 没把 DNS 交给 resolved。
+
+修复（不重启网络、不影响运行中的容器）：
+
+```bash
+mkdir -p /etc/systemd/resolved.conf.d
+cat > /etc/systemd/resolved.conf.d/zz-upstream-dns.conf <<EOF
+[Resolve]
+DNS=100.125.0.25
+FallbackDNS=223.5.5.5
+Domains=~.
+
+### 10.15 llm02 / llm13 的 DNS 已修复（持久化）
+
+根因：两台节点的 `systemd-resolved` 虽然 active，但**没有任何上游 DNS**
+（`resolvectl status` 里 `enp131s0f0` 是 `Current Scopes: none`，全局也没有 DNS Servers）；
+健康节点 llm18 是 `enp131s0f0 -> 100.125.0.25 / openstacklocal`。
+网络由 NetworkManager 管（`Wired connection 1`），DHCP 没把 DNS 交给 resolved。
+
+修复（不重启网络、不影响运行中的容器）：写 `/etc/systemd/resolved.conf.d/zz-upstream-dns.conf`，
+内容为 `[Resolve]` 段里的 `DNS=100.125.0.25`、`FallbackDNS=223.5.5.5`、`Domains=~.`，然后
+`systemctl restart systemd-resolved`。
+
+验证：`getent hosts` 解析 `crpi-…` / `aliregistry-…-oss` / `dockerauth…` 全部成功，
+两台都能 `docker pull …:arm64-sm80-v41-sampling-fix`；运行中的模型容器未受影响。
+（`docker.io` 仍不可达，这是整个集群的既有策略，与 DNS 无关。）
