@@ -24,3 +24,36 @@
 
 下一步顺序：① #60767 + #60142（正确性、纯 Python/内核各一）→ ② #62936 单独移植并跑 `tests/kernels/test_top_k_per_row.py` →
 ③ M3.1 三项 → ④ csrc 重编出镜像（分支 C）→ ⑤ 按 §6 验收。
+
+---
+
+## 10. 出包流水线（已核对 `.github/workflows/build-arm64-app.yml` + `docker/build_base_aarch64.sh`）
+
+**两层结构**，改动落在哪一层决定了出包代价：
+
+| 层 | 脚本/入口 | 机器 | 耗时 | 何时必须重建 |
+|---|---|---|---|---|
+| base（全量 nvcc） | `docker/build_base_aarch64.sh`（`docker/Dockerfile` target `vllm-openai`，`TORCH_CUDA_ARCH_LIST=8.0`、`INSTALL_EP_KERNELS=false`） | 任意 ARM64（不需 GPU）；`PUSH=0` 可只留本地 | 小时级 | `csrc/`、`CMakeLists.txt`、`cmake/`、`setup.py`、`requirements/`、`docker/Dockerfile` 有改动 |
+| app（只换 Python/Triton） | `docker/Dockerfile.aarch64_app`，GitHub Actions `build-arm64-app.yml`（`ubuntu-24.04-arm`，timeout 120 min，实测 45 min 起） | GHA arm64 runner | 分钟级 | 只改 `vllm/**.py` |
+
+- app 层会 `cp -a` 覆盖 `site-packages/vllm`，并重装 `ray 2.56.1` 与 `mooncake-transfer-engine`+`libcudart.so.12`；构建期断言 `arch_list` 含 `sm_80`。
+- 打 tag：`arm64-sm80-$(date -u +%Y%m%d-%H%M)-$(git rev-parse --short=8 HEAD)` + 浮动 tag；双推 ACR(`crpi-…/reputationly/vllm-backport`) 与 Docker Hub(`arronlee/vllm-backport`)。
+- **Guard 步骤**（`base_commit` 入参非空时）：只要 `csrc|CMakeLists.txt|cmake|setup.py|requirements|docker/Dockerfile` 相对 base 有 diff，**直接失败**——这正是"Python 新、.so 旧"的静默事故防线。
+
+### 对本方案的影响（关键）
+
+本分支含 **#63475 的 csrc 改动**（`csrc/libtorch_stable/persistent_topk.cuh`），因此：
+
+1. **不能只跑 app 层**——Guard 会拦住，且拦得对（.so 里没有 `__syncthreads` 修复）。
+2. 要出带 #63475 的镜像，必须先重建 base（小时级，ARM64 机器），再跑 app 层。
+3. 因此按 §5 的分批执行时，**分支 A（采样语义）可以先单独出 app 层镜像**（纯 Python，秒级验证、分钟级出包），
+   B 里的纯 Python 项（#58231/#62046/#60613/#59945/#58489/#58961/#60767）也都能进 app 层；
+   只有 #63475 需要等 base 重建。
+
+### 建议的两条出包线
+
+- `release/a100-app`：master + 采样语义 + 全部纯 Python 正确性项 → **app 层镜像**（快，可先上线验证三模型）
+- `release/a100-base`：再加 #63475（及后续任何 csrc 项）→ **重建 base + app 层**（慢，单独一波）
+
+当前 base 线：ACR/Docker Hub 浮动 tag `arm64-sm80-base` = `arm64-sm80-base-20261102-1338-6bd0b071`；
+回滚点 `arm64-sm80-base-prev-20261030-c14d2fbf`（见 `minimax-m31-a100.md` §306–310）。
