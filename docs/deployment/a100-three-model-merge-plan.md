@@ -332,3 +332,28 @@ CI 流水线（`build-arm64-app.yml`，`--ref merge/a100-three-model`，`base_im
 
 > DeepSeek 的 decode 数值偏高是**流式口径**造成的：它的 `reasoning` 不是逐 delta 下发，`ttot-ttft` 只覆盖正文阶段，
 > 用 `completion_tokens/(ttot-ttft)` 会虚高；同口径横向比较请用热 TTFT 与 prefill。
+
+### 10.14 第 6 个 DeepSeek 副本卡住的根因与修复
+
+现象：`deepseek-v4-1-flash-2zt9i` 长时间 `starting`（ready 5/6）。
+
+根因：该副本是 TP8×PP2 跨 **4 个 worker** 的分布式实例
+（leader `newapi-A100-0017`/10.0.0.241 + 子节点 0013/10.0.0.69、0018/10.0.0.99、0024/10.0.0.68），
+其中 **`newapi-A100-0013`（llm13）没有新镜像**——它的 `127.0.0.53` 解析器坏了，`docker pull` 一直失败，
+gpustack 只能在它上面创建出 `-pause` 占位容器（`Created` 状态），run 容器起不来，
+于是 leader 侧 `world_size=16` 只等到 rank 0–3，其余 rank 永远缺席。
+
+修复：把镜像手工灌进那两台 DNS 异常的节点。由于 `dockerauth`、`aliregistry-…-oss` 也都解析不了，
+需要把三个域名临时写进 `/etc/hosts`（用健康节点查到的 IPv4）：
+
+```
+139.196.71.17  crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com
+120.55.35.2    dockerauth.cn-hangzhou.aliyuncs.com
+183.131.237.80 aliregistry-cn-shanghai.oss-cn-shanghai.aliyuncs.com
+```
+
+拉取成功后立即用备份还原 `/etc/hosts`。**llm13、llm02 现在都已有该镜像**；
+随后 gpustack 自动补建了 `-f0-run-0` 容器，该副本在 06:58 变为 ready。
+
+最终：deepseek-v4-1-flash **6/6**、qwen3.8-flash-fp8 **3/3**、minimax-m3.1-flash **1/1**，
+全部 `backend_version=rep-backport-sampling-fix-custom`；经网关复测 DeepSeek T=1.8 + RAG ×12 仍是 **0/12**。
