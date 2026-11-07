@@ -42,6 +42,9 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionStreamResponse,
     ChatMessage,
 )
+from vllm.entrypoints.openai.chat_completion.sampling_policy import (
+    policy_for,
+)
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.engine.protocol import (
     CompletionTokenUsageInfo,
@@ -170,6 +173,7 @@ class OpenAIServingChat(GenerateBaseServing):
         self.enable_force_include_usage = enable_force_include_usage
         self.enable_per_request_metrics = enable_per_request_metrics
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
+        self.sampling_policy = policy_for(self.model_config)
         mc = self.model_config
         self.override_max_tokens = (
             self.default_sampling_params.get("max_tokens")
@@ -327,6 +331,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 sampling_params = request.to_sampling_params(
                     max_tokens,
                     self.default_sampling_params,
+                    sampling_policy=self.sampling_policy,
                 )
 
             self._log_inputs(
