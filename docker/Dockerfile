@@ -210,6 +210,15 @@ ARG PYTORCH_NIGHTLY
 # Install build and runtime dependencies, including PyTorch
 # Check whether to install torch nightly instead of release for this build
 COPY requirements/common.txt requirements/common.txt
+# Source builds inside this step (llguidance builds a maturin/rust wheel) fetch
+# crates; without the mirror they hang on an unreachable crates.io. The same
+# config is written again for the rust build below.
+RUN if [ -n "${CARGO_REGISTRY_MIRROR}" ]; then \
+        mkdir -p /root/.cargo \
+        && printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "%s"\n\n[net]\ngit-fetch-with-cli = true\nretry = 10\n' \
+            "${CARGO_REGISTRY_MIRROR}" > /root/.cargo/config.toml; \
+    fi
+
 COPY requirements/cuda.txt requirements/cuda.txt
 COPY use_existing_torch.py use_existing_torch.py
 COPY pyproject.toml pyproject.toml
