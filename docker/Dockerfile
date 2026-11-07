@@ -210,6 +210,10 @@ ARG PYTORCH_NIGHTLY
 # Install build and runtime dependencies, including PyTorch
 # Check whether to install torch nightly instead of release for this build
 COPY requirements/common.txt requirements/common.txt
+# Declared here (again at the rust stage) so the mirror is in scope for the
+# source builds below.
+ARG CARGO_REGISTRY_MIRROR
+
 # Source builds inside this step (llguidance builds a maturin/rust wheel) fetch
 # crates; without the mirror they hang on an unreachable crates.io. The same
 # config is written again for the rust build below.
