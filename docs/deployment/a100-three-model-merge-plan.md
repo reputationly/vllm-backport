@@ -118,3 +118,23 @@ app 层叠现网 base 这条路对 MiniMax 走不通。这也正是 `build-arm64
    → 需要先跑一次 `mirror-build-base-to-acr.yml` 把该 builder 镜像搬进 ACR，或在有 Docker Hub 的机器上构建。
 
 分支已推送：`origin/merge/a100-three-model`（`8c7ea29f3a`）、`origin/release/a100-app`（`3542f4078e`）。
+
+### 10.4 base 重建已启动（dev gpu12，按 `minimax-m31-a100.md` §8.2 的路径）
+
+`minimax-m31-a100.md` §8.2 记录了上一轮 M3.1 出包的做法：**在 dev 的 ARM64 大内存节点上用本地 cn 基座镜像跑
+`docker/build_base_aarch64.sh`，配合 aliyun 镜像源**。照此执行：
+
+- 机器：`gpu12`（`dev-gpustack-a100-0012`，251 GB 内存 / 700 G 空闲盘），本地已有
+  `local/manylinuxaarch64-builder:cuda13.0-cn` 与 `local/nvidia-cuda:13.0.3-base-ubuntu24.04-cn` 两个基座（**不需要 Docker Hub**）；
+- 源码：`git bundle` 传分支保证 commit 哈希一致，`/root/m31build2` @ `e7eaf2e79a`；
+- 命令（`/root/run_base_build2.sh`）：
+  `PUSH=0 MAX_JOBS=32 NVCC_THREADS=1 TORCH_CUDA_ARCH_LIST=8.0 BUILD_BASE_IMAGE=local/manylinuxaarch64-builder:cuda13.0-cn
+   FINAL_BASE_IMAGE=local/nvidia-cuda:13.0.3-base-ubuntu24.04-cn DEADSNAKES_MIRROR_URL=https://mirrors.aliyun.com
+   PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ PYTORCH_CUDA_INDEX_BASE_URL=https://mirrors.aliyun.com/pytorch-wheels/cu130
+   FLASHINFER_INDEX_BASE_URL=https://mirrors.aliyun.com/pypi/simple CARGO_REGISTRY_MIRROR=sparse+https://mirrors.aliyun.com/crates.io-index/
+   RUSTUP_DIST_SERVER=https://rsproxy.cn RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup bash docker/build_base_aarch64.sh`
+- 日志：`/root/base_build2.log`（**小时级**，nvcc 全量编译）。
+
+**顺带修掉一个出包阻断**：`vllm-runtime-base` 阶段的 `curl ${GET_PIP_URL} | python3.12` 在 Ubuntu 24.04 上必然失败
+（`ModuleNotFoundError: No module named 'distutils'`，get-pip 自带 pip 依赖已被移除的 distutils），实测 aliyun 与
+bootstrap.pypa.io 两个源都一样。改为 `apt-get install python3-pip`（pip 24.0 / python3.12，无需网络引导），commit `e7eaf2e79a`。
