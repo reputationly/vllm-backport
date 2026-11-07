@@ -79,3 +79,21 @@ Guard 检查通过：`git diff --name-only origin/master..HEAD -- csrc CMakeList
 
 ⇒ 纯 Python 批（采样语义 + #58231/#62046/#60613/#59945/#58489/#58961/#60767）在现网 base 上**可跑且行为达标**。
 下一步：MiniMax-M3.1 与 Qwen3.8 用同一镜像各跑一遍 §6 的门槛；带 #63475 的 base 重建另行安排。
+
+### 10.2 关键发现：MiniMax-M3.1 无法在"现网 base + master Python"的 app 层镜像上起服务
+
+用 `release/a100-app`（master Python）叠在现网 base（`b5558c8f` / digest `dc509aed33b5`）上，
+MiniMax-M3.1（TP4×PP4，现网参数）启动到 profiling 阶段失败：
+
+```
+RuntimeError: _C::fused_minimax_m3_qknorm_rope_kv_insert() expected at most 23 argument(s)
+              but received 26 argument(s)
+```
+
+根因已确认：`e89bb7b747`（2026-11-01 `minimax_m3: port fused kernel to upstream (nvfp4 insert, write_qkv, dspark)`）
+**不是** `b5558c8f` 的祖先，即 master 的 Python 调用的是新版融合内核（26 参），而现网 base 里的 `.so` 仍是 23 参版本。
+
+⇒ **三模型统一镜像必须用「从 master 重建的 base」**（含 M3.1 csrc + 我们的 csrc 修复），
+app 层叠现网 base 这条路对 MiniMax 走不通。这也正是 `build-arm64-app.yml` 的 Guard 想拦的事：
+`release/a100-app` 相对 `origin/master` 通过 Guard，但相对**现网 base 的 commit** 不通过（csrc 早已在 master 上变过）。
+后续出包必须以 `base_commit = 实测所基于的 base` 为准，或直接重建 base。
