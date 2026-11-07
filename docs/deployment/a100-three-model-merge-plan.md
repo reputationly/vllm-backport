@@ -181,3 +181,28 @@ bootstrap.pypa.io 两个源都一样。改为 `apt-get install python3-pip`（pi
   `/root/.cargo/config.toml`（commit `565be34759`）。
 - 另外两条路径也入口：单趟构建会让 `base` 与 `vllm-runtime-base` 抢同一个 uv 缓存锁（脚本注释里写的坑），
   所以按文档建议**分两趟**：先 `BUILD_TARGET=base`，再跑默认目标。
+
+### 10.7 出包路线收敛：只编 wheel，再叠到现网镜像（不做 pass 2 全量运行时镜像）
+
+排查中发现两条"看似更快"的路都不可行，最终确定如下：
+
+| 备选 | 结论 |
+|---|---|
+| 复用 M3.1 现网镜像（ACR `arm64-sm80-20261102-0949-12ed760d`）当 base | ❌ 该镜像 Python/csrc 自洽，但 `fused_minimax_m3_qknorm_rope_kv_insert` 的 Python 参数是 **27** 个，现网 `b5558c8f` 的 `.so` 是 **23**，本分支 master 是 **26** —— 三条血缘不同，叠谁的 Python 都会错配 |
+| 在现网镜像里就地重编扩展（`setup.py build_ext`） | ❌ 现网运行时镜像缺 cmake/git/pybind11，且 CMake 的第三方依赖走 FetchContent 从 GitHub 拉，dev 网内 github.com **不可达**（实测 000） |
+| **dev gpu12 全量编 wheel（当前路线）** | ✅ 基座 `local/manylinuxaarch64-builder:cuda13.0-cn` 自带 `/opt/wheelhouse` 等离线依赖；`BUILD_TARGET=base` 只产出编译好的 wheel，**不需要 pass 2** 的运行时镜像 |
+
+最终叠加方式（pass 1 结束后执行）：从 pass-1 镜像取出 `dist/*.whl`，用一个小 Dockerfile 叠到现网镜像：
+
+```dockerfile
+ARG BASE_IMAGE=<现网 b5558c8f 或同血缘镜像>
+FROM ${BASE_IMAGE}
+COPY dist/*.whl /tmp/
+RUN python3 -m pip install --no-deps --force-reinstall /tmp/*.whl && rm -f /tmp/*.whl
+COPY vllm/ /tmp/vllm-src/
+RUN VLLM_PKG=$(python3 -c 'import vllm,os;print(os.path.dirname(vllm.__file__))') \
+ && find /tmp/vllm-src -name '*.so' -delete \
+ && cp -a /tmp/vllm-src/. "$VLLM_PKG"/
+```
+
+这样镜像里 `.so` 与 Python 都来自**同一棵树**（本分支），三个模型才能同时正确加载。
