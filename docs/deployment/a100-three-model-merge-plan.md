@@ -270,3 +270,21 @@ RUN VLLM_PKG=$(python3 -c 'import vllm,os;print(os.path.dirname(vllm.__file__))'
 
 > Qwen 现网那组冷启动 3.70s 是模型刚 ready 的首发（含 JIT/页缓存冷），候选这组是在跑完一轮后测的；
 > 两边同口径的稳态指标（热 TTFT、decode）一致，没有回归。
+
+### 10.11 出包与预热完成
+
+CI 流水线（`build-arm64-app.yml`，`--ref merge/a100-three-model`，`base_image=<M3.1 现网 base>`）构建并双推成功：
+
+- ACR 不可变 tag：`…/reputationly/vllm-backport:arm64-sm80-20261107-1737-1a1e6798`
+- ACR 浮动 tag：`…:arm64-sm80-v41-sampling-fix`
+- Docker Hub：`arronlee/vllm-backport:arm64-sm80-20261107-1737-1a1e6798`
+- Digest：`sha256:187b1c1e1930aebd0fdd375970d7335bf7fda95e2354076efe626274ad80a682`
+- 抽检：`vllm 0.13.2`、`sampling_policy.py` 在场、`arch_list` 含 `sm_80`
+
+**38 台现网预热：36/38 成功**。`llm02`、`llm13` 因节点自身 `127.0.0.53` DNS 解析异常拉取失败
+（`dial tcp: lookup … server misbehaving`，与镜像无关；临时 `/etc/hosts` 固定也因该节点 IPv6-only、路由不可达而无效），
+需要运维重启这两台的 systemd-resolved 或另行分发。
+
+**gpustack 侧**：已在 vLLM 后端注册新版本 `rep-backport-sampling-fix-custom`（image 指向上面的不可变 tag，
+其余字段与 `reputationly-backport-custom` 一致）。**尚未切换任何模型的 backend_version**——切换会让该模型的全部
+副本按新镜像重启（MiniMax 1 副本 / Qwen 3 / DeepSeek 6），回滚方式是改回原版本名。
