@@ -153,3 +153,31 @@ app 层叠现网 base 这条路对 MiniMax 走不通。这也正是 `build-arm64
 **顺带修掉一个出包阻断**：`vllm-runtime-base` 阶段的 `curl ${GET_PIP_URL} | python3.12` 在 Ubuntu 24.04 上必然失败
 （`ModuleNotFoundError: No module named 'distutils'`，get-pip 自带 pip 依赖已被移除的 distutils），实测 aliyun 与
 bootstrap.pypa.io 两个源都一样。改为 `apt-get install python3-pip`（pip 24.0 / python3.12，无需网络引导），commit `e7eaf2e79a`。
+
+### 10.5 Qwen3.8 在 app 层镜像上验收通过（之前的"阻塞"是我启动参数错了）
+
+现网 Qwen 是 **2 节点**（TP2×PP4 = 8 GPU，每节点 4 卡），我先前按 4 节点起（`--nnodes 4` + 每节点 4 卡 = 16 GPU ≠ TP×PP）才导致
+`DistNetworkError / assert remote_message_queue`；另外必须带现网的
+`--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'`，否则报
+`piecewise CUDA graphs (FULL_AND_PIECEWISE) unavailable`。
+
+按现网参数（2 节点、TP2×PP4、`VLLM_PLE_CPU_OFFLOAD=1`、`chat_template_effort_fixed.jinja`、block 256、EP 开）在
+`repro/vllm-backport:dev-app-a` 上实跑：
+
+| 项 | 结果 |
+|---|---|
+| 启动 | 正常，`EngramConfig(cpu_offload=True)`、PP0–PP3 × TP0–TP1 共 8 个 rank |
+| KV 容量 | **22.86 GiB / 6,626,242 token** |
+| T=1.8 + RAG ×12 | **0/12**（旧判据与新判据都是 0；思考中位 300 token、正文中位 230 字、空 content 0） |
+| T=0.7 + 裸 prompt ×12 | 旧判据 3/12、**新判据 0/12**（已知误报），正文中位 3038 字 |
+
+⇒ 纯 Python 批在 **DeepSeek V4.1 + Qwen3.8** 两个模型上都已验收通过；只剩 MiniMax 需要 master-base。
+
+### 10.6 base 构建又修了两处（隔离网）
+
+- `vllm-runtime-base` 的 `get-pip.py`：Ubuntu 24.04 无 distutils → 改用 `apt-get install python3-pip`（commit `e7eaf2e79a`）。
+- `llguidance` 在 requirements 阶段用 maturin/cargo 编 rust wheel，而 cargo 镜像配置原本写在**后面**的 rust 阶段
+  （`/workspace/.cargo/config.toml`），隔离网下 crates.io 直接挂起（实测卡了 1h22m、CPU 0%）→ 把同一份镜像配置提前写到
+  `/root/.cargo/config.toml`（commit `565be34759`）。
+- 另外两条路径也入口：单趟构建会让 `base` 与 `vllm-runtime-base` 抢同一个 uv 缓存锁（脚本注释里写的坑），
+  所以按文档建议**分两趟**：先 `BUILD_TARGET=base`，再跑默认目标。
