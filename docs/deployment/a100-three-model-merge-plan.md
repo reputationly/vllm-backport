@@ -407,3 +407,14 @@ Domains=~.
 3. 新镜像验证后替换三模型。
 
 另外确认：`minimax-m31-a100` 本地的同名 commit `fa283ccdb3` 已在远端（`origin/minimax-m31-a100` 指向它），无需再推。
+
+### 10.17 新镜像已全量上线（含哨兵修复）
+
+镜像 `arm64-sm80-20261107-2328-a6b4fb9c`（digest `sha256:c06ed14fd370f244ab5f6d4d9cbcdffcd2283d9cd007111b501ed3b53dadd5f1`，
+= master `0588ddddb0` 的哨兵修复 + 本分支全部修复）：
+
+- 38/38 节点预热完成（llm02/llm13 的 DNS 修复后均正常拉取）；
+- gpustack 版本 `rep-backport-sampling-fix-custom` 的 image_name 已指向新 tag；
+- 三模型按 MiniMax → Qwen → DeepSeek 顺序 0→1 重部署，容器镜像 ID `c06ed14fd370`；
+- 经网关复测 T=1.8 + RAG ×12：DeepSeek 0/12（content 中位 234、空 0）、Qwen 0/12、MiniMax 0/12；
+- 最终 ready：deepseek 6/6、qwen 3/3、minimax 1/1。
