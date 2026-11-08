@@ -495,6 +495,7 @@ class OpenAIServingChat(GenerateBaseServing):
         num_cache_creation_tokens = None
         tools_streamed = [False] * num_choices
         content_streamed = [False] * num_choices
+        answer_tokens = [0] * num_choices
 
         previous_texts = [""] * num_choices
 
@@ -702,6 +703,18 @@ class OpenAIServingChat(GenerateBaseServing):
                         and not delta_message.content.isspace()
                     ):
                         content_streamed[i] = True
+                        answer_tokens[i] += len(output.token_ids)
+
+                    body_limit = getattr(request._vendor_state, "body_limit", None)
+                    if (
+                        body_limit is not None
+                        and answer_tokens[i] >= body_limit
+                    ):
+                        # ``max_tokens`` caps the answer only (design D2): stop
+                        # the engine instead of letting it generate past the
+                        # budget and truncating the text afterwards.
+                        await self.engine_client.abort(request_id)
+                        break
 
                     previous_texts[i] += delta_text
 
