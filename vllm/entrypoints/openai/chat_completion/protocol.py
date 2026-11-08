@@ -39,8 +39,8 @@ from vllm.entrypoints.generate.base.protocol import (
     validate_structural_tag_response_format,
     validate_structured_outputs_structural_tag,
 )
+from vllm.entrypoints.openai.chat_completion import sampling_policy as vendor
 from vllm.entrypoints.openai.chat_completion.sampling_policy import (
-    ACTIVE_PROFILE,
     SamplingInputs,
     VendorProfile,
     VendorState,
@@ -547,14 +547,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ``reasoning_effort="ultra"``, 17 stop strings, ...) are not rejected by
         the generic OpenAI validation first.
         """
-        profile = ACTIVE_PROFILE
+        profile = vendor.ACTIVE_PROFILE
         if profile is None or not profile_gate_enabled() or not isinstance(data, dict):
             return handler(data)
         return handler(profile.gate(dict(data)))
 
     @model_validator(mode="after")
     def _derive_vendor_state(self) -> "ChatCompletionRequest":
-        profile = ACTIVE_PROFILE
+        profile = vendor.ACTIVE_PROFILE
         if profile is None or not profile_gate_enabled():
             return self
         raw = dict(self.model_extra or {})
@@ -642,7 +642,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             documents=self.documents,
             reasoning_effort=self.reasoning_effort,
         )
-        profile = ACTIVE_PROFILE
+        profile = vendor.ACTIVE_PROFILE
         if profile is not None and profile_gate_enabled():
             # The hosted API decides thinking on its own; the caller's
             # chat_template_kwargs never reach the template.
