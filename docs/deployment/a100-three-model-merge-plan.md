@@ -418,3 +418,15 @@ Domains=~.
 - 三模型按 MiniMax → Qwen → DeepSeek 顺序 0→1 重部署，容器镜像 ID `c06ed14fd370`；
 - 经网关复测 T=1.8 + RAG ×12：DeepSeek 0/12（content 中位 234、空 0）、Qwen 0/12、MiniMax 0/12；
 - 最终 ready：deepseek 6/6、qwen 3/3、minimax 1/1。
+
+### 10.18 合入 master
+
+分支内容已在 dev（三模型 §6 门槛）与现网（网关复测 0/12 ×3）双重验收，合入 master：
+
+- 合并方式：`--no-ff`，commit message 带 `[skip ci]` —— 因为 `docker-publish.yml` 在 push 到 master 时
+  触发全量构建，而仓库当前没有在线 self-hosted runner，会让 run 永远 queued；
+  出包走的是手动触发的 `build-arm64-app.yml`（app 层），master 上的代码与现网镜像 `2328-a6b4fb9c` 树完全一致。
+- **遗留（Branch C）**：分支上的两个 csrc commit（#63475 persistent_topk CTA 同步、#60767 的 csrc 部分）
+  **不在**当前部署的 `.so` 里（M31 base 的 `minimax-m31-a100` 不含它们）——现网 Python 树已带调用侧改动，
+  但内核侧修复要等下一次从 master 全量重编 base 才生效。在此之前**不要**用 master 直接构建 app 层镜像
+  而不带 Guard 校验（csrc 与 base 会不一致）。
