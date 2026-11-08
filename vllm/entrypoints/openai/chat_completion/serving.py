@@ -494,11 +494,7 @@ class OpenAIServingChat(GenerateBaseServing):
         num_cached_tokens = None
         num_cache_creation_tokens = None
         tools_streamed = [False] * num_choices
-
-        if isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam):
-            tool_choice_function_name = request.tool_choice.function.name
-        else:
-            tool_choice_function_name = None
+        content_streamed = [False] * num_choices
 
         previous_texts = [""] * num_choices
 
@@ -687,6 +683,26 @@ class OpenAIServingChat(GenerateBaseServing):
                     else:
                         delta_message = DeltaMessage(content=delta_text)
 
+                    if (
+                        self.sampling_policy is not None
+                        and self.sampling_policy.strip_leading_newlines
+                        and not content_streamed[i]
+                        and delta_message is not None
+                        and delta_message.content
+                    ):
+                        # The template emits a blank line right after the
+                        # thinking block; the hosted API starts the answer with
+                        # the first real character.
+                        delta_message.content = delta_message.content.lstrip("\n")
+                        if not delta_message.content and not delta_message.reasoning:
+                            delta_message = None
+                    if (
+                        delta_message is not None
+                        and delta_message.content
+                        and not delta_message.content.isspace()
+                    ):
+                        content_streamed[i] = True
+
                     previous_texts[i] += delta_text
 
                     # set the previous values for the next iteration
@@ -773,10 +789,9 @@ class OpenAIServingChat(GenerateBaseServing):
 
                         # Send the finish response for each request.n only once
                         # In OpenAI's API, when a tool is called, the
-                        # finish_reason is:
-                        # "tool_calls" for "auto" or "required" tool calls,
-                        # and "stop" for named tool calls.
-                        if tools_streamed[i] and not tool_choice_function_name:
+                        # Any streamed tool call reports "tool_calls"; the
+                        # hosted APIs do not special-case a named tool_choice.
+                        if tools_streamed[i]:
                             finish_reason_ = "tool_calls"
                         else:
                             finish_reason_ = (
@@ -1085,13 +1100,11 @@ class OpenAIServingChat(GenerateBaseServing):
             # metadata cached on the reasoning parser.
             message = self._finalize_response_message(message, parser=parser)
 
-            # In OpenAI's API, when a tool is called, the finish_reason is:
-            # "tool_calls" for "auto" or "required" tool calls,
-            # and "stop" for named tool calls.
-            is_finish_reason_tool_calls = auto_tools_called or (
-                request.tool_choice
-                and request.tool_choice == "required"
-                and output.finish_reason == "stop"
+            # Every emitted tool call reports finish_reason="tool_calls".
+            # The hosted APIs of the models we serve do the same for a named
+            # tool_choice, where vLLM would otherwise report "stop".
+            is_finish_reason_tool_calls = auto_tools_called or bool(
+                getattr(message, "tool_calls", None)
             )
 
             routed_experts_b64 = (
@@ -1099,6 +1112,13 @@ class OpenAIServingChat(GenerateBaseServing):
                 if output.routed_experts is not None
                 else None
             )
+
+            if (
+                self.sampling_policy is not None
+                and self.sampling_policy.strip_leading_newlines
+                and message.content
+            ):
+                message.content = message.content.lstrip("\n")
 
             choice_data = ChatCompletionResponseChoice(
                 index=output.index,
