@@ -430,3 +430,30 @@ Domains=~.
   **不在**当前部署的 `.so` 里（M31 base 的 `minimax-m31-a100` 不含它们）——现网 Python 树已带调用侧改动，
   但内核侧修复要等下一次从 master 全量重编 base 才生效。在此之前**不要**用 master 直接构建 app 层镜像
   而不带 Guard 校验（csrc 与 base 会不一致）。
+
+### 10.19 Branch C 完成：csrc 重编镜像已上线
+
+**构建**：Mac（Apple Silicon，18 核 / 128G / Docker linux-arm64 原生）用现网镜像
+`2328-a6b4fb9c` 作构建环境，`TORCH_CUDA_ARCH_LIST=8.0 MAX_JOBS=8 python3 setup.py build_ext --inplace`
+（先 `apt install cmake git ccache`、`pip install pybind11 setuptools-rust`）。
+两个坑：① 镜像里 `/root/.gitconfig` 把 github 重写到 `gh-proxy.com`，TLS 握手失败 → 删掉 rewrite 直连；
+② `MAX_JOBS=16` 时 flash-attn 的 hdim256 TU 被 OOM kill（exit 137）→ 降到 8 通过。
+产物 5 个 `.so`（`_C_stable_libtorch` 136M、`_moe_C_stable_libtorch` 44M 等）。
+
+**打包**：新增 `docker/Dockerfile.aarch64_csrc_overlay`（与 app 层的区别是**保留 .so**），
+`FROM 2328-a6b4fb9c` + 覆盖 Python 树 → `arm64-sm80-20261108-0340-f1a14bb7-csrc`
+（digest `sha256:8695df29c91b…`），Mac 直接 `docker push` 到 ACR（`--provenance=false --sbom=false`，
+否则 ACR 报 `unknown manifest class`）。
+
+**dev 验证**：kernel 套件 `tests/kernels/test_top_k_per_row.py` **138 passed / 3 failed**
+（与旧 .so 完全一致，3 个失败是 `cooperative_topk_cs2` 缺 op，SM90 专用，与本次改动无关）；
+三模型 KV 容量与旧镜像**逐字节一致**（6.62 GiB/1,595,582、22.86 GiB/6,626,242、19.78 GiB/2,496,256）；
+T=1.8+RAG ×12 全部 0/12。
+
+**现网**：38/38 预热完成；gpustack 新增版本 `rep-backport-csrc-custom`；三模型切换后
+容器镜像 ID `8695df29c91b`；经网关复测 DeepSeek/Qwen/MiniMax 均 **0/12**。
+
+冷/热（经网关）：DeepSeek 冷 5.36s→热 1.64–1.92s、prefill 623→1.7–2.0k；Qwen 冷 2.11s→热 0.46s、
+prefill 1592→7.3k、decode 111→128；MiniMax 冷 1.53s→热 0.35s、prefill 2344→10.2k、decode 70。
+
+至此 Python 与 `.so` 同源（master `d1cbd41bb1`），Branch C 收尾。
