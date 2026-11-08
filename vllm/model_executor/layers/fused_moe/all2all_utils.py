@@ -46,10 +46,20 @@ class FlashInferOneSidedDispatchLayout:
 
 
 def flashinfer_one_sided_dispatch_layout(
-    hidden_dim: int, quant_config: FusedMoEQuantConfig
+    hidden_dim: int,
+    quant_config: FusedMoEQuantConfig,
+    input_dtype: torch.dtype | None = None,
 ) -> FlashInferOneSidedDispatchLayout:
     """Return the one-sided activation payload layout."""
-    if quant_config.quant_dtype is None:
+    if input_dtype is not None and input_dtype not in (
+        torch.float16,
+        torch.bfloat16,
+    ):
+        raise ValueError(
+            "flashinfer_nvlink_one_sided unpacked inputs must be float16 "
+            f"or bfloat16, got {input_dtype}"
+        )
+    if input_dtype is not None or quant_config.quant_dtype is None:
         return FlashInferOneSidedDispatchLayout(hidden_dim * 2, 0)
     if quant_config.quant_dtype == "nvfp4":
         scale_elems = hidden_dim // 16
@@ -169,6 +179,7 @@ def maybe_make_prepare_finalize(
     allow_new_interface: bool = False,
     use_monolithic: bool = False,
     eep_stage: bool = False,
+    input_dtype: torch.dtype | None = None,
 ) -> FusedMoEPrepareAndFinalize | None:
     if not moe.moe_parallel_config.use_all2all_kernels:
         if not allow_new_interface:
@@ -330,7 +341,7 @@ def maybe_make_prepare_finalize(
             get_current_vllm_config().scheduler_config.max_num_batched_tokens
         )
         dispatch_layout = flashinfer_one_sided_dispatch_layout(
-            moe.hidden_dim, quant_config
+            moe.hidden_dim, quant_config, input_dtype=input_dtype
         )
         prepare_finalize = FlashInferNVLinkOneSidedPrepareAndFinalize(
             max_num_tokens=max_num_tokens,

@@ -414,8 +414,7 @@ fn reject_image_placeholder_text(messages: &[ChatMessage]) -> Result<()> {
         ChatMessage::System { content }
         | ChatMessage::Developer { content, .. }
         | ChatMessage::User { content }
-        | ChatMessage::ToolResponse { content, .. }
-        | ChatMessage::Custom { content, .. } => match content {
+        | ChatMessage::ToolResponse { content, .. } => match content {
             ChatContent::Text(text) => has_placeholder(text),
             ChatContent::Parts(parts) => parts.iter().any(
                 |part| matches!(part, ChatContentPart::Text { text } if has_placeholder(text)),

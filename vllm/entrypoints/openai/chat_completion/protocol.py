@@ -18,6 +18,7 @@ from pydantic import (
     model_validator,
 )
 
+import vllm.envs as envs
 from vllm.config import ModelConfig
 from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
@@ -37,6 +38,10 @@ from vllm.entrypoints.generate.base.protocol import (
     validate_cache_salt,
     validate_structural_tag_response_format,
     validate_structured_outputs_structural_tag,
+)
+from vllm.entrypoints.openai.chat_completion.sampling_policy import (
+    SamplingPolicy,
+    thinking_enabled,
 )
 from vllm.entrypoints.serve.engine.protocol import OpenAIBaseModel, UsageInfo
 from vllm.exceptions import VLLMValidationError
@@ -578,33 +583,36 @@ class ChatCompletionRequest(OpenAIBaseModel):
     _grammar_from_parser: bool = PrivateAttr(default=False)
     """CAUTION: Should only be set by the parser-engine adapter's adjust_request."""
 
-    def build_chat_params(
-        self,
-        default_template: str | None,
-        default_template_content_format: ChatTemplateContentFormatOption,
-    ) -> ChatParams:
+    def resolved_template_kwargs(self) -> dict[str, Any]:
+        """The chat-template kwargs actually passed to the template.
+
+        Single source of truth for `build_chat_params()` and for the sampling
+        semantics in `to_sampling_params()`.
+        """
         extra_kwargs: dict[str, Any] = dict(
             add_generation_prompt=self.add_generation_prompt,
             continue_final_message=self.continue_final_message,
             documents=self.documents,
             reasoning_effort=self.reasoning_effort,
         )
-
-        # When reasoning is requested, activate thinking for models whose
-        # chat templates require explicit opt-in (e.g., Gemma4 defaults
+        # When reasoning is requested, activate thinking for models whose chat
+        # templates require explicit opt-in (e.g. Gemma4 defaults
         # enable_thinking to false). For templates that don't declare the
         # variable, resolve_chat_template_kwargs filters it out harmlessly.
         user_kwargs = self.chat_template_kwargs or {}
         if self.reasoning_effort is not None and "enable_thinking" not in user_kwargs:
             extra_kwargs["enable_thinking"] = self.reasoning_effort != "none"
+        return merge_kwargs(self.chat_template_kwargs, extra_kwargs)
 
+    def build_chat_params(
+        self,
+        default_template: str | None,
+        default_template_content_format: ChatTemplateContentFormatOption,
+    ) -> ChatParams:
         return ChatParams(
             chat_template=self.chat_template or default_template,
             chat_template_content_format=default_template_content_format,
-            chat_template_kwargs=merge_kwargs(
-                self.chat_template_kwargs,
-                extra_kwargs,
-            ),
+            chat_template_kwargs=self.resolved_template_kwargs(),
             media_io_kwargs=self.media_io_kwargs,
             return_assistant_tokens_mask=bool(self.return_assistant_tokens_mask),
             # No-tools requests default to tool_choice="none" at the API
@@ -673,6 +681,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         self,
         max_tokens: int,
         default_sampling_params: dict,
+        sampling_policy: SamplingPolicy | None = None,
     ) -> SamplingParams:
         # Default parameters
         if (repetition_penalty := self.repetition_penalty) is None:
@@ -684,6 +693,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             temperature = default_sampling_params.get(
                 "temperature", self._DEFAULT_SAMPLING_PARAMS["temperature"]
             )
+        user_top_p = self.top_p
         if (top_p := self.top_p) is None:
             top_p = default_sampling_params.get(
                 "top_p", self._DEFAULT_SAMPLING_PARAMS["top_p"]
@@ -696,6 +706,43 @@ class ChatCompletionRequest(OpenAIBaseModel):
             min_p = default_sampling_params.get(
                 "min_p", self._DEFAULT_SAMPLING_PARAMS["min_p"]
             )
+
+        # DeepSeek V4 official sampling semantics (docs: "思考模式不支持
+        # temperature / presence_penalty / frequency_penalty 参数 … 设置参数
+        # 不会报错，但也不会生效"; top_p on deepseek-flash is clamped to
+        # [0.95, 1.0] while thinking and pinned to 1.0 otherwise).
+        # Without this the engine samples at the caller's temperature, which the
+        # hosted API never does in thinking mode, so the same request produces a
+        # different (and far more fragile) distribution here.
+        presence_penalty = self.presence_penalty
+        frequency_penalty = self.frequency_penalty
+        # Apply the model family's hosted sampling semantics (see
+        # sampling_policy.py); models without a policy are untouched.
+        policy = sampling_policy if envs.VLLM_VENDOR_SAMPLING_POLICY else None
+        if policy is not None:
+            template_kwargs = self.resolved_template_kwargs()
+            if thinking_enabled(template_kwargs, policy.thinking_style):
+                if policy.temperature is not None:
+                    temperature = policy.temperature
+                if policy.max_temperature is not None:
+                    temperature = min(temperature, policy.max_temperature)
+                if policy.top_p is not None:
+                    top_p = policy.top_p
+                elif policy.top_p_floor is not None:
+                    if user_top_p is None:
+                        default = policy.top_p_default
+                        if self.tools and policy.top_p_default_with_tools:
+                            default = policy.top_p_default_with_tools
+                        if default is not None:
+                            top_p = default
+                    top_p = max(policy.top_p_floor, min(1.0, top_p))
+                if policy.top_k is not None:
+                    top_k = policy.top_k
+                if policy.clear_penalties:
+                    presence_penalty = 0.0
+                    frequency_penalty = 0.0
+            elif policy.chat_top_p is not None:
+                top_p = policy.chat_top_p
 
         # Merge server-default stop_token_ids (e.g., model-specific tokens
         # like </call> for gpt-oss) with any request-specified ones
@@ -722,8 +769,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
             extra_args["ec_transfer_params"] = self.ec_transfer_params
         return SamplingParams.from_optional(
             n=self.n,
-            presence_penalty=self.presence_penalty,
-            frequency_penalty=self.frequency_penalty,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
             repetition_penalty=repetition_penalty,
             temperature=temperature,
             watermarking=self.watermarking,

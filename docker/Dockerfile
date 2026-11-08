@@ -79,6 +79,9 @@ ARG UV_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
 # PyTorch provides its own indexes for standard and nightly builds
 ARG PYTORCH_CUDA_INDEX_BASE_URL=https://download.pytorch.org/whl
 
+# FlashInfer publishes CUDA-specific wheels on its own index
+ARG FLASHINFER_INDEX_BASE_URL=https://flashinfer.ai/whl
+
 # PIP supports multiple authentication schemes, including keyring
 # By parameterizing the PIP_KEYRING_PROVIDER variable and setting it to
 # disabled by default, we allow third-party to use keyring authentication for
@@ -196,6 +199,8 @@ ENV VLLM_ENABLE_CUDA_COMPATIBILITY=0
 # Install PyTorch and core CUDA dependencies
 # This is ~2GB and rarely changes
 ARG PYTORCH_CUDA_INDEX_BASE_URL
+ARG FLASHINFER_INDEX_BASE_URL
+ARG PIP_INDEX_URL UV_INDEX_URL
 
 WORKDIR /workspace
 
@@ -205,6 +210,21 @@ ARG PYTORCH_NIGHTLY
 # Install build and runtime dependencies, including PyTorch
 # Check whether to install torch nightly instead of release for this build
 COPY requirements/common.txt requirements/common.txt
+# Declared here (again at the rust stage) so the mirror is in scope for the
+# source builds below.
+ARG CARGO_REGISTRY_MIRROR
+
+# Source builds inside this step (llguidance builds a maturin/rust wheel) fetch
+# crates; without the mirror they hang on an unreachable crates.io. The same
+# config is written again for the rust build below.
+RUN if [ -n "${CARGO_REGISTRY_MIRROR}" ]; then \
+        for d in /root/.cargo "${CARGO_HOME:-/root/.cargo}"; do \
+            mkdir -p "$d" \
+            && printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "%s"\n\n[net]\ngit-fetch-with-cli = true\nretry = 10\n' \
+                "${CARGO_REGISTRY_MIRROR}" > "$d/config.toml"; \
+        done; \
+    fi
+
 COPY requirements/cuda.txt requirements/cuda.txt
 COPY use_existing_torch.py use_existing_torch.py
 COPY pyproject.toml pyproject.toml
@@ -218,6 +238,9 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     && if [ "$(echo $CUDA_VERSION | cut -d. -f1)" = "12" ]; then \
         sed -i 's/^nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' requirements/cuda.txt; \
         sed -i 's/^humming-kernels\[cu13\]/humming-kernels[cu12]/' requirements/cuda.txt; \
+    fi \
+    && if [ "${FLASHINFER_INDEX_BASE_URL}" != "https://flashinfer.ai/whl" ]; then \
+        sed -i "s|--extra-index-url https://flashinfer.ai/whl/|--extra-index-url ${FLASHINFER_INDEX_BASE_URL}/|" requirements/cuda.txt; \
     fi \
     && if [ "$(uname -m)" = "aarch64" ]; then \
         # The manylinux 2_28 (glibc 2.28) aarch64 builder cannot use
@@ -301,6 +324,9 @@ ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 FROM base AS rust-build-cache
 ARG USE_SCCACHE
 ARG SCCACHE_ENDPOINT
+ARG RUSTUP_DIST_SERVER
+ARG RUSTUP_UPDATE_ROOT
+ARG CARGO_REGISTRY_MIRROR
 
 # Install native tools needed only for Rust builds.
 RUN dnf install -y --setopt=install_weak_deps=False make perl-core \
@@ -337,6 +363,13 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
         if [ -n "${SCCACHE_ENDPOINT}" ]; then export SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT}"; fi; \
         export RUSTC_WRAPPER=sccache; \
         sccache --show-stats; \
+    fi \
+    && if [ -z "${RUSTUP_DIST_SERVER}" ]; then unset RUSTUP_DIST_SERVER; fi \
+    && if [ -z "${RUSTUP_UPDATE_ROOT}" ]; then unset RUSTUP_UPDATE_ROOT; fi \
+    && if [ -n "${CARGO_REGISTRY_MIRROR}" ]; then \
+        mkdir -p /workspace/.cargo \
+        && printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "%s"\n\n[net]\ngit-fetch-with-cli = true\nretry = 10\n' \
+            "${CARGO_REGISTRY_MIRROR}" > /workspace/.cargo/config.toml; \
     fi \
     && SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0+docker.cache" bash build_rust.sh \
     && if [ "$USE_SCCACHE" = "1" ]; then \
@@ -706,6 +739,7 @@ ARG max_jobs=16
 ENV MAX_JOBS=${max_jobs}
 ARG nvcc_threads
 ENV NVCC_THREADS=$nvcc_threads
+ARG PIP_INDEX_URL UV_INDEX_URL
 
 RUN --mount=type=cache,target=/opt/uv/cache \
     git clone ${LMCACHE_REPO} /workspace/lmcache-src \
@@ -817,13 +851,13 @@ RUN apt-get update -y \
         python${PYTHON_VERSION} \
         python${PYTHON_VERSION}-dev \
         python${PYTHON_VERSION}-venv \
+        python3-pip \
         libibverbs-dev \
     && rm -rf /var/lib/apt/lists/* \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 \
     && update-alternatives --set python3 /usr/bin/python${PYTHON_VERSION} \
     && ln -sf /usr/bin/python${PYTHON_VERSION}-config /usr/bin/python3-config \
     && rm -f /usr/lib/python${PYTHON_VERSION}/EXTERNALLY-MANAGED \
-    && curl -sS ${GET_PIP_URL} | python${PYTHON_VERSION} \
     && python3 --version && python3 -m pip --version
 
 # Install CUDA development tools for runtime JIT compilation
@@ -962,6 +996,7 @@ ENV VLLM_ENABLE_CUDA_COMPATIBILITY=0
 # Install PyTorch and core CUDA dependencies
 # This is ~2GB and rarely changes
 ARG PYTORCH_CUDA_INDEX_BASE_URL
+ARG FLASHINFER_INDEX_BASE_URL
 COPY requirements/common.txt /tmp/common.txt
 COPY requirements/cuda.txt /tmp/requirements-cuda.txt
 RUN --mount=type=cache,target=/opt/uv/cache \
@@ -974,6 +1009,9 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     if [ "$(echo $CUDA_VERSION | cut -d. -f1)" = "12" ]; then \
         sed -i 's/^nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' /tmp/requirements-cuda.txt; \
         sed -i 's/^humming-kernels\[cu13\]/humming-kernels[cu12]/' /tmp/requirements-cuda.txt; \
+    fi && \
+    if [ "${FLASHINFER_INDEX_BASE_URL}" != "https://flashinfer.ai/whl" ]; then \
+        sed -i "s|--extra-index-url https://flashinfer.ai/whl/|--extra-index-url ${FLASHINFER_INDEX_BASE_URL}/|" /tmp/requirements-cuda.txt; \
     fi && \
     if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
         uv pip install --system \
@@ -1001,7 +1039,7 @@ ARG FLASHINFER_VERSION=0.6.18.post1
 RUN --mount=type=cache,target=/opt/uv/cache \
     if [ "${INSTALL_RUBIN_PRERELEASE}" != "true" ]; then \
         uv pip install --system flashinfer-jit-cache==${FLASHINFER_VERSION} \
-            --index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+            --index-url ${FLASHINFER_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     fi
 
 # ============================================================

@@ -48,7 +48,9 @@ lora_filesystem_resolver = "vllm.plugins.lora_resolvers.filesystem_resolver:regi
 lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_hub_resolver"
 
 [tool.setuptools_scm]
-# no extra settings needed, presence enables setuptools-scm
+# Limit describe to version tags: release tags like arm64-sm80-<ts>-<sha>
+# are not parseable by setuptools_scm and break `git describe`-based versions.
+git_describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--match", "v[0-9]*"]
 
 [tool.setuptools.packages.find]
 where = ["."]
