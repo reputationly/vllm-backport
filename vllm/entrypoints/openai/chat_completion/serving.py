@@ -10,6 +10,7 @@ from typing import Any, Final, cast
 
 from fastapi import Request
 
+import vllm.envs as envs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
@@ -29,6 +30,9 @@ from vllm.entrypoints.generate.base.serving import (
     build_spec_decoding_metrics,
     clamp_prompt_logprobs,
     format_token_id_placeholder,
+)
+from vllm.entrypoints.openai.chat_completion.sampling_policy import (
+    set_active_profile,
 )
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionLogProb,
@@ -174,6 +178,17 @@ class OpenAIServingChat(GenerateBaseServing):
         self.enable_per_request_metrics = enable_per_request_metrics
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
         self.sampling_policy = policy_for(self.model_config)
+        # One model per process, so the request gate can read the profile from
+        # module state without threading it through pydantic validation.
+        set_active_profile(self.sampling_policy)
+        if self.sampling_policy is not None:
+            # The gate enforces each family's stop-string rule; pydantic still
+            # applies VLLM_MAX_STOP_STRINGS afterwards, and it defaults to 4.
+            if envs.VLLM_MAX_STOP_STRINGS < 64:
+                raise ValueError(
+                    "VLLM_MAX_STOP_STRINGS must be >= 64 when serving a model "
+                    f"with a vendor API profile (got {envs.VLLM_MAX_STOP_STRINGS})"
+                )
         mc = self.model_config
         self.override_max_tokens = (
             self.default_sampling_params.get("max_tokens")

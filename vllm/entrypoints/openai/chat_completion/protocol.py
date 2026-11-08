@@ -40,7 +40,11 @@ from vllm.entrypoints.generate.base.protocol import (
     validate_structured_outputs_structural_tag,
 )
 from vllm.entrypoints.openai.chat_completion.sampling_policy import (
-    SamplingPolicy,
+    ACTIVE_PROFILE,
+    SamplingInputs,
+    VendorProfile,
+    VendorState,
+    profile_gate_enabled,
     thinking_enabled,
 )
 from vllm.entrypoints.serve.engine.protocol import OpenAIBaseModel, UsageInfo
@@ -527,6 +531,49 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     # --8<-- [end:chat-completion-extra-params]
 
+    #: Thinking decision + answer budget, derived once from the raw request by
+    #: the vendor gate below and read by the template/sampling stages.
+    _vendor_state: VendorState = PrivateAttr(
+        default_factory=lambda: VendorState(thinking=True)
+    )
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _vendor_profile_gate(cls, data: Any, handler: Any) -> Any:
+        """Apply the served model's hosted-API rules before any other check.
+
+        Runs before the ``mode="before"`` validators so that parameters the
+        hosted API accepts (``top_logprobs`` without ``logprobs``,
+        ``reasoning_effort="ultra"``, 17 stop strings, ...) are not rejected by
+        the generic OpenAI validation first.
+        """
+        profile = ACTIVE_PROFILE
+        if profile is None or not profile_gate_enabled() or not isinstance(data, dict):
+            return handler(data)
+        return handler(profile.gate(dict(data)))
+
+    @model_validator(mode="after")
+    def _derive_vendor_state(self) -> "ChatCompletionRequest":
+        profile = ACTIVE_PROFILE
+        if profile is None or not profile_gate_enabled():
+            return self
+        raw = dict(self.model_extra or {})
+        raw.update(
+            {
+                key: getattr(self, key)
+                for key in (
+                    "reasoning_effort",
+                    "enable_thinking",
+                    "max_tokens",
+                    "max_completion_tokens",
+                    "chat_template_kwargs",
+                )
+                if getattr(self, key, None) is not None
+            }
+        )
+        self._vendor_state = profile.state(raw)
+        return self
+
     @model_validator(mode="before")
     @classmethod
     def check_cache_salt_support(cls, data: Any) -> Any:
@@ -595,6 +642,24 @@ class ChatCompletionRequest(OpenAIBaseModel):
             documents=self.documents,
             reasoning_effort=self.reasoning_effort,
         )
+        profile = ACTIVE_PROFILE
+        if profile is not None and profile_gate_enabled():
+            # The hosted API decides thinking on its own; the caller's
+            # chat_template_kwargs never reach the template.
+            state = self._vendor_state
+            extra_kwargs.pop("reasoning_effort", None)
+            if profile.thinking_style == "deepseek":
+                extra_kwargs["thinking"] = state.thinking
+                extra_kwargs["reasoning_effort"] = state.effort or "none"
+            elif profile.thinking_style == "qwen":
+                extra_kwargs["enable_thinking"] = state.thinking
+                if state.effort is not None:
+                    extra_kwargs["reasoning_effort"] = state.effort
+            else:  # "always" (MiniMax)
+                if state.effort is not None:
+                    extra_kwargs["reasoning_effort"] = state.effort
+            return merge_kwargs(None, extra_kwargs)
+
         # When reasoning is requested, activate thinking for models whose chat
         # templates require explicit opt-in (e.g. Gemma4 defaults
         # enable_thinking to false). For templates that don't declare the
@@ -681,7 +746,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         self,
         max_tokens: int,
         default_sampling_params: dict,
-        sampling_policy: SamplingPolicy | None = None,
+        sampling_policy: VendorProfile | None = None,
     ) -> SamplingParams:
         # Default parameters
         if (repetition_penalty := self.repetition_penalty) is None:
@@ -719,30 +784,34 @@ class ChatCompletionRequest(OpenAIBaseModel):
         # Apply the model family's hosted sampling semantics (see
         # sampling_policy.py); models without a policy are untouched.
         policy = sampling_policy if envs.VLLM_VENDOR_SAMPLING_POLICY else None
+        n = self.n
+        seed = self.seed
         if policy is not None:
-            template_kwargs = self.resolved_template_kwargs()
-            if thinking_enabled(template_kwargs, policy.thinking_style):
-                if policy.temperature is not None:
-                    temperature = policy.temperature
-                if policy.max_temperature is not None:
-                    temperature = min(temperature, policy.max_temperature)
-                if policy.top_p is not None:
-                    top_p = policy.top_p
-                elif policy.top_p_floor is not None:
-                    if user_top_p is None:
-                        default = policy.top_p_default
-                        if self.tools and policy.top_p_default_with_tools:
-                            default = policy.top_p_default_with_tools
-                        if default is not None:
-                            top_p = default
-                    top_p = max(policy.top_p_floor, min(1.0, top_p))
-                if policy.top_k is not None:
-                    top_k = policy.top_k
-                if policy.clear_penalties:
-                    presence_penalty = 0.0
-                    frequency_penalty = 0.0
-            elif policy.chat_top_p is not None:
-                top_p = policy.chat_top_p
+            state = self._vendor_state
+            resolved = policy.sampling(
+                SamplingInputs(
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    min_p=min_p,
+                    repetition_penalty=repetition_penalty,
+                    presence_penalty=presence_penalty,
+                    frequency_penalty=frequency_penalty,
+                    seed=seed,
+                    n=n or 1,
+                    thinking=state.thinking,
+                    effort=state.effort,
+                )
+            )
+            temperature = resolved.temperature
+            top_p = resolved.top_p
+            top_k = resolved.top_k
+            min_p = resolved.min_p
+            repetition_penalty = resolved.repetition_penalty
+            presence_penalty = resolved.presence_penalty
+            frequency_penalty = resolved.frequency_penalty
+            seed = resolved.seed
+            n = resolved.n
 
         # Merge server-default stop_token_ids (e.g., model-specific tokens
         # like </call> for gpt-oss) with any request-specified ones
@@ -768,7 +837,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             # Pass in ec_transfer_params via extra_args
             extra_args["ec_transfer_params"] = self.ec_transfer_params
         return SamplingParams.from_optional(
-            n=self.n,
+            n=n,
             presence_penalty=presence_penalty,
             frequency_penalty=frequency_penalty,
             repetition_penalty=repetition_penalty,
@@ -777,7 +846,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,
-            seed=self.seed,
+            seed=seed,
             stop=self.stop,
             stop_token_ids=stop_token_ids,
             logprobs=(
