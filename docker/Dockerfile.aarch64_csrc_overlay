@@ -1,0 +1,23 @@
+# Overlay a freshly compiled vLLM extension (and its matching Python tree) onto an
+# existing runtime image.
+#
+# Unlike Dockerfile.aarch64_app, this variant *keeps* the .so files from the build
+# context: it exists to ship a csrc rebuild (Branch C) where the compiled extension
+# and the Python tree must come from the same commit.
+#
+# usage:
+#   docker build -f docker/Dockerfile.aarch64_csrc_overlay \
+#     --build-arg BASE_IMAGE=<runtime image> -t <dest> <context containing vllm/>
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+COPY vllm/ /tmp/vllm-src/
+
+RUN set -eux; \
+    find /tmp/vllm-src -name '__pycache__' -type d -prune -exec rm -rf {} +; \
+    VLLM_PKG="$(python3 -c 'import vllm, os; print(os.path.dirname(vllm.__file__))')"; \
+    echo "overlaying python tree + compiled extension onto ${VLLM_PKG}"; \
+    find "${VLLM_PKG}" -name '__pycache__' -type d -prune -exec rm -rf {} +; \
+    cp -a /tmp/vllm-src/. "${VLLM_PKG}/"; \
+    rm -rf /tmp/vllm-src; \
+    python3 -c "import vllm, torch; print('vllm', vllm.__version__); al = torch.cuda.get_arch_list(); print('arch_list', al); assert any('80' in a for a in al), 'sm_80 missing'"
