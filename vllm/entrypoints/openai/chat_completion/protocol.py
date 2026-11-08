@@ -817,7 +817,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             # Qwen: ``max_tokens`` caps the answer only, thinking has its own
             # budget (design D2). The engine limit covers both.
             if policy.answer_only_max_tokens and state.body_limit is not None:
-                budget = self.thinking_budget
+                budget = (self.model_extra or {}).get("thinking_budget")
                 if budget is None:
                     budget = {
                         "low": 4096,
