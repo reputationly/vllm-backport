@@ -457,3 +457,26 @@ T=1.8+RAG ×12 全部 0/12。
 prefill 1592→7.3k、decode 111→128；MiniMax 冷 1.53s→热 0.35s、prefill 2344→10.2k、decode 70。
 
 至此 Python 与 `.so` 同源（master `d1cbd41bb1`），Branch C 收尾。
+
+### 10.20 分支 D 第一轮 profile（DeepSeek V4.1，单流）
+
+**方法**：dev 四节点 TP8×PP2 + 现网参数 + `--profiler-config '{"profiler":"torch","torch_profiler_dir":"/log/prof"}'`，
+`POST /start_profile` → 一发 3157 token prefill + 32 步 decode → `POST /stop_profile`，取 rank0 的 chrome trace 聚合。
+
+**结果（rank0，窗口 8.6 s，kernel 合计 7635 ms）**
+
+| 类别 | 时间 | 占比 |
+|---|---|---|
+| NCCL 集合通信 | 7356 ms | **96%** |
+| 计算 kernel | 279 ms | 4% |
+
+计算 kernel 内部排名（占总时间）：`marlin_moe_wna16` 0.69%、`marlin` 0.57%、`_sparse_attn_prefill_ragged` 0.25%、
+`mhc_post_tilelang` 0.17%、`mhc_pre_big_fuse_with_norm` 0.14%、`_sparse_attn_decode_partial` 0.08% ……
+
+NCCL 里最刺眼的是几次**超大 Broadcast**：2309 ms、1522 ms、395 ms、204 ms（另有 656 次 AllReduce，最大 47.7 ms）。
+
+**结论（按 §4 的 >1% 门控）**：§4.1 里所有"计算类"候选（top-k、indexer、GEMM/融合、DSpark 各组）
+在单流口径下**全部 <1%**，不立项。真正的大头是 PP/TP 的通信与流水线气泡，
+对应候选是 **#58542（PP 下跳过已退出请求的采样广播）** 和 **#63885（decode 元数据一次 launch）**，两者都是 CONFLICT 需移植。
+
+**注意**：这次是单流（batch=1）口径，气泡占比天然高；若要看并发下的真实瓶颈需要再跑一轮带并发的 profile。
