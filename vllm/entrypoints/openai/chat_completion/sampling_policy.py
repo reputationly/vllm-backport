@@ -121,17 +121,20 @@ def _require_range(
     high: float,
     *,
     low_open: bool = False,
+    high_open: bool = False,
     message: str | None = None,
 ) -> None:
     value = _num(data, key)
     if value is None:
         return
     too_low = value <= low if low_open else value < low
-    if too_low or value > high:
+    too_high = value >= high if high_open else value > high
+    if too_low or too_high:
         left = "(" if low_open else "["
+        right = ")" if high_open else "]"
         _reject(
             message
-            or f"`{key}` must be in {left}{low:g}, {high:g}], got {value:g}",
+            or f"`{key}` must be in {left}{low:g}, {high:g}{right}, got {value:g}",
             key,
             value,
         )
