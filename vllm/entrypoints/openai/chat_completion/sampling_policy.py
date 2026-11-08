@@ -477,10 +477,14 @@ def _qwen_state(data: Mapping[str, Any]) -> VendorState:
 
 
 def _qwen_sampling(inputs: SamplingInputs) -> SamplingInputs:
-    updates: dict[str, Any] = {"min_p": 0.0}
+    # The hosted API accepts top_p=0; SamplingParams rejects it, so pin the
+    # degenerate value to the smallest legal probability.
+    updates: dict[str, Any] = {
+        "min_p": 0.0,
+        "top_p": inputs.top_p if inputs.top_p > 0 else 1e-6,
+    }
     if inputs.thinking:
         updates["temperature"] = min(max(inputs.temperature, 0.6), 1.0)
-        updates["top_p"] = inputs.top_p
         updates["top_k"] = inputs.top_k
         if inputs.top_k <= 0 or inputs.top_k > 100:
             updates["top_k"] = -1
