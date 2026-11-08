@@ -781,6 +781,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         # different (and far more fragile) distribution here.
         presence_penalty = self.presence_penalty
         frequency_penalty = self.frequency_penalty
+        thinking_token_budget = self.thinking_token_budget
         # Apply the model family's hosted sampling semantics (see
         # sampling_policy.py); models without a policy are untouched.
         policy = sampling_policy if envs.VLLM_VENDOR_SAMPLING_POLICY else None
@@ -812,6 +813,19 @@ class ChatCompletionRequest(OpenAIBaseModel):
             frequency_penalty = resolved.frequency_penalty
             seed = resolved.seed
             n = resolved.n
+
+            # Qwen: ``max_tokens`` caps the answer only, thinking has its own
+            # budget (design D2). The engine limit covers both.
+            if policy.answer_only_max_tokens and state.body_limit is not None:
+                budget = self.thinking_budget
+                if budget is None:
+                    budget = {
+                        "low": 4096,
+                        "medium": 16384,
+                        "xhigh": 262144,
+                    }.get(state.effort or "", 131072)
+                thinking_token_budget = budget
+                max_tokens = max_tokens + budget
 
         # Merge server-default stop_token_ids (e.g., model-specific tokens
         # like </call> for gpt-oss) with any request-specified ones
@@ -869,7 +883,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             structured_outputs=self.extract_structured_outputs(),
             logit_bias=self.logit_bias,
             bad_words=self.bad_words,
-            thinking_token_budget=self.thinking_token_budget,
+            thinking_token_budget=thinking_token_budget,
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
