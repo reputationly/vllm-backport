@@ -53,6 +53,9 @@ class VendorState:
     effort: str | None = None
     #: Answer-only token budget (Qwen). ``None`` means "no extra limit".
     body_limit: int | None = None
+    #: The request used the legacy ``functions``/``function_call`` shape, so
+    #: the response must answer in that shape too (Qwen).
+    legacy_functions: bool = False
 
 
 @dataclass(frozen=True)
@@ -195,6 +198,12 @@ def _drop(data: dict[str, Any], *keys: str) -> None:
         data.pop(key, None)
 
 
+def _drop_stream_options_without_stream(data: dict[str, Any]) -> None:
+    """``stream_options`` on a non-streaming request is accepted and ignored."""
+    if data.get("stream_options") and not data.get("stream"):
+        _drop(data, "stream_options")
+
+
 def _allowed_escape_hatches() -> frozenset[str]:
     raw = os.environ.get("VLLM_VENDOR_API_PROFILE_ALLOW", "")
     return frozenset(item.strip() for item in raw.split(",") if item.strip())
@@ -207,6 +216,7 @@ def _allowed_escape_hatches() -> frozenset[str]:
 
 def _deepseek_gate(data: dict[str, Any]) -> dict[str, Any]:
     data = dict(data)
+    _drop_stream_options_without_stream(data)
     _require_range(data, "temperature", 0.0, 2.0)
     _require_range(
         data,
@@ -339,6 +349,7 @@ DEEPSEEK_V4 = VendorProfile(
 
 def _qwen_gate(data: dict[str, Any]) -> dict[str, Any]:
     data = dict(data)
+    _drop_stream_options_without_stream(data)
     _require_range(
         data,
         "temperature",
@@ -438,6 +449,29 @@ def _qwen_gate(data: dict[str, Any]) -> dict[str, Any]:
                     message.pop("reasoning_content", None)
                     message.pop("reasoning", None)
 
+    # Legacy ``functions``/``function_call`` are still served by the hosted
+    # API; translate them to the tools shape and answer in the legacy shape.
+    functions = data.get("functions")
+    if functions and not data.get("tools"):
+        data["tools"] = [
+            {"type": "function", "function": fn}
+            for fn in functions
+            if isinstance(fn, Mapping)
+        ]
+        function_call = data.get("function_call")
+        if function_call == "none":
+            data["tool_choice"] = "none"
+        elif function_call == "auto":
+            data["tool_choice"] = "auto"
+        elif isinstance(function_call, Mapping):
+            name = function_call.get("name")
+            if isinstance(name, str):
+                data["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": name},
+                }
+        data["_vendor_legacy_functions"] = True
+
     allowed = _allowed_escape_hatches()
     for key in ("min_p", "logit_bias", "functions", "function_call"):
         if key not in allowed:
@@ -477,7 +511,12 @@ def _qwen_state(data: Mapping[str, Any]) -> VendorState:
         and not isinstance(max_tokens, bool)
     ):
         body_limit = max_tokens
-    return VendorState(thinking=thinking, effort=effort, body_limit=body_limit)
+    return VendorState(
+        thinking=thinking,
+        effort=effort,
+        body_limit=body_limit,
+        legacy_functions=bool(data.get("_vendor_legacy_functions")),
+    )
 
 
 def _qwen_sampling(inputs: SamplingInputs) -> SamplingInputs:
@@ -516,6 +555,7 @@ QWEN3_8 = VendorProfile(
 
 def _minimax_gate(data: dict[str, Any]) -> dict[str, Any]:
     data = dict(data)
+    _drop_stream_options_without_stream(data)
     _require_range(
         data,
         "top_p",

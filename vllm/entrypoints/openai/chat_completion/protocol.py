@@ -574,6 +574,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 if getattr(self, key, None) is not None
             }
         )
+        # The gate stashes the legacy-shape marker in ``model_extra``; keep it
+        # out of everything downstream.
+        self.model_extra.pop("_vendor_legacy_functions", None)
         self._vendor_state = profile.state(raw)
         return self
 

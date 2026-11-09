@@ -510,6 +510,9 @@ class OpenAIServingChat(GenerateBaseServing):
         # lets the engine overshoot the budget.
         answer_tokens = [0] * num_choices
         answer_started = [not thinking] * num_choices
+        legacy_functions = bool(
+            getattr(request._vendor_state, "legacy_functions", False)
+        )
 
         previous_texts = [""] * num_choices
 
@@ -693,6 +696,10 @@ class OpenAIServingChat(GenerateBaseServing):
                         )
                         if delta_message is not None and delta_message.tool_calls:
                             tools_streamed[i] = True
+                            if legacy_functions:
+                                first_delta = delta_message.tool_calls[0]
+                                delta_message.function_call = first_delta.function
+                                delta_message.tool_calls = []
 
                     # handle streaming just a content delta (no parsers)
                     else:
@@ -828,7 +835,9 @@ class OpenAIServingChat(GenerateBaseServing):
                         # In OpenAI's API, when a tool is called, the
                         # Any streamed tool call reports "tool_calls"; the
                         # hosted APIs do not special-case a named tool_choice.
-                        if tools_streamed[i]:
+                        if tools_streamed[i] and legacy_functions:
+                            finish_reason_ = "function_call"
+                        elif tools_streamed[i]:
                             finish_reason_ = "tool_calls"
                         elif budget_spent[i]:
                             # The engine reports "abort" because we stopped it;
@@ -1236,6 +1245,20 @@ class OpenAIServingChat(GenerateBaseServing):
             is_finish_reason_tool_calls = auto_tools_called or bool(
                 getattr(message, "tool_calls", None)
             )
+            if (
+                is_finish_reason_tool_calls
+                and getattr(request._vendor_state, "legacy_functions", False)
+            ):
+                # The caller used ``functions``/``function_call``, so answer in
+                # that shape: a single ``function_call`` and the legacy reason.
+                first_call = (message.tool_calls or [None])[0]
+                if first_call is not None:
+                    message.function_call = first_call.function
+                message.tool_calls = []
+                is_finish_reason_tool_calls = False
+                legacy_function_call = True
+            else:
+                legacy_function_call = False
 
             routed_experts_b64 = (
                 numpy2base64(output.routed_experts)
@@ -1256,6 +1279,8 @@ class OpenAIServingChat(GenerateBaseServing):
                 logprobs=logprobs,
                 finish_reason="tool_calls"
                 if is_finish_reason_tool_calls
+                else "function_call"
+                if legacy_function_call
                 else output.finish_reason
                 if output.finish_reason
                 else "stop",

@@ -474,6 +474,44 @@ def test_minimax_ignored_fields(profile, key):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "profile", [sp.DEEPSEEK_V4, sp.QWEN3_8, sp.MINIMAX_M3], indirect=True
+)
+def test_stream_options_accepted_without_stream(profile):
+    """All three hosted APIs accept and ignore ``stream_options`` here."""
+    req = _parse(profile, stream_options={"include_usage": True})
+    assert req.stream_options is None
+
+
+@pytest.mark.parametrize(
+    "profile", [sp.DEEPSEEK_V4, sp.MINIMAX_M3], indirect=True
+)
+def test_legacy_functions_ignored_where_unsupported(profile):
+    req = _parse(profile, functions=[TOOLS[0]["function"]], function_call="auto")
+    assert not getattr(req, "functions", None)
+    assert not req._vendor_state.legacy_functions
+
+
+@QWEN
+def test_qwen_legacy_functions_become_tools(profile):
+    req = _parse(profile, functions=[TOOLS[0]["function"]], function_call="auto")
+    assert [t.function.name for t in req.tools] == ["get_weather"]
+    assert req.tool_choice == "auto"
+    assert req._vendor_state.legacy_functions is True
+    # the marker must not survive on the request
+    assert "_vendor_legacy_functions" not in (req.model_extra or {})
+
+
+@QWEN
+def test_qwen_legacy_named_function_call(profile):
+    req = _parse(
+        profile,
+        functions=[TOOLS[0]["function"]],
+        function_call={"name": "get_weather"},
+    )
+    assert req.tool_choice.function.name == "get_weather"
+
+
 def test_no_profile_leaves_request_untouched():
     sp.set_active_profile(None)
     req = ChatCompletionRequest.model_validate(
