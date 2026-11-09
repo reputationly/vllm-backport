@@ -141,14 +141,23 @@ VLLM_MAX_STOP_STRINGS=64
 
 ### 8.3 进度
 
-| 模型 | 状态 |
-|---|---|
-| `minimax-m3.1-flash` | **已全量升级** 1/1。网关实测 200、`content=391`、`rt=18`；`top_p=0` 返回 200（修复生效）；`reasoning_split=false` 被 400（网关包成 200+空 choices） |
-| `deepseek-v4-1-flash` | 滚动中。新镜像实例直连实测 `fin=stop pt=40 rt=17 content=391`（修复前 `pt=14 rt=0`） |
-| `qwen3.8-flash-fp8` | 滚动中。新镜像实例直连实测 `max_tokens=32` → `fin=length ct=109 rt=75 answer=34`，符合 WP5b 门槛（≤42） |
+全部三个模型的所有副本都已换成新镜像（`c20bee8162cd`），旧副本（`8695df29c91b`）无残留。
 
-gpustack 改 `env` 后会按副本逐个替换（不是全量重启），所以 DeepSeek 全程保持
-4–5 个副本在线，符合"至少留一个"的要求。
+| 模型 | 副本 | 状态 |
+|---|---|---|
+| `minimax-m3.1-flash` | 1/1 | **已升级**。网关 200、`content=391`、`rt=18~20`；`top_p=0` 200（修复生效） |
+| `deepseek-v4-1-flash` | 6/6 | **已升级**。新副本直连 `fin=stop pt=40 rt=17 content=391`（修复前 `pt=14 rt=0`） |
+| `qwen3.8-flash-fp8` | 3/3 | **已升级**。新副本直连 `max_tokens=32` → `fin=length ct=109 rt=75 answer=34`（WP5b 门槛 ≤42） |
+
+升级后终验（经 MaaS 网关，客户 RAG 问句，`max_tokens=2000`，每模型每温度 12 次）：
+
+| 模型 | T=1.0 | T=1.8 |
+|---|---|---|
+| `deepseek-v4-1-flash-261017`（→ 我们） | 异常 0/12、空 0 | 异常 0/12、空 0 |
+| `Qwen3.8-Flash`（→ 我们） | 异常 0/12、空 0 | 异常 0/12、空 0 |
+| `MiniMax-M3.1-Flash`（→ 我们） | 异常 0/12、空 0 | 异常 0/12、空 0 |
+
+gpustack 改 `env` 或删实例后会按副本逐个重建，所以整个过程 DeepSeek 始终有 ≥3 台在线。
 
 ### 8.4 回滚
 
