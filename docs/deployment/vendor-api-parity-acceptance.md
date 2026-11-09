@@ -176,6 +176,32 @@ VLLM_MAX_STOP_STRINGS=64
 
 gpustack 改 `env` 或删实例后会按副本逐个重建，所以整个过程 DeepSeek 始终有 ≥3 台在线。
 
+### 8.3.1 第二轮升级（`73eaf3406304`，2026-11-10）
+
+出包提交 `c995959dd8`，镜像 `swr.cn-central-221.ovaijisuan.com/reputationly/vllm-backport:arm64-sm80-20261109-2250-c995959d`
+（digest `sha256:73eaf3406304422e2eb621d678918931c56f4d2956644eb07506e84dbb0bf5e6`），
+gpustack 版本 `rep-backport-parity2-custom`。相对生产基础镜像 `f1a14bb7-csrc` 只替换 5 个 Python 文件，
+镜像内 158 条单测全过。
+
+**三个模型全部升级**（不是只升 Qwen——DeepSeek 确实有两处净变化，见 8.6）：
+
+| 模型 | 副本 | 结果 |
+|---|---|---|
+| `qwen3.8-flash-fp8` | 3/3 | 逐台替换，全程 ≥2 在线。新副本 `max_tokens=32` → `finish=length`、answer=36（门槛 ≤42） |
+| `deepseek-v4-1-flash` | 6/6 | 逐台替换，全程 ≥5 在线。新副本 baseline `pt=40 rt=17 content=391`；`thinking.type=enabled`+`reasoning_effort=none` 现在**渲染思考**（rt=65、reasoning 226 字符），修复生效 |
+| `minimax-m3.1-flash` | 1/1 | 单副本，低峰替换，约 12 分钟零容量 |
+
+### 8.3.2 滚动中遇到的两个问题和处置
+
+1. **`CUDA error: out of memory` 一次性失败（DeepSeek 1 台、MiniMax 1 台）**：删掉旧实例后，新实例的
+   worker 在 `set_device_index` 处 OOM——旧容器的显存尚未完全释放就被新容器抢占。两边都发生在
+   **第一次尝试**，删除失败的实例重新拉起即成功（此时 `nvidia-smi` 已回落到 4 MiB）。
+   处置：`DELETE` 失败的 model-instance，让 gpustack 用当前 spec 重新创建；不需要改配置。
+   经验：**删实例后先等 20–30 秒再让下一个开始，或失败后直接重建**。
+2. **MaaS 网关令牌失效**：验收脚本用 `sk-Notq…` 调 `https://maas.ovaijisuan.com/v1` 返回
+   `401 无效的令牌 (new_api_error)`，所以本轮**终验改为直连各实例**（`http://10.0.0.x:400xx`），
+   未使用网关。网关侧需要新令牌才能再跑网关级对拍。
+
 ### 8.4 回滚
 
 `backend_version` 改回 `rep-backport-csrc-custom`（或 `rep-backport-sampling-fix-custom` /
