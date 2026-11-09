@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     VLLM_RPC_BASE_PATH: str = tempfile.gettempdir()
     VLLM_USE_MODELSCOPE: bool = False
     VLLM_VENDOR_SAMPLING_POLICY: bool = True
+    VLLM_VENDOR_API_PROFILE: bool = True
     VLLM_USE_FASTOKENS: bool = False
     VLLM_RINGBUFFER_WARNING_INTERVAL: int = 60
     VLLM_NCCL_SO_PATH: str | None = None
@@ -2289,6 +2290,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # without a policy are untouched.
     "VLLM_VENDOR_SAMPLING_POLICY": lambda: (
         os.environ.get("VLLM_VENDOR_SAMPLING_POLICY", "1") == "1"
+    ),
+    # Request gate + chat-template stage of the vendor API profile. Turning
+    # this off keeps the sampling semantics but stops rejecting/rewriting
+    # parameters, which is useful when bisecting a behaviour change.
+    "VLLM_VENDOR_API_PROFILE": lambda: (
+        os.environ.get("VLLM_VENDOR_API_PROFILE", "1") == "1"
     ),
     # Split the Lightning Indexer's prefill query rows across TP ranks and
     # all-gather the resulting top-k indices, instead of every rank computing

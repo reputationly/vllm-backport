@@ -39,8 +39,11 @@ from vllm.entrypoints.generate.base.protocol import (
     validate_structural_tag_response_format,
     validate_structured_outputs_structural_tag,
 )
+from vllm.entrypoints.openai.chat_completion import sampling_policy as vendor
 from vllm.entrypoints.openai.chat_completion.sampling_policy import (
-    SamplingPolicy,
+    SamplingInputs,
+    VendorProfile,
+    VendorState,
     thinking_enabled,
 )
 from vllm.entrypoints.serve.engine.protocol import OpenAIBaseModel, UsageInfo
@@ -527,6 +530,56 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     # --8<-- [end:chat-completion-extra-params]
 
+    #: Thinking decision + answer budget, derived once from the raw request by
+    #: the vendor gate below and read by the template/sampling stages.
+    _vendor_state: VendorState = PrivateAttr(
+        default_factory=lambda: VendorState(thinking=True)
+    )
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _vendor_profile_gate(cls, data: Any, handler: Any) -> Any:
+        """Apply the served model's hosted-API rules before any other check.
+
+        Runs before the ``mode="before"`` validators so that parameters the
+        hosted API accepts (``top_logprobs`` without ``logprobs``,
+        ``reasoning_effort="ultra"``, 17 stop strings, ...) are not rejected by
+        the generic OpenAI validation first.
+        """
+        profile = vendor.ACTIVE_PROFILE
+        if (
+            profile is None
+            or not vendor.profile_gate_enabled()
+            or not isinstance(data, dict)
+        ):
+            return handler(data)
+        return handler(profile.gate(dict(data)))
+
+    @model_validator(mode="after")
+    def _derive_vendor_state(self) -> "ChatCompletionRequest":
+        profile = vendor.ACTIVE_PROFILE
+        if profile is None or not vendor.profile_gate_enabled():
+            return self
+        raw = dict(self.model_extra or {})
+        raw.update(
+            {
+                key: getattr(self, key)
+                for key in (
+                    "reasoning_effort",
+                    "enable_thinking",
+                    "max_tokens",
+                    "max_completion_tokens",
+                    "chat_template_kwargs",
+                )
+                if getattr(self, key, None) is not None
+            }
+        )
+        # The gate stashes the legacy-shape marker in ``model_extra``; keep it
+        # out of everything downstream.
+        self.model_extra.pop("_vendor_legacy_functions", None)
+        self._vendor_state = profile.state(raw)
+        return self
+
     @model_validator(mode="before")
     @classmethod
     def check_cache_salt_support(cls, data: Any) -> Any:
@@ -595,6 +648,29 @@ class ChatCompletionRequest(OpenAIBaseModel):
             documents=self.documents,
             reasoning_effort=self.reasoning_effort,
         )
+        profile = vendor.ACTIVE_PROFILE
+        if profile is not None and vendor.profile_gate_enabled():
+            # The hosted API decides thinking on its own; the caller's
+            # chat_template_kwargs never reach the template.
+            state = self._vendor_state
+            extra_kwargs.pop("reasoning_effort", None)
+            if profile.thinking_style == "deepseek":
+                # The V4.1 renderer treats reasoning_effort="none" as "do not
+                # think", so only forward an effort the caller actually asked
+                # for; otherwise leave it unset and let the renderer pick its
+                # default while still thinking.
+                extra_kwargs["thinking"] = state.thinking
+                if state.effort is not None:
+                    extra_kwargs["reasoning_effort"] = state.effort
+            elif profile.thinking_style == "qwen":
+                extra_kwargs["enable_thinking"] = state.thinking
+                if state.effort is not None:
+                    extra_kwargs["reasoning_effort"] = state.effort
+            else:  # "always" (MiniMax)
+                if state.effort is not None:
+                    extra_kwargs["reasoning_effort"] = state.effort
+            return merge_kwargs(None, extra_kwargs)
+
         # When reasoning is requested, activate thinking for models whose chat
         # templates require explicit opt-in (e.g. Gemma4 defaults
         # enable_thinking to false). For templates that don't declare the
@@ -681,7 +757,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         self,
         max_tokens: int,
         default_sampling_params: dict,
-        sampling_policy: SamplingPolicy | None = None,
+        sampling_policy: VendorProfile | None = None,
     ) -> SamplingParams:
         # Default parameters
         if (repetition_penalty := self.repetition_penalty) is None:
@@ -716,33 +792,59 @@ class ChatCompletionRequest(OpenAIBaseModel):
         # different (and far more fragile) distribution here.
         presence_penalty = self.presence_penalty
         frequency_penalty = self.frequency_penalty
+        thinking_token_budget = self.thinking_token_budget
+        # Set when ``max_tokens`` caps the answer only: the non-streaming path
+        # then needs per-token deltas to know when the budget is spent.
+        answer_budget = False
         # Apply the model family's hosted sampling semantics (see
         # sampling_policy.py); models without a policy are untouched.
         policy = sampling_policy if envs.VLLM_VENDOR_SAMPLING_POLICY else None
+        n = self.n
+        seed = self.seed
         if policy is not None:
-            template_kwargs = self.resolved_template_kwargs()
-            if thinking_enabled(template_kwargs, policy.thinking_style):
-                if policy.temperature is not None:
-                    temperature = policy.temperature
-                if policy.max_temperature is not None:
-                    temperature = min(temperature, policy.max_temperature)
-                if policy.top_p is not None:
-                    top_p = policy.top_p
-                elif policy.top_p_floor is not None:
-                    if user_top_p is None:
-                        default = policy.top_p_default
-                        if self.tools and policy.top_p_default_with_tools:
-                            default = policy.top_p_default_with_tools
-                        if default is not None:
-                            top_p = default
-                    top_p = max(policy.top_p_floor, min(1.0, top_p))
-                if policy.top_k is not None:
-                    top_k = policy.top_k
-                if policy.clear_penalties:
-                    presence_penalty = 0.0
-                    frequency_penalty = 0.0
-            elif policy.chat_top_p is not None:
-                top_p = policy.chat_top_p
+            state = self._vendor_state
+            resolved = policy.sampling(
+                SamplingInputs(
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    min_p=min_p,
+                    repetition_penalty=repetition_penalty,
+                    presence_penalty=presence_penalty,
+                    frequency_penalty=frequency_penalty,
+                    seed=seed,
+                    n=n or 1,
+                    thinking=state.thinking,
+                    effort=state.effort,
+                )
+            )
+            temperature = resolved.temperature
+            top_p = resolved.top_p
+            top_k = resolved.top_k
+            min_p = resolved.min_p
+            repetition_penalty = resolved.repetition_penalty
+            presence_penalty = resolved.presence_penalty
+            frequency_penalty = resolved.frequency_penalty
+            seed = resolved.seed
+            n = resolved.n
+
+            # Qwen: ``max_tokens`` caps the answer only, thinking has its own
+            # budget (design D2). The engine limit covers both.
+            if (
+                policy.answer_only_max_tokens
+                and state.body_limit is not None
+                and state.thinking
+            ):
+                budget = (self.model_extra or {}).get("thinking_budget")
+                if budget is None:
+                    budget = {
+                        "low": 4096,
+                        "medium": 16384,
+                        "xhigh": 262144,
+                    }.get(state.effort or "", 131072)
+                thinking_token_budget = budget
+                max_tokens = max_tokens + budget
+                answer_budget = True
 
         # Merge server-default stop_token_ids (e.g., model-specific tokens
         # like </call> for gpt-oss) with any request-specified ones
@@ -768,7 +870,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             # Pass in ec_transfer_params via extra_args
             extra_args["ec_transfer_params"] = self.ec_transfer_params
         return SamplingParams.from_optional(
-            n=self.n,
+            n=n,
             presence_penalty=presence_penalty,
             frequency_penalty=frequency_penalty,
             repetition_penalty=repetition_penalty,
@@ -777,7 +879,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,
-            seed=self.seed,
+            seed=seed,
             stop=self.stop,
             stop_token_ids=stop_token_ids,
             logprobs=(
@@ -794,13 +896,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             include_stop_str_in_output=self.include_stop_str_in_output,
             output_kind=(
-                RequestOutputKind.DELTA if self.stream else RequestOutputKind.FINAL_ONLY
+                RequestOutputKind.DELTA
+                if self.stream or answer_budget
+                else RequestOutputKind.FINAL_ONLY
             ),
             stream_interval=self.stream_interval,
             structured_outputs=self.extract_structured_outputs(),
             logit_bias=self.logit_bias,
             bad_words=self.bad_words,
-            thinking_token_budget=self.thinking_token_budget,
+            thinking_token_budget=thinking_token_budget,
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone

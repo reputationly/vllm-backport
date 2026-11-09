@@ -10,6 +10,7 @@ from typing import Any, Final, cast
 
 from fastapi import Request
 
+import vllm.envs as envs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
@@ -29,6 +30,9 @@ from vllm.entrypoints.generate.base.serving import (
     build_spec_decoding_metrics,
     clamp_prompt_logprobs,
     format_token_id_placeholder,
+)
+from vllm.entrypoints.openai.chat_completion.sampling_policy import (
+    set_active_profile,
 )
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionLogProb,
@@ -174,6 +178,17 @@ class OpenAIServingChat(GenerateBaseServing):
         self.enable_per_request_metrics = enable_per_request_metrics
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
         self.sampling_policy = policy_for(self.model_config)
+        # One model per process, so the request gate can read the profile from
+        # module state without threading it through pydantic validation.
+        set_active_profile(self.sampling_policy)
+        if self.sampling_policy is not None:
+            # The gate enforces each family's stop-string rule; pydantic still
+            # applies VLLM_MAX_STOP_STRINGS afterwards, and it defaults to 4.
+            if envs.VLLM_MAX_STOP_STRINGS < 64:
+                raise ValueError(
+                    "VLLM_MAX_STOP_STRINGS must be >= 64 when serving a model "
+                    f"with a vendor API profile (got {envs.VLLM_MAX_STOP_STRINGS})"
+                )
         mc = self.model_config
         self.override_max_tokens = (
             self.default_sampling_params.get("max_tokens")
@@ -479,11 +494,25 @@ class OpenAIServingChat(GenerateBaseServing):
         num_cached_tokens = None
         num_cache_creation_tokens = None
         tools_streamed = [False] * num_choices
-
-        if isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam):
-            tool_choice_function_name = request.tool_choice.function.name
-        else:
-            tool_choice_function_name = None
+        content_streamed = [False] * num_choices
+        # Set once the answer-only budget (design D2) has been spent and the
+        # engine has been aborted; the terminal chunk then reports "length".
+        budget_spent = [False] * num_choices
+        body_limit = getattr(request._vendor_state, "body_limit", None)
+        thinking = getattr(request._vendor_state, "thinking", True)
+        policy = self.sampling_policy
+        if policy is None or not policy.answer_only_max_tokens or not thinking:
+            # Matches the DELTA switch in ``to_sampling_params``: without
+            # thinking there is no separate answer budget to enforce.
+            body_limit = None
+        # Answer tokens are counted by token id, not by decoded text: counting
+        # only non-whitespace content deltas undercounts markdown answers and
+        # lets the engine overshoot the budget.
+        answer_tokens = [0] * num_choices
+        answer_started = [not thinking] * num_choices
+        legacy_functions = bool(
+            getattr(request._vendor_state, "legacy_functions", False)
+        )
 
         previous_texts = [""] * num_choices
 
@@ -667,10 +696,56 @@ class OpenAIServingChat(GenerateBaseServing):
                         )
                         if delta_message is not None and delta_message.tool_calls:
                             tools_streamed[i] = True
+                            if legacy_functions:
+                                first_delta = delta_message.tool_calls[0]
+                                delta_message.function_call = first_delta.function
+                                delta_message.tool_calls = []
 
                     # handle streaming just a content delta (no parsers)
                     else:
                         delta_message = DeltaMessage(content=delta_text)
+
+                    if (
+                        self.sampling_policy is not None
+                        and self.sampling_policy.strip_leading_newlines
+                        and not content_streamed[i]
+                        and delta_message is not None
+                        and delta_message.content
+                    ):
+                        # The template emits a blank line right after the
+                        # thinking block; the hosted API starts the answer with
+                        # the first real character.
+                        delta_message.content = delta_message.content.lstrip("\n")
+                        if not delta_message.content and not delta_message.reasoning:
+                            delta_message = None
+                    if (
+                        delta_message is not None
+                        and delta_message.content
+                        and not delta_message.content.isspace()
+                    ):
+                        content_streamed[i] = True
+
+                    if body_limit is not None:
+                        delta_ids = as_list(output.token_ids)
+                        if delta_ids and not answer_started[i]:
+                            if parser is None or parser.is_reasoning_end(
+                                list(delta_ids)
+                            ):
+                                answer_started[i] = True
+                                if parser is not None:
+                                    delta_ids = parser.extract_content_ids(
+                                        list(delta_ids)
+                                    )
+                            else:
+                                delta_ids = []
+                        answer_tokens[i] += len(delta_ids)
+                        if answer_tokens[i] >= body_limit:
+                            # ``max_tokens`` caps the answer only (design D2):
+                            # stop the engine instead of letting it generate
+                            # past the budget and truncating the text later.
+                            budget_spent[i] = True
+                            await self.engine_client.abort(request_id)
+                            break
 
                     previous_texts[i] += delta_text
 
@@ -758,11 +833,17 @@ class OpenAIServingChat(GenerateBaseServing):
 
                         # Send the finish response for each request.n only once
                         # In OpenAI's API, when a tool is called, the
-                        # finish_reason is:
-                        # "tool_calls" for "auto" or "required" tool calls,
-                        # and "stop" for named tool calls.
-                        if tools_streamed[i] and not tool_choice_function_name:
+                        # Any streamed tool call reports "tool_calls"; the
+                        # hosted APIs do not special-case a named tool_choice.
+                        if tools_streamed[i] and legacy_functions:
+                            finish_reason_ = "function_call"
+                        elif tools_streamed[i]:
                             finish_reason_ = "tool_calls"
+                        elif budget_spent[i]:
+                            # The engine reports "abort" because we stopped it;
+                            # the caller asked for a capped answer, so the
+                            # hosted-API reason is "length".
+                            finish_reason_ = "length"
                         else:
                             finish_reason_ = (
                                 output.finish_reason if output.finish_reason else "stop"
@@ -820,6 +901,30 @@ class OpenAIServingChat(GenerateBaseServing):
 
             # once the final token is handled, if stream_options.include_usage
             # is sent, send the usage
+            # A request the engine aborted on our behalf may end its output
+            # stream without a terminal chunk. Every choice must still report a
+            # finish_reason, so emit the missing ones here.
+            for i in range(num_choices):
+                if finish_reason_sent[i]:
+                    continue
+                choice_data = ChatCompletionResponseStreamChoice(
+                    index=i,
+                    delta=DeltaMessage(),
+                    logprobs=None,
+                    finish_reason="length" if budget_spent[i] else "stop",
+                )
+                finish_reason_sent[i] = True
+                chunk = ChatCompletionStreamResponse(
+                    id=request_id,
+                    object=chunk_object_type,
+                    created=created_time,
+                    choices=[choice_data],
+                    model=model_name,
+                )
+                if not include_usage and self.system_fingerprint is not None:
+                    chunk.system_fingerprint = self.system_fingerprint
+                yield f"data: {chunk.model_dump_json(exclude_unset=True)}\n\n"
+
             if include_usage:
                 completion_tokens = sum(previous_num_tokens)
                 final_usage = UsageInfo(
@@ -929,11 +1034,75 @@ class OpenAIServingChat(GenerateBaseServing):
         created_time = int(time.time())
         final_res: RequestOutput | None = None
 
+        # ``max_tokens`` caps the answer only (design D2). The engine therefore
+        # runs with ``RequestOutputKind.DELTA`` and we stop it as soon as the
+        # answer budget is spent, instead of letting it generate a much longer
+        # sequence and truncating the text afterwards.
+        body_limit = getattr(request._vendor_state, "body_limit", None)
+        policy = self.sampling_policy
+        if policy is None or not policy.answer_only_max_tokens:
+            body_limit = None
+        thinking = getattr(request._vendor_state, "thinking", True)
+        answer_tokens: dict[int, int] = {}
+        answer_started: dict[int, bool] = {}
+        budget_spent = False
+        prompt_logprobs = None
+        last_res: RequestOutput | None = None
+
         try:
             async for res in result_generator:
-                final_res = res
+                if body_limit is None:
+                    final_res = res
+                    continue
+                last_res = res
+                if budget_spent:
+                    # The engine is aborting; drop the tail it still emits.
+                    continue
+                if final_res is None:
+                    final_res = res
+                    prompt_logprobs = res.prompt_logprobs
+                else:
+                    final_res.add(res, aggregate=True)
+                for output in res.outputs:
+                    i = output.index
+                    delta_ids = as_list(output.token_ids)
+                    if not delta_ids:
+                        continue
+                    if not answer_started.get(i, parser is None or not thinking):
+                        if parser.is_reasoning_end(list(delta_ids)):
+                            answer_started[i] = True
+                            delta_ids = parser.extract_content_ids(list(delta_ids))
+                        else:
+                            continue
+                    answer_tokens[i] = answer_tokens.get(i, 0) + len(delta_ids)
+                if any(count >= body_limit for count in answer_tokens.values()):
+                    budget_spent = True
+                    await self.engine_client.abort(request_id)
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
+
+        if body_limit is not None and final_res is not None:
+            # DELTA mode hands prompt logprobs to the first chunk only, and
+            # ``RequestOutput.add`` does not merge the finish-only payloads.
+            final_res.prompt_logprobs = prompt_logprobs
+            if last_res is not None:
+                for output in final_res.outputs:
+                    source = next(
+                        (o for o in last_res.outputs if o.index == output.index),
+                        None,
+                    )
+                    if source is None:
+                        continue
+                    if output.routed_experts is None:
+                        output.routed_experts = source.routed_experts
+                    if output.sampling_mask is None:
+                        output.sampling_mask = source.sampling_mask
+                    if output.spec_decode_metrics is None:
+                        output.spec_decode_metrics = source.spec_decode_metrics
+            if budget_spent:
+                for output in final_res.outputs:
+                    if output.finish_reason is None:
+                        output.finish_reason = "length"
 
         if final_res is None:
             return self.create_error_response(
@@ -1070,14 +1239,26 @@ class OpenAIServingChat(GenerateBaseServing):
             # metadata cached on the reasoning parser.
             message = self._finalize_response_message(message, parser=parser)
 
-            # In OpenAI's API, when a tool is called, the finish_reason is:
-            # "tool_calls" for "auto" or "required" tool calls,
-            # and "stop" for named tool calls.
-            is_finish_reason_tool_calls = auto_tools_called or (
-                request.tool_choice
-                and request.tool_choice == "required"
-                and output.finish_reason == "stop"
+            # Every emitted tool call reports finish_reason="tool_calls".
+            # The hosted APIs of the models we serve do the same for a named
+            # tool_choice, where vLLM would otherwise report "stop".
+            is_finish_reason_tool_calls = auto_tools_called or bool(
+                getattr(message, "tool_calls", None)
             )
+            if (
+                is_finish_reason_tool_calls
+                and getattr(request._vendor_state, "legacy_functions", False)
+            ):
+                # The caller used ``functions``/``function_call``, so answer in
+                # that shape: a single ``function_call`` and the legacy reason.
+                first_call = (message.tool_calls or [None])[0]
+                if first_call is not None:
+                    message.function_call = first_call.function
+                message.tool_calls = []
+                is_finish_reason_tool_calls = False
+                legacy_function_call = True
+            else:
+                legacy_function_call = False
 
             routed_experts_b64 = (
                 numpy2base64(output.routed_experts)
@@ -1085,12 +1266,21 @@ class OpenAIServingChat(GenerateBaseServing):
                 else None
             )
 
+            if (
+                self.sampling_policy is not None
+                and self.sampling_policy.strip_leading_newlines
+                and message.content
+            ):
+                message.content = message.content.lstrip("\n")
+
             choice_data = ChatCompletionResponseChoice(
                 index=output.index,
                 message=message,
                 logprobs=logprobs,
                 finish_reason="tool_calls"
                 if is_finish_reason_tool_calls
+                else "function_call"
+                if legacy_function_call
                 else output.finish_reason
                 if output.finish_reason
                 else "stop",

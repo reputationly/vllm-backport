@@ -363,6 +363,9 @@ class DeltaMessage(OpenAIBaseModel):
     role: str | None = None
     content: str | None = None
     reasoning: str | None = None
+    #: Legacy ``functions`` callers get ``function_call`` instead of
+    #: ``tool_calls``; only the Qwen profile emits it.
+    function_call: DeltaFunctionCall | None = None
     tool_calls: list[DeltaToolCall] = Field(default_factory=list)
 
     @model_serializer(mode="wrap")
