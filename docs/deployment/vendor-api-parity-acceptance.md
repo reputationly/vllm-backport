@@ -107,30 +107,54 @@ docker cp tests/entrypoints/openai/test_vendor_profile_tables.py <container>:/tm
 docker exec <container> python3 -m pytest /tmp/test_vendor_profile_tables.py -q
 ```
 
-## 8. 现网升级：阻塞
+## 8. 现网升级（进行中）
 
-**代码已合入 `master`，但现网尚未升级**，原因是产不出新镜像：
+镜像：`swr.cn-central-221.ovaijisuan.com/reputationly/vllm-backport:arm64-sm80-20261109-1600-9497ff2f`
+（digest `sha256:c20bee8162cd0a1bf1dde8ddc88e22652d742de150b76890189c9425d64ed591`）。
+在 prod 基础镜像 `…f1a14bb7-csrc` 上叠一层，只替换 5 个 Python 文件；镜像内 91 条单测全过。
 
-1. 本轮改动是 5 个 Python 文件（`envs.py` + 4 个 entrypoint 文件），需要重新打包镜像；
-2. dev 节点向 ACR push 被拒：`insufficient_scope: authorization failed`（凭据只有 pull 权限）；
-3. 自托管 CI runner 不在线：`GET /actions/runners` 返回 `total_count: 0`；
-4. gpustack 的模型配置里没有 `volume_mounts` 字段，无法用 bind-mount 灰度。
+gpustack 版本名：`rep-backport-parity-custom`（已注册到 vLLM backend 的 `version_configs`）。
 
-解除办法（任一即可）：
+### 8.1 出包路径（踩过的坑）
 
-- 提供有 push 权限的 ACR 凭据；或
-- 拉起一个自托管 CI runner，走现有流水线出包；或
-- 升级 gpustack 到支持 `volume_mounts` 的版本，用 bind-mount 灰度。
+- ACR（`crpi-…personal.cr.aliyuncs.com`）从 dev 节点 push 被拒：
+  `insufficient_scope: authorization failed`（凭据只有 pull 权限）；自托管 CI runner 不在线
+  （`/actions/runners` → `total_count: 0`）。
+- **可行路径**：dev 节点上有 `swr.cn-central-221.ovaijisuan.com` 的 push 凭据。
+  本地 `docker build` 出小层 → `docker push` 到 SWR → prod 节点可直接 pull。
+- **必须先在每个 prod 节点预 pull**：gpustack 在部分节点上拉不到镜像时，只会留一个
+  `-pause` 占位容器、实例状态停在 `starting` 且不报错（本轮 MiniMax 卡了 22 分钟，
+  Qwen/DeepSeek 各报过一次 `Failed to pull image`）。预 pull 后立刻恢复。
+  建议把这一步固化到升级流程里。
 
-镜像就绪后的滚动顺序（用户已确认）：**MiniMax 直接升**（1 副本）→
-**DeepSeek 删一个重建、起来一个再删剩下的**（6 副本，任何时刻 ≥1 存活）→
-**Qwen 全量升**（3 副本）。
+### 8.2 必配环境变量
 
-gpustack 注意：只改 `backend_version` 不会重启实例，必须 `replicas 0 → N`；
-版本名必须以 `-custom` 结尾。
+新镜像对命中 vendor profile 的模型有启动硬校验：`VLLM_MAX_STOP_STRINGS >= 64`
+（pydantic 默认只有 4，而 Qwen 官方允许不限个数的 `stop`）。三个模型都必须加：
 
-回滚：`backend_version` 改回 `rep-backport-sampling-fix-custom`（或
-`reputationly-backport-custom` / `reputationly-backport-m31-custom`）+ 0→N 重新部署。
+```
+VLLM_MAX_STOP_STRINGS=64
+```
+
+本轮 `deepseek-v4-1-flash` / `qwen3.8-flash-fp8` 起初没配，重建出来的实例一起来就
+`ValueError` 退出，表现为"一直 error"。
+
+### 8.3 进度
+
+| 模型 | 状态 |
+|---|---|
+| `minimax-m3.1-flash` | **已全量升级** 1/1。网关实测 200、`content=391`、`rt=18`；`top_p=0` 返回 200（修复生效）；`reasoning_split=false` 被 400（网关包成 200+空 choices） |
+| `deepseek-v4-1-flash` | 滚动中。新镜像实例直连实测 `fin=stop pt=40 rt=17 content=391`（修复前 `pt=14 rt=0`） |
+| `qwen3.8-flash-fp8` | 滚动中。新镜像实例直连实测 `max_tokens=32` → `fin=length ct=109 rt=75 answer=34`，符合 WP5b 门槛（≤42） |
+
+gpustack 改 `env` 后会按副本逐个替换（不是全量重启），所以 DeepSeek 全程保持
+4–5 个副本在线，符合"至少留一个"的要求。
+
+### 8.4 回滚
+
+`backend_version` 改回 `rep-backport-csrc-custom`（或 `rep-backport-sampling-fix-custom` /
+`reputationly-backport-m31-custom`）+ `replicas 0 → N`。gpustack 的 PUT 需要带
+`name` + `source` 全量字段，只传 `replicas` 会 422。
 
 ## 9. 遗留
 
