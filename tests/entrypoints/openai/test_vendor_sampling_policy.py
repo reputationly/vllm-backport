@@ -27,10 +27,22 @@ DEFAULTS: dict = {}
 
 
 def _params(policy, **kwargs):
-    req = ChatCompletionRequest(
-        model="m", messages=[{"role": "user", "content": "hi"}], **kwargs
-    )
-    return req.to_sampling_params(8, DEFAULTS, sampling_policy=policy)
+    """Sample with ``policy``; the profile is activated for the request gate.
+
+    ``_vendor_state`` is derived during validation, so the served profile has
+    to be installed while the request is parsed, exactly as at serving time.
+    """
+    from vllm.entrypoints.openai.chat_completion import sampling_policy as sp
+
+    previous = sp.ACTIVE_PROFILE
+    sp.set_active_profile(policy)
+    try:
+        req = ChatCompletionRequest(
+            model="m", messages=[{"role": "user", "content": "hi"}], **kwargs
+        )
+        return req.to_sampling_params(8, DEFAULTS, sampling_policy=policy)
+    finally:
+        sp.set_active_profile(previous)
 
 
 @pytest.mark.parametrize(
@@ -46,19 +58,20 @@ def _params(policy, **kwargs):
         # non-thinking: temperature honoured, top_p pinned to 1.0
         (
             {"temperature": 1.8, "chat_template_kwargs": {"reasoning_effort": "none"}},
-            1.8,
+            1.0,
             1.0,
         ),
         ({"temperature": 1.8, "reasoning_effort": "none"}, 1.8, 1.0),
-        ({"temperature": 1.8, "chat_template_kwargs": {"thinking": False}}, 1.8, 1.0),
+        # ``chat_template_kwargs`` is ignored by the hosted API (design 4.1),
+        # so it can no longer switch thinking off.
+        ({"temperature": 1.8, "chat_template_kwargs": {"thinking": False}}, 1.0, 1.0),
         ({"temperature": 1.8, "chat_template_kwargs": {"thinking": True}}, 1.0, 1.0),
-        # reasoning_effort="none" wins over thinking=True, as in the tokenizer
         (
             {
                 "temperature": 1.8,
                 "chat_template_kwargs": {"thinking": True, "reasoning_effort": "none"},
             },
-            1.8,
+            1.0,
             1.0,
         ),
     ],
@@ -78,15 +91,26 @@ def test_deepseek_clears_penalties():
 
 
 def test_deepseek_top_p_default_with_tools():
-    req = ChatCompletionRequest(
-        model="m",
-        messages=[{"role": "user", "content": "hi"}],
-        temperature=1.8,
-        tools=[{"type": "function", "function": {"name": "f", "parameters": {}}}],
-    )
-    params = req.to_sampling_params(8, DEFAULTS, sampling_policy=DEEPSEEK_V4)
-    assert params.temperature == 1.0
-    assert params.top_p == 0.95
+    """Design 4.1: the default stays 1.0 even when tools are present.
+
+    The old ``top_p_default_with_tools=0.95`` rule belongs to v4-pro, not to
+    the flash channel.
+    """
+    from vllm.entrypoints.openai.chat_completion import sampling_policy as sp
+
+    sp.set_active_profile(DEEPSEEK_V4)
+    try:
+        req = ChatCompletionRequest(
+            model="m",
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=1.8,
+            tools=[{"type": "function", "function": {"name": "f", "parameters": {}}}],
+        )
+        params = req.to_sampling_params(8, DEFAULTS, sampling_policy=DEEPSEEK_V4)
+        assert params.temperature == 1.0
+        assert params.top_p == 1.0
+    finally:
+        sp.set_active_profile(None)
 
 
 @pytest.mark.parametrize(
@@ -115,20 +139,25 @@ def test_minimax_semantics(
 @pytest.mark.parametrize(
     "kwargs,expected_temperature,expected_top_p,expected_top_k",
     [
-        # Qwen honours temperature but its documented thinking range is <= 1.0
+        # Thinking clamps temperature to the documented [0.6, 1.0] range; the
+        # default top_p/top_k only apply where the caller stayed silent.
         ({"temperature": 1.8}, 1.0, 0.95, 20),
-        ({"temperature": 0.6, "top_p": 0.8}, 0.6, 0.95, 20),
-        # non-thinking keeps the caller's values
+        # A caller-supplied top_p/top_k takes effect (design 4.2).
+        ({"temperature": 0.6, "top_p": 0.8, "top_k": 5}, 0.6, 0.8, 5),
+        # Non-thinking: caller values kept, non-thinking top_p default 0.8
         (
-            {"temperature": 1.8, "chat_template_kwargs": {"enable_thinking": False}},
+            {
+                "temperature": 1.8,
+                "top_k": 5,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
             1.8,
-            1.0,
+            0.8,
             5,
         ),
     ],
 )
 def test_qwen_semantics(kwargs, expected_temperature, expected_top_p, expected_top_k):
-    kwargs.setdefault("top_k", 5)
     params = _params(QWEN3_8, **kwargs)
     assert params.temperature == expected_temperature
     assert params.top_p == expected_top_p

@@ -69,6 +69,25 @@ def test_deepseek_temperature_range(profile):
 
 
 @DEEPSEEK
+def test_deepseek_top_p_ignores_model_generation_config(profile):
+    """Design 4.1 pins the thinking default to 1.0, whatever the model ships."""
+    sp.set_active_profile(sp.DEEPSEEK_V4)
+    try:
+        req = ChatCompletionRequest.model_validate({**BASE, "temperature": 1.8})
+        params = req.to_sampling_params(
+            8, {"top_p": 0.95}, sampling_policy=sp.DEEPSEEK_V4
+        )
+        assert params.top_p == 1.0
+        req2 = ChatCompletionRequest.model_validate({**BASE, "top_p": 0.9})
+        params2 = req2.to_sampling_params(
+            8, {"top_p": 0.95}, sampling_policy=sp.DEEPSEEK_V4
+        )
+        assert params2.top_p == 0.95
+    finally:
+        sp.set_active_profile(None)
+
+
+@DEEPSEEK
 def test_deepseek_top_p_range(profile):
     _rejects(profile, "top_p", top_p=0)
     _rejects(profile, "top_p", top_p=1.5)
@@ -121,10 +140,30 @@ def test_deepseek_logit_bias_rejected(profile):
     _rejects(profile, "logit_bias", logit_bias={"100": -100})
 
 
+def test_deepseek_stop_limit_gate():
+    """The gate rejects more than 16 stop strings.
+
+    ``VLLM_MAX_STOP_STRINGS`` is baked into the pydantic field at import time
+    and defaults to 4, so the request-level cap can only be exercised on a
+    deployment that raised it; the gate rule itself is checked directly here.
+    """
+    gate = sp.DEEPSEEK_V4.gate
+    with pytest.raises(VLLMValidationError) as ei:
+        gate({"model": "m", "messages": [], "stop": STOP17})
+    assert ei.value.parameter == "stop"
+    assert len(gate({"model": "m", "messages": [], "stop": STOP17[:16]})["stop"]) == 16
+
+
 @DEEPSEEK
-def test_deepseek_stop_limit(profile):
+def test_deepseek_stop_limit_request(profile):
+    from vllm import envs
+
+    if envs.VLLM_MAX_STOP_STRINGS < 16:
+        pytest.skip(
+            "VLLM_MAX_STOP_STRINGS is baked into the schema at import time; "
+            f"this build caps stop at {envs.VLLM_MAX_STOP_STRINGS}"
+        )
     assert _parse(profile, stop=STOP17[:16]).stop
-    _rejects(profile, "stop", stop=STOP17)
 
 
 @DEEPSEEK
@@ -310,9 +349,7 @@ def test_qwen_token_budget_range(profile, key):
 def test_qwen_max_tokens_sets_body_limit(profile):
     """D2: max_tokens caps the answer only; max_completion_tokens does not."""
     assert _parse(profile, max_tokens=32)._vendor_state.body_limit == 32
-    assert (
-        _parse(profile, max_completion_tokens=32)._vendor_state.body_limit is None
-    )
+    assert _parse(profile, max_completion_tokens=32)._vendor_state.body_limit is None
 
 
 @QWEN
@@ -398,8 +435,16 @@ def test_minimax_top_p_validated_and_pinned(profile):
 
 @MINIMAX
 @pytest.mark.parametrize(
-    "key", ["top_k", "min_p", "repetition_penalty", "presence_penalty",
-            "frequency_penalty", "logit_bias", "seed"]
+    "key",
+    [
+        "top_k",
+        "min_p",
+        "repetition_penalty",
+        "presence_penalty",
+        "frequency_penalty",
+        "logit_bias",
+        "seed",
+    ],
 )
 def test_minimax_unvalidated_knobs_ignored(profile, key):
     params = _sampling(profile, **{key: 7})
@@ -437,7 +482,10 @@ def test_minimax_response_format_ignored(profile):
 
 @MINIMAX
 def test_minimax_tool_choice_rewritten_to_auto(profile):
-    for choice in ("required", {"type": "function", "function": {"name": "get_weather"}}):
+    for choice in (
+        "required",
+        {"type": "function", "function": {"name": "get_weather"}},
+    ):
         assert _parse(profile, tools=TOOLS, tool_choice=choice).tool_choice == "auto"
 
 
@@ -480,8 +528,64 @@ def test_minimax_effort_rules(profile):
     ["enable_thinking", "chat_template_kwargs", "service_tier"],
 )
 def test_minimax_ignored_fields(profile, key):
-    assert _parse(profile, **{key: {"enable_thinking": False}
-                             if key == "chat_template_kwargs" else False})
+    assert _parse(
+        profile,
+        **{key: {"enable_thinking": False} if key == "chat_template_kwargs" else False},
+    )
+
+
+# ---------------------------------------------------------------------------
+# GLM-5.3
+# ---------------------------------------------------------------------------
+
+GLM = pytest.mark.parametrize("profile", [sp.GLM5], indirect=True)
+
+
+@GLM
+def test_glm_temperature_capped_while_thinking(profile):
+    """GLM-5.3 cannot stop thinking; the hosted API caps temperature at 1.0."""
+    assert _sampling(profile, temperature=1.8).temperature == 1.0
+    assert _sampling(profile, temperature=0.7).temperature == 0.7
+
+
+@GLM
+def test_glm_top_p_pinned(profile):
+    assert _sampling(profile, top_p=0.5).top_p == 0.95
+
+
+@GLM
+def test_glm_thinking_cannot_be_disabled(profile):
+    for kwargs in ({"thinking": {"type": "disabled"}}, {"enable_thinking": False}):
+        assert _parse(profile, **kwargs)._vendor_state.thinking is True
+
+
+@GLM
+def test_glm_keeps_caller_template_kwargs(profile, monkeypatch):
+    """GLM has no gate rule dropping them, so the old behaviour is kept."""
+    from vllm import envs
+
+    monkeypatch.setattr(envs, "VLLM_VENDOR_API_PROFILE", True)
+    monkeypatch.setattr(envs, "VLLM_VENDOR_SAMPLING_POLICY", True)
+    sp.set_active_profile(sp.GLM5)
+    try:
+        req = _parse(sp.GLM5, chat_template_kwargs={"reasoning_effort": "low"})
+        resolved = req.resolved_template_kwargs()
+        assert resolved.get("reasoning_effort") == "low"
+    finally:
+        sp.set_active_profile(None)
+
+
+def test_policy_lookup_covers_glm():
+    def cfg(model_type, architectures=None):
+        return SimpleNamespace(
+            hf_config=SimpleNamespace(
+                model_type=model_type, architectures=architectures
+            )
+        )
+
+    assert sp.policy_for(cfg("glm5_next")) is sp.GLM5
+    assert sp.policy_for(cfg("x", ["Glm5NextForCausalLM"])) is sp.GLM5
+    assert sp.policy_for(cfg("x", ["Glm5NextForConditionalGeneration"])) is sp.GLM5
 
 
 # ---------------------------------------------------------------------------
@@ -498,9 +602,7 @@ def test_stream_options_accepted_without_stream(profile):
     assert req.stream_options is None
 
 
-@pytest.mark.parametrize(
-    "profile", [sp.DEEPSEEK_V4, sp.MINIMAX_M3], indirect=True
-)
+@pytest.mark.parametrize("profile", [sp.DEEPSEEK_V4, sp.MINIMAX_M3], indirect=True)
 def test_legacy_functions_ignored_where_unsupported(profile):
     req = _parse(profile, functions=[TOOLS[0]["function"]], function_call="auto")
     assert not getattr(req, "functions", None)
@@ -535,6 +637,57 @@ def test_no_profile_leaves_request_untouched():
     assert req.temperature == 2.5
     assert req.top_p == 0.3
     assert req.n == 3
+
+
+def test_thinking_budget_type_validated():
+    sp.set_active_profile(sp.QWEN3_8)
+    try:
+        with pytest.raises(VLLMValidationError) as ei:
+            _parse(sp.QWEN3_8, thinking_budget="64")
+        assert ei.value.parameter == "thinking_budget"
+        assert _parse(sp.QWEN3_8, thinking_budget=64)._vendor_state.body_limit is None
+    finally:
+        sp.set_active_profile(None)
+
+
+def test_deepseek_thinking_type_outranks_effort_none():
+    """``thinking.type=enabled`` + ``reasoning_effort=none`` must still think."""
+    sp.set_active_profile(sp.DEEPSEEK_V4)
+    try:
+        req = _parse(
+            sp.DEEPSEEK_V4,
+            thinking={"type": "enabled"},
+            reasoning_effort="none",
+        )
+        assert req._vendor_state.thinking is True
+        # The renderer treats "none" as "do not think", so it must not be sent.
+        assert req._vendor_state.effort is None
+        assert "reasoning_effort" not in req.resolved_template_kwargs()
+    finally:
+        sp.set_active_profile(None)
+
+
+def test_kill_switch_derives_thinking_from_template(monkeypatch):
+    """With the gate off, sampling must not assume thinking."""
+    from vllm import envs
+
+    monkeypatch.setattr(envs, "VLLM_VENDOR_API_PROFILE", False)
+    monkeypatch.setattr(envs, "VLLM_VENDOR_SAMPLING_POLICY", True)
+    sp.set_active_profile(sp.DEEPSEEK_V4)
+    try:
+        req = ChatCompletionRequest.model_validate(
+            {
+                **BASE,
+                "temperature": 1.8,
+                "chat_template_kwargs": {"thinking": False},
+                "reasoning_effort": "none",
+            }
+        )
+        params = req.to_sampling_params(8, DEFAULTS, sampling_policy=sp.DEEPSEEK_V4)
+        # chat mode keeps the caller's temperature instead of pinning 1.0
+        assert params.temperature == 1.8
+    finally:
+        sp.set_active_profile(None)
 
 
 def test_profile_switch_disabled_by_env(monkeypatch):

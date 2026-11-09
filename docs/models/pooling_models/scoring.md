@@ -130,8 +130,8 @@ All models that support embedding task also support using the score API to compu
 The following [pooling parameters][vllm.PoolingParams] are only supported by cross-encoder models and do not work for late-interaction and bi-encoder models.
 
 ```python
---8<-- "vllm/pooling_params.py:common-pooling-params"
---8<-- "vllm/pooling_params.py:classify-pooling-params"
+--8 < --"vllm/pooling_params.py:common-pooling-params"
+--8 < --"vllm/pooling_params.py:classify-pooling-params"
 ```
 
 ### `LLM.score`
@@ -164,11 +164,11 @@ Our Score API (`/score`, `/v1/score`) is similar to `LLM.score`, compute similar
 The following Score API parameters are supported:
 
 ```python
---8<-- "vllm/entrypoints/pooling/base/protocol.py:pooling-common-params"
---8<-- "vllm/entrypoints/pooling/base/protocol.py:pooling-common-extra-params"
---8<-- "vllm/entrypoints/pooling/base/protocol.py:classify-extra-params"
---8<-- "vllm/entrypoints/pooling/scoring/protocol.py:scoring-common-params"
---8<-- "vllm/entrypoints/pooling/scoring/protocol.py:score-request-params"
+--8 < --"vllm/entrypoints/pooling/base/protocol.py:pooling-common-params"
+--8 < --"vllm/entrypoints/pooling/base/protocol.py:pooling-common-extra-params"
+--8 < --"vllm/entrypoints/pooling/base/protocol.py:classify-extra-params"
+--8 < --"vllm/entrypoints/pooling/scoring/protocol.py:scoring-common-params"
+--8 < --"vllm/entrypoints/pooling/scoring/protocol.py:score-request-params"
 ```
 
 #### Examples
@@ -376,11 +376,11 @@ Code example: [examples/pooling/score/rerank_api_online.py](../../../examples/po
 The following rerank api parameters are supported:
 
 ```python
---8<-- "vllm/entrypoints/pooling/base/protocol.py:pooling-common-params"
---8<-- "vllm/entrypoints/pooling/base/protocol.py:pooling-common-extra-params"
---8<-- "vllm/entrypoints/pooling/base/protocol.py:classify-extra-params"
---8<-- "vllm/entrypoints/pooling/scoring/protocol.py:scoring-common-params"
---8<-- "vllm/entrypoints/pooling/scoring/protocol.py:rerank-request-params"
+--8 < --"vllm/entrypoints/pooling/base/protocol.py:pooling-common-params"
+--8 < --"vllm/entrypoints/pooling/base/protocol.py:pooling-common-extra-params"
+--8 < --"vllm/entrypoints/pooling/base/protocol.py:classify-extra-params"
+--8 < --"vllm/entrypoints/pooling/scoring/protocol.py:scoring-common-params"
+--8 < --"vllm/entrypoints/pooling/scoring/protocol.py:rerank-request-params"
 ```
 
 #### Examples

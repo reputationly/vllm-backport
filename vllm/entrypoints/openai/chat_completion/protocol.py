@@ -44,7 +44,6 @@ from vllm.entrypoints.openai.chat_completion.sampling_policy import (
     SamplingInputs,
     VendorProfile,
     VendorState,
-    thinking_enabled,
 )
 from vllm.entrypoints.serve.engine.protocol import OpenAIBaseModel, UsageInfo
 from vllm.exceptions import VLLMValidationError
@@ -555,11 +554,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
             return handler(data)
         return handler(profile.gate(dict(data)))
 
-    @model_validator(mode="after")
-    def _derive_vendor_state(self) -> "ChatCompletionRequest":
-        profile = vendor.ACTIVE_PROFILE
-        if profile is None or not vendor.profile_gate_enabled():
-            return self
+    def _vendor_state_inputs(self) -> dict[str, Any]:
+        """Request fields a profile's ``state`` hook needs, extras included."""
         raw = dict(self.model_extra or {})
         raw.update(
             {
@@ -574,9 +570,19 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 if getattr(self, key, None) is not None
             }
         )
+        return raw
+
+    @model_validator(mode="after")
+    def _derive_vendor_state(self) -> "ChatCompletionRequest":
+        profile = vendor.ACTIVE_PROFILE
+        if profile is None or not vendor.profile_gate_enabled():
+            return self
+        raw = self._vendor_state_inputs()
+        raw = dict(raw)
         # The gate stashes the legacy-shape marker in ``model_extra``; keep it
         # out of everything downstream.
-        self.model_extra.pop("_vendor_legacy_functions", None)
+        if self.model_extra is not None:
+            self.model_extra.pop("_vendor_legacy_functions", None)
         self._vendor_state = profile.state(raw)
         return self
 
@@ -666,9 +672,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 extra_kwargs["enable_thinking"] = state.thinking
                 if state.effort is not None:
                     extra_kwargs["reasoning_effort"] = state.effort
-            else:  # "always" (MiniMax)
+            else:  # "always"
                 if state.effort is not None:
                     extra_kwargs["reasoning_effort"] = state.effort
+                # MiniMax's gate already dropped the caller's kwargs; GLM-5.3
+                # has no such rule, so keep whatever it was given.
+                return merge_kwargs(self.chat_template_kwargs, extra_kwargs)
             return merge_kwargs(None, extra_kwargs)
 
         # When reasoning is requested, activate thinking for models whose chat
@@ -769,7 +778,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
             temperature = default_sampling_params.get(
                 "temperature", self._DEFAULT_SAMPLING_PARAMS["temperature"]
             )
-        user_top_p = self.top_p
         if (top_p := self.top_p) is None:
             top_p = default_sampling_params.get(
                 "top_p", self._DEFAULT_SAMPLING_PARAMS["top_p"]
@@ -802,7 +810,24 @@ class ChatCompletionRequest(OpenAIBaseModel):
         n = self.n
         seed = self.seed
         if policy is not None:
-            state = self._vendor_state
+            if vendor.profile_gate_enabled() and vendor.ACTIVE_PROFILE is policy:
+                state = self._vendor_state
+            elif vendor.profile_gate_enabled():
+                # The caller passed a different policy than the process serves;
+                # derive the state for *this* policy instead of reusing one
+                # derived by another family's gate.
+                state = policy.state(self._vendor_state_inputs())
+            else:
+                # ``VLLM_VENDOR_API_PROFILE=0`` skips the gate, so nothing
+                # derived the thinking decision. Ask the template instead of
+                # assuming thinking, otherwise a request that renders in
+                # chat mode is sampled with thinking-mode knobs.
+                state = VendorState(
+                    thinking=vendor.thinking_enabled(
+                        self.resolved_template_kwargs(), policy.thinking_style
+                    ),
+                    effort=self.reasoning_effort,
+                )
             resolved = policy.sampling(
                 SamplingInputs(
                     temperature=temperature,
@@ -810,12 +835,22 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     top_k=top_k,
                     min_p=min_p,
                     repetition_penalty=repetition_penalty,
-                    presence_penalty=presence_penalty,
-                    frequency_penalty=frequency_penalty,
+                    presence_penalty=presence_penalty or 0.0,
+                    frequency_penalty=frequency_penalty or 0.0,
                     seed=seed,
                     n=n or 1,
                     thinking=state.thinking,
                     effort=state.effort,
+                    specified=frozenset(
+                        key
+                        for key, value in (
+                            ("temperature", self.temperature),
+                            ("top_p", self.top_p),
+                            ("top_k", self.top_k),
+                            ("presence_penalty", self.presence_penalty),
+                        )
+                        if value is not None
+                    ),
                 )
             )
             temperature = resolved.temperature

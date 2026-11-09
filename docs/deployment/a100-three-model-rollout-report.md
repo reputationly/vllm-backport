@@ -118,9 +118,11 @@
 class SamplingPolicy:
     name: str
     ignore_temperature_in_thinking: bool
-    thinking_top_p: tuple[float, float] | None   # 钳制区间
+    thinking_top_p: tuple[float, float] | None  # 钳制区间
     non_thinking_top_p: float | None
     ...
+
+
 DEEPSEEK_V4 / MINIMAX_M3 / QWEN3_8 / GLM5
 ```
 

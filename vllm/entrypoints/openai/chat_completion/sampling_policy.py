@@ -34,9 +34,7 @@ ThinkingStyle = Literal["deepseek", "qwen", "always"]
 _DEEPSEEK_EFFORTS = frozenset(
     {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 )
-_QWEN_EFFORTS = frozenset(
-    {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
-)
+_QWEN_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
 _MINIMAX_EFFORTS = frozenset({"minimal", "low", "medium", "high", "xhigh", "max"})
 
 
@@ -73,6 +71,9 @@ class SamplingInputs:
     n: int
     thinking: bool
     effort: str | None
+    #: Names of the knobs the caller set explicitly; the rest may take the
+    #: family's documented default instead of the engine's.
+    specified: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -84,18 +85,10 @@ class VendorProfile:
     gate: Callable[[dict[str, Any]], dict[str, Any]]
     sampling: Callable[[SamplingInputs], SamplingInputs]
     state: Callable[[Mapping[str, Any]], VendorState]
-    #: ``max_tokens`` used when the caller omits it.
-    default_max_tokens_thinking: int | None = None
-    default_max_tokens_chat: int | None = None
     #: Qwen: ``max_tokens`` caps the answer only, thinking has its own budget.
     answer_only_max_tokens: bool = False
     #: Qwen: the template emits a blank line after ``</think>``.
     strip_leading_newlines: bool = False
-    #: DeepSeek/Qwen: drop ``tools`` when ``tool_choice == "none"`` so the model
-    #: does not emit a suppressed tool call and return an empty answer.
-    drop_tools_when_none: bool = False
-    #: MiniMax: the hosted API only implements ``auto``.
-    force_tool_choice_auto: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -234,11 +227,12 @@ def _deepseek_gate(data: dict[str, Any]) -> dict[str, Any]:
             _reject(f"`{key}` must be at least 1", key, value)
 
     top_logprobs = data.get("top_logprobs")
-    if isinstance(top_logprobs, int) and not isinstance(top_logprobs, bool):
-        if top_logprobs < 0 or top_logprobs > 20:
-            _reject(
-                "top_logprobs must be in [0, 20]", "top_logprobs", top_logprobs
-            )
+    if (
+        isinstance(top_logprobs, int)
+        and not isinstance(top_logprobs, bool)
+        and (top_logprobs < 0 or top_logprobs > 20)
+    ):
+        _reject("top_logprobs must be in [0, 20]", "top_logprobs", top_logprobs)
     if not data.get("logprobs"):
         # The hosted API accepts ``top_logprobs`` on its own and ignores it.
         _drop(data, "top_logprobs")
@@ -292,8 +286,16 @@ def _deepseek_gate(data: dict[str, Any]) -> dict[str, Any]:
         _drop(data, "tools", "tool_choice")
 
     allowed = _allowed_escape_hatches()
-    for key in ("chat_template_kwargs", "enable_thinking", "top_k", "min_p",
-                "repetition_penalty", "seed", "functions", "function_call"):
+    for key in (
+        "chat_template_kwargs",
+        "enable_thinking",
+        "top_k",
+        "min_p",
+        "repetition_penalty",
+        "seed",
+        "functions",
+        "function_call",
+    ):
         if key not in allowed:
             _drop(data, key)
     return data
@@ -304,6 +306,11 @@ def _deepseek_state(data: Mapping[str, Any]) -> VendorState:
     effort = data.get("reasoning_effort")
     if thinking_type is not None:
         thinking = thinking_type != "disabled"
+        # ``thinking.type`` outranks ``reasoning_effort``; forwarding "none"
+        # would make the renderer drop thinking mode while the sampler still
+        # applies thinking-mode semantics.
+        if thinking and effort == "none":
+            effort = None
     elif effort == "none":
         thinking = False
     else:
@@ -324,7 +331,12 @@ def _deepseek_sampling(inputs: SamplingInputs) -> SamplingInputs:
     }
     if inputs.thinking:
         updates["temperature"] = 1.0
-        updates["top_p"] = max(0.95, min(1.0, inputs.top_p))
+        # Default 1.0 regardless of the model's generation_config (design 4.1),
+        # floored to 0.95 when the caller asks for less.
+        if "top_p" not in inputs.specified:
+            updates["top_p"] = 1.0
+        else:
+            updates["top_p"] = max(0.95, min(1.0, inputs.top_p))
     else:
         updates["top_p"] = 1.0
     return replace(inputs, **updates)
@@ -336,9 +348,6 @@ DEEPSEEK_V4 = VendorProfile(
     gate=_deepseek_gate,
     sampling=_deepseek_sampling,
     state=_deepseek_state,
-    default_max_tokens_thinking=65536,
-    default_max_tokens_chat=8192,
-    drop_tools_when_none=True,
 )
 
 
@@ -367,20 +376,17 @@ def _qwen_gate(data: dict[str, Any]) -> dict[str, Any]:
     )
     top_k = data.get("top_k")
     if isinstance(top_k, int) and not isinstance(top_k, bool) and top_k < 0:
-        _reject(
-            "top_k must be a non-negative integer", "top_k", top_k
-        )
+        _reject("top_k must be a non-negative integer", "top_k", top_k)
     for key in ("presence_penalty", "frequency_penalty"):
         _require_range(data, key, -2.0, 2.0)
 
     top_logprobs = data.get("top_logprobs")
-    if isinstance(top_logprobs, int) and not isinstance(top_logprobs, bool):
-        if top_logprobs < 0 or top_logprobs > 5:
-            _reject(
-                "Range of top_logprobs should be [0, 5]",
-                "top_logprobs",
-                top_logprobs,
-            )
+    if (
+        isinstance(top_logprobs, int)
+        and not isinstance(top_logprobs, bool)
+        and (top_logprobs < 0 or top_logprobs > 5)
+    ):
+        _reject("Range of top_logprobs should be [0, 5]", "top_logprobs", top_logprobs)
     if not data.get("logprobs"):
         _drop(data, "top_logprobs")
 
@@ -391,7 +397,7 @@ def _qwen_gate(data: dict[str, Any]) -> dict[str, Any]:
         "auto",
     }:
         _reject(
-            "'type' must be in [\"enabled\", \"disabled\", \"auto\"]",
+            '\'type\' must be in ["enabled", "disabled", "auto"]',
             "thinking.type",
             thinking_type,
         )
@@ -425,11 +431,22 @@ def _qwen_gate(data: dict[str, Any]) -> dict[str, Any]:
 
     for key in ("max_tokens", "max_completion_tokens"):
         value = data.get(key)
-        if isinstance(value, int) and not isinstance(value, bool):
-            if value < 1 or value > 131072:
-                _reject(
-                    f"Range of {key} should be [1, 131072]", key, value
-                )
+        if (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and (value < 1 or value > 131072)
+        ):
+            _reject(f"Range of {key} should be [1, 131072]", key, value)
+
+    budget = data.get("thinking_budget")
+    if budget is not None and (
+        not isinstance(budget, int) or isinstance(budget, bool) or budget < 0
+    ):
+        _reject(
+            "`thinking_budget` must be a non-negative integer",
+            "thinking_budget",
+            budget,
+        )
 
     _require_json_hint(
         data,
@@ -503,6 +520,10 @@ def _qwen_state(data: Mapping[str, Any]) -> VendorState:
             thinking = data.get("reasoning_effort") != "none"
 
     effort = _qwen_effort_map(data.get("reasoning_effort"))
+    if thinking and effort == "none":
+        # A higher-priority switch asked for thinking; the template would read
+        # "none" as "do not think", so do not forward it.
+        effort = None
     body_limit = None
     max_tokens = data.get("max_tokens")
     if (
@@ -522,17 +543,31 @@ def _qwen_state(data: Mapping[str, Any]) -> VendorState:
 def _qwen_sampling(inputs: SamplingInputs) -> SamplingInputs:
     # The hosted API accepts top_p=0; SamplingParams rejects it, so pin the
     # degenerate value to the smallest legal probability.
-    updates: dict[str, Any] = {
-        "min_p": 0.0,
-        "top_p": inputs.top_p if inputs.top_p > 0 else 1e-6,
-    }
+    updates: dict[str, Any] = {"min_p": 0.0}
     if inputs.thinking:
         updates["temperature"] = min(max(inputs.temperature, 0.6), 1.0)
         updates["top_k"] = inputs.top_k
         if inputs.top_k <= 0 or inputs.top_k > 100:
             updates["top_k"] = -1
+        if "top_k" not in inputs.specified:
+            updates["top_k"] = 20
+        if "top_p" not in inputs.specified:
+            updates["top_p"] = 0.95
+        if "presence_penalty" not in inputs.specified:
+            updates["presence_penalty"] = 0.0
     else:
-        updates["temperature"] = inputs.temperature
+        if "temperature" not in inputs.specified:
+            updates["temperature"] = 0.7
+        else:
+            updates["temperature"] = inputs.temperature
+        if "top_p" not in inputs.specified:
+            updates["top_p"] = 0.8
+        if "top_p" in updates and updates["top_p"] <= 0:
+            updates["top_p"] = 1e-6
+        if "presence_penalty" not in inputs.specified:
+            updates["presence_penalty"] = 1.5
+    if "top_p" not in updates:
+        updates["top_p"] = inputs.top_p if inputs.top_p > 0 else 1e-6
     return replace(inputs, **updates)
 
 
@@ -544,7 +579,6 @@ QWEN3_8 = VendorProfile(
     state=_qwen_state,
     answer_only_max_tokens=True,
     strip_leading_newlines=True,
-    drop_tools_when_none=True,
 )
 
 
@@ -568,8 +602,7 @@ def _minimax_gate(data: dict[str, Any]) -> dict[str, Any]:
     n = data.get("n")
     if isinstance(n, int) and not isinstance(n, bool) and n > 1:
         _reject(
-            "invalid params, model[MiniMax-M3.1-Flash] does not support n > 1 "
-            "(2013)",
+            "invalid params, model[MiniMax-M3.1-Flash] does not support n > 1 (2013)",
             "n",
             n,
         )
@@ -588,8 +621,7 @@ def _minimax_gate(data: dict[str, Any]) -> dict[str, Any]:
         "disabled",
     }:
         _reject(
-            "invalid params, `thinking.type` must be one of adaptive, enabled "
-            "(2013)",
+            "invalid params, `thinking.type` must be one of adaptive, enabled (2013)",
             "thinking.type",
             thinking_type,
         )
@@ -686,7 +718,45 @@ MINIMAX_M3 = VendorProfile(
     gate=_minimax_gate,
     sampling=_minimax_sampling,
     state=_minimax_state,
-    force_tool_choice_auto=True,
+)
+
+
+# ---------------------------------------------------------------------------
+# GLM-5.3
+# ---------------------------------------------------------------------------
+
+
+def _glm5_gate(data: dict[str, Any]) -> dict[str, Any]:
+    # No hosted-API request rules have been measured for GLM-5.3, so the
+    # request is passed through verbatim: this profile only restores the
+    # sampling clamp the family needs while thinking.
+    return dict(data)
+
+
+def _glm5_state(data: Mapping[str, Any]) -> VendorState:
+    effort = data.get("reasoning_effort")
+    return VendorState(
+        thinking=True,
+        effort=effort if isinstance(effort, str) else None,
+    )
+
+
+def _glm5_sampling(inputs: SamplingInputs) -> SamplingInputs:
+    # GLM-5.3 cannot stop thinking; the hosted API caps temperature at 1.0 and
+    # pins top_p to 0.95. Everything else is forwarded.
+    return replace(
+        inputs,
+        temperature=min(inputs.temperature, 1.0),
+        top_p=0.95,
+    )
+
+
+GLM5 = VendorProfile(
+    name="glm-5.3",
+    thinking_style="always",
+    gate=_glm5_gate,
+    sampling=_glm5_sampling,
+    state=_glm5_state,
 )
 
 
@@ -705,6 +775,7 @@ _POLICIES: dict[str, VendorProfile] = {
     "minimax_m3_vl": MINIMAX_M3,
     "qwen4_exp": QWEN3_8,
     "qwen4_exp_text": QWEN3_8,
+    "glm5_next": GLM5,
 }
 
 _ARCHITECTURE_POLICIES: dict[str, VendorProfile] = {
@@ -714,6 +785,8 @@ _ARCHITECTURE_POLICIES: dict[str, VendorProfile] = {
     "MiniMaxM3SparseForConditionalGeneration": MINIMAX_M3,
     "Qwen4ExpForCausalLM": QWEN3_8,
     "Qwen4ExpForConditionalGeneration": QWEN3_8,
+    "Glm5NextForCausalLM": GLM5,
+    "Glm5NextForConditionalGeneration": GLM5,
 }
 
 #: Profile of the model this process serves (one model per process).
@@ -726,9 +799,7 @@ def set_active_profile(profile: VendorProfile | None) -> None:
 
 
 def profile_gate_enabled() -> bool:
-    return bool(envs.VLLM_VENDOR_SAMPLING_POLICY) and bool(
-        envs.VLLM_VENDOR_API_PROFILE
-    )
+    return bool(envs.VLLM_VENDOR_SAMPLING_POLICY) and bool(envs.VLLM_VENDOR_API_PROFILE)
 
 
 def policy_for(model_config: Any) -> VendorProfile | None:

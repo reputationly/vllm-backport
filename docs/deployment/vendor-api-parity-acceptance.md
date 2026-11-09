@@ -69,7 +69,7 @@
 
 | # | 差异 | 官方 | 我们（修前） | 处置 |
 |---|---|---|---|---|
-| 1 | **DeepSeek 默认请求完全不思考** | 每例都有 reasoning | rl=0 全线 | `resolved_template_kwargs` 无条件传 `reasoning_effort="none"`，V4.1 renderer 把 `none` 解释成"不思考"。改为只在调用方真给了 effort 时才传 |
+| 1 | DeepSeek 默认请求不思考（**分支内自伤，未进过现网**） | 每例都有 reasoning | rl=0 全线 | `resolved_template_kwargs` 无条件传 `reasoning_effort="none"`，V4.1 renderer 把 `none` 解释成"不思考"。这个 bug 由 WP1 提交 `be133fd8d5` 自己引入，合并前在 `5538610b20` 修掉，**现网从未出现**，因此不计入"修掉的真实差异"，实际为 7 个 |
 | 2 | Qwen 旧版 `functions`/`function_call` | `message.function_call` + `finish_reason="function_call"` | 字段被丢，模型按 prompt 硬答 | 闸门转成 `tools`/`tool_choice`，响应转回旧形状（流式也支持） |
 | 3 | `stream_options` 无 `stream` | 三族都 200 并忽略 | 400 | 闸门里丢弃 |
 | 4 | MiniMax `top_p=0` | 200（3/3） | 400 | 接受，内部钉 1e-6 |
@@ -96,9 +96,18 @@
 
 ## 7. 单测
 
-`tests/entrypoints/openai/test_vendor_profile_tables.py`：**91 例全过**，
-按设计 §4 三张表逐行覆盖（400 断言 `parameter`、忽略断言生效值、映射断言结果），
-外加思考判定优先级、无画像模型不变、开关与白名单。
+`tests/entrypoints/openai/test_vendor_profile_tables.py` + `test_vendor_sampling_policy.py`：
+**138 例通过、1 例跳过**，按设计 §4 三张表逐行覆盖（400 断言 `parameter`、忽略断言生效值、
+映射断言结果），外加思考判定优先级、无画像模型不变、开关与白名单。
+
+两点前提必须说明：
+
+- 初版报告写的"91 例全过"是在容器里设了 `VLLM_MAX_STOP_STRINGS=64` 时跑出来的。该上限在
+  导入期被固化进 pydantic 字段（`Annotated[..., Field(max_length=envs.VLLM_MAX_STOP_STRINGS)]`），
+  运行时改环境变量无效，缺省值 4 时 16 个 stop 的用例必然失败。现在拆成两条：gate 规则直接
+  断言（与环境无关），请求级用例在 `VLLM_MAX_STOP_STRINGS < 16` 时 `skip` 并给出原因。
+- 原有的 `test_vendor_sampling_policy.py` 在初版里**整个文件导入失败**（`GLM5` 被删），
+  报告没有如实反映这一点。
 
 跑法（镜像内，无本地 venv）：
 
@@ -172,6 +181,44 @@ gpustack 改 `env` 或删实例后会按副本逐个重建，所以整个过程 
 `backend_version` 改回 `rep-backport-csrc-custom`（或 `rep-backport-sampling-fix-custom` /
 `reputationly-backport-m31-custom`）+ `replicas 0 → N`。gpustack 的 PUT 需要带
 `name` + `source` 全量字段，只传 `replicas` 会 422。
+
+## 8.5 评审后的修复（2026-11-09 第二轮）
+
+代码评审跑了两份对照（`c2f4707c29` 合并前 / `ffe96511aa` 合并后）后提出 3 个必修 + 一批建议，
+本轮全部处理：
+
+| # | 问题 | 处置 |
+|---|---|---|
+| 1 | **GLM-5.3 的采样策略在 WP1 重写时被删**（`GLM5` 及 `glm5_next`/`Glm5NextForCausalLM` 映射），下次给 `glm-5.3-flash-w4a8` 出包会失去「思考时温度 ≤1.0 / top_p 0.95」，高温退化可能重现 | 以 `VendorProfile` 形式恢复：`_glm5_sampling` 做 `min(T, 1.0)` + `top_p=0.95`，`_glm5_state` 恒思考，`_glm5_gate` 原样放行（未实测过该族的请求规则，不臆造）。并在 `resolved_template_kwargs` 的 `"always"` 分支保留调用方 `chat_template_kwargs`（MiniMax 的闸门已把它们删掉，因此对 MiniMax 无影响） |
+| 2 | **`finish_reason="tool_calls"` 覆盖没有限定只对画像模型生效**，违反"无规则表模型不受影响" | 流式与非流式两条路径都加上 `self.sampling_policy is not None` 条件 |
+| 3 | **`VLLM_VENDOR_API_PROFILE=0` 语义错误**：闸门关闭后不再判定思考，一律按"开思考"采样，而模板可能渲染成不思考 | `to_sampling_params` 在闸门关闭时退回 `thinking_enabled(resolved_template_kwargs(), style)` |
+
+建议项处理情况：
+
+- **Qwen 流式提前停止两处漏洞**：达预算后立即给该 choice 打 `finish_reason_sent` 并发终止块，
+  引擎 abort 前已生成的那段不再外推；撞上限的那个 delta 正常发出并计入 `usage`。
+- **非流式未判断是否开思考**：补上 `or not thinking`，与流式一致。
+- **DeepSeek 思考态 `top_p` 缺省**：不再依赖模型 `generation_config`，未显式传时固定 1.0
+  （现网 `DeepSeek-V4.1-Flash-1017` 没有 `generation_config.json`，本来也是 1.0，属加固）。
+- **4 个没人读的配置字段**（`default_max_tokens_thinking` / `default_max_tokens_chat` /
+  `drop_tools_when_none` / `force_tool_choice_auto`）：删除。设计里 DeepSeek 不传 `max_tokens`
+  时的缺省上限（65536 / 8192）**未实现**，此处明确记录。
+- **`thinking_budget` 类型校验**：补上，非负整数之外一律 400。
+- **DeepSeek `thinking.type=enabled` + `reasoning_effort=none`**：`thinking.type` 优先，
+  不再把 `none` 透给 renderer（否则模板按不思考渲染、采样按思考处理）。Qwen 同类问题一并修。
+- **流式去开头换行可能吞掉 tool_calls**：现在只有 content 为空且既无 reasoning 也无 tool_calls
+  时才置空整个 delta。
+- **`test_gate_smoke.py`**：删除（无 SPDX 头、行超长、内容与 profile tables 重复），
+  其中"无画像模型不变"与"开关"两条已并入 profile tables。
+- **Qwen 缺省值**：显式实现设计 §4.2 的 `top_p` 0.95/0.8、`top_k` 20、`presence_penalty` 0.0/1.5、
+  非思考 `temperature` 0.7，且**只对调用方没传的字段生效**（`SamplingInputs.specified`）。
+- **隐藏的全局依赖**：`to_sampling_params` 原先无条件读 `_vendor_state`，而它由模块级
+  `ACTIVE_PROFILE` 的闸门产生；传一个非激活的 policy 时会用错状态。现在只要
+  `ACTIVE_PROFILE is not policy` 就用传入的 policy 重新推导。
+
+仍未做：**服务层新逻辑没有单测**（提前停止、终止块补发、`functions` 旧形状、
+去开头换行、`finish_reason` 覆盖）——这些只能端到端验证，补单元测试需要先把
+async 生成器里的逻辑抽成纯函数，留作后续。
 
 ## 9. 遗留
 

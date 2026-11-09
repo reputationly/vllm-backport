@@ -31,9 +31,6 @@ from vllm.entrypoints.generate.base.serving import (
     clamp_prompt_logprobs,
     format_token_id_placeholder,
 )
-from vllm.entrypoints.openai.chat_completion.sampling_policy import (
-    set_active_profile,
-)
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionLogProb,
     ChatCompletionLogProbs,
@@ -48,6 +45,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 )
 from vllm.entrypoints.openai.chat_completion.sampling_policy import (
     policy_for,
+    set_active_profile,
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.engine.protocol import (
@@ -181,14 +179,13 @@ class OpenAIServingChat(GenerateBaseServing):
         # One model per process, so the request gate can read the profile from
         # module state without threading it through pydantic validation.
         set_active_profile(self.sampling_policy)
-        if self.sampling_policy is not None:
-            # The gate enforces each family's stop-string rule; pydantic still
-            # applies VLLM_MAX_STOP_STRINGS afterwards, and it defaults to 4.
-            if envs.VLLM_MAX_STOP_STRINGS < 64:
-                raise ValueError(
-                    "VLLM_MAX_STOP_STRINGS must be >= 64 when serving a model "
-                    f"with a vendor API profile (got {envs.VLLM_MAX_STOP_STRINGS})"
-                )
+        # The gate enforces each family's stop-string rule; pydantic still
+        # applies VLLM_MAX_STOP_STRINGS afterwards, and it defaults to 4.
+        if self.sampling_policy is not None and envs.VLLM_MAX_STOP_STRINGS < 64:
+            raise ValueError(
+                "VLLM_MAX_STOP_STRINGS must be >= 64 when serving a model "
+                f"with a vendor API profile (got {envs.VLLM_MAX_STOP_STRINGS})"
+            )
         mc = self.model_config
         self.override_max_tokens = (
             self.default_sampling_params.get("max_tokens")
@@ -715,8 +712,14 @@ class OpenAIServingChat(GenerateBaseServing):
                         # The template emits a blank line right after the
                         # thinking block; the hosted API starts the answer with
                         # the first real character.
-                        delta_message.content = delta_message.content.lstrip("\n")
-                        if not delta_message.content and not delta_message.reasoning:
+                        stripped = delta_message.content.lstrip("\n")
+                        if (
+                            stripped
+                            or delta_message.reasoning
+                            or delta_message.tool_calls
+                        ):
+                            delta_message.content = stripped
+                        else:
                             delta_message = None
                     if (
                         delta_message is not None
@@ -725,6 +728,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     ):
                         content_streamed[i] = True
 
+                    budget_exhausted_here = False
                     if body_limit is not None:
                         delta_ids = as_list(output.token_ids)
                         if delta_ids and not answer_started[i]:
@@ -743,9 +747,12 @@ class OpenAIServingChat(GenerateBaseServing):
                             # ``max_tokens`` caps the answer only (design D2):
                             # stop the engine instead of letting it generate
                             # past the budget and truncating the text later.
+                            # The chunk that reached the limit is still emitted
+                            # and counted; only what the engine produced before
+                            # the abort lands is dropped, below.
                             budget_spent[i] = True
+                            budget_exhausted_here = True
                             await self.engine_client.abort(request_id)
-                            break
 
                     previous_texts[i] += delta_text
 
@@ -837,7 +844,7 @@ class OpenAIServingChat(GenerateBaseServing):
                         # hosted APIs do not special-case a named tool_choice.
                         if tools_streamed[i] and legacy_functions:
                             finish_reason_ = "function_call"
-                        elif tools_streamed[i]:
+                        elif tools_streamed[i] and self.sampling_policy is not None:
                             finish_reason_ = "tool_calls"
                         elif budget_spent[i]:
                             # The engine reports "abort" because we stopped it;
@@ -898,6 +905,29 @@ class OpenAIServingChat(GenerateBaseServing):
 
                     data = chunk.model_dump_json(exclude_unset=True)
                     yield f"data: {data}\n\n"
+
+                    if budget_exhausted_here:
+                        # We decided to stop; close the choice now so anything
+                        # the engine produced before the abort landed is
+                        # dropped instead of appended after the budget.
+                        finish_reason_sent[i] = True
+                        choice_data = ChatCompletionResponseStreamChoice(
+                            index=i,
+                            delta=DeltaMessage(),
+                            logprobs=None,
+                            finish_reason="length",
+                        )
+                        chunk = ChatCompletionStreamResponse(
+                            id=request_id,
+                            object=chunk_object_type,
+                            created=created_time,
+                            choices=[choice_data],
+                            model=model_name,
+                        )
+                        if not include_usage and self.system_fingerprint is not None:
+                            chunk.system_fingerprint = self.system_fingerprint
+                        yield f"data: {chunk.model_dump_json(exclude_unset=True)}\n\n"
+                        break
 
             # once the final token is handled, if stream_options.include_usage
             # is sent, send the usage
@@ -1040,9 +1070,11 @@ class OpenAIServingChat(GenerateBaseServing):
         # sequence and truncating the text afterwards.
         body_limit = getattr(request._vendor_state, "body_limit", None)
         policy = self.sampling_policy
-        if policy is None or not policy.answer_only_max_tokens:
-            body_limit = None
         thinking = getattr(request._vendor_state, "thinking", True)
+        if policy is None or not policy.answer_only_max_tokens or not thinking:
+            # Matches the DELTA switch in ``to_sampling_params``: without
+            # thinking there is no separate answer budget to enforce.
+            body_limit = None
         answer_tokens: dict[int, int] = {}
         answer_started: dict[int, bool] = {}
         budget_spent = False
@@ -1069,7 +1101,9 @@ class OpenAIServingChat(GenerateBaseServing):
                     if not delta_ids:
                         continue
                     if not answer_started.get(i, parser is None or not thinking):
-                        if parser.is_reasoning_end(list(delta_ids)):
+                        if parser is not None and parser.is_reasoning_end(
+                            list(delta_ids)
+                        ):
                             answer_started[i] = True
                             delta_ids = parser.extract_content_ids(list(delta_ids))
                         else:
@@ -1242,16 +1276,18 @@ class OpenAIServingChat(GenerateBaseServing):
             # Every emitted tool call reports finish_reason="tool_calls".
             # The hosted APIs of the models we serve do the same for a named
             # tool_choice, where vLLM would otherwise report "stop".
-            is_finish_reason_tool_calls = auto_tools_called or bool(
-                getattr(message, "tool_calls", None)
+            # Only the profiled families deviate from OpenAI here; a model
+            # without a profile keeps vLLM's own finish_reason.
+            is_finish_reason_tool_calls = self.sampling_policy is not None and (
+                auto_tools_called or bool(getattr(message, "tool_calls", None))
             )
-            if (
-                is_finish_reason_tool_calls
-                and getattr(request._vendor_state, "legacy_functions", False)
+            if is_finish_reason_tool_calls and getattr(
+                request._vendor_state, "legacy_functions", False
             ):
                 # The caller used ``functions``/``function_call``, so answer in
                 # that shape: a single ``function_call`` and the legacy reason.
-                first_call = (message.tool_calls or [None])[0]
+                tool_calls_out = getattr(message, "tool_calls", None) or []
+                first_call = tool_calls_out[0] if tool_calls_out else None
                 if first_call is not None:
                     message.function_call = first_call.function
                 message.tool_calls = []

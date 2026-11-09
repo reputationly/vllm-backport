@@ -101,9 +101,12 @@ The contrived example below implements a custom logits processor which consumes 
     import torch
     from vllm.config import VllmConfig
     from vllm.sampling_params import SamplingParams
-    from vllm.v1.sample.logits_processor import (BatchUpdate,
-                                                LogitsProcessor,
-                                                MoveDirectionality)
+    from vllm.v1.sample.logits_processor import (
+        BatchUpdate,
+        LogitsProcessor,
+        MoveDirectionality,
+    )
+
 
     class DummyLogitsProcessor(LogitsProcessor):
         """Fake logit processor to support unit testing and examples"""
@@ -116,8 +119,9 @@ The contrived example below implements a custom logits processor which consumes 
             if target_token is not None and not isinstance(target_token, int):
                 raise ValueError(f"target_token value {target_token} is not int")
 
-        def __init__(self, vllm_config: "VllmConfig", device: torch.device,
-                    is_pin_memory: bool):
+        def __init__(
+            self, vllm_config: "VllmConfig", device: torch.device, is_pin_memory: bool
+        ):
             self.req_info: dict[int, int] = {}
 
         def is_argmax_invariant(self) -> bool:
@@ -132,10 +136,11 @@ The contrived example below implements a custom logits processor which consumes 
             for index, params, _, _ in batch_update.added:
                 assert params is not None
                 self.validate_params(params)
-                if params.extra_args and (target_token :=
-                                        params.extra_args.get("target_token")):
+                if params.extra_args and (
+                    target_token := params.extra_args.get("target_token")
+                ):
                     self.req_info[index] = target_token
-                else: 
+                else:
                     self.req_info.pop(index, None)
 
             if self.req_info:
@@ -167,11 +172,10 @@ The contrived example below implements a custom logits processor which consumes 
             values_to_keep = logits[rows, cols].clone()
 
             # Mask all but target tokens
-            logits[rows] = float('-inf')
+            logits[rows] = float("-inf")
             logits[rows, cols] = values_to_keep
 
             return logits
-
     ```
 
 In the rest of this document, we will use `DummyLogitsProcessor` as an example of a custom logits processor.
@@ -184,10 +188,8 @@ Although the vLLM engine applies logits processors at batch granularity, some us
 
 ``` python
 RequestLogitsProcessor = Union[
-
     # (output token ids, logits tensor) -> logits tensor
     Callable[[list[int], Tensor], Tensor],
-
     # (prompt token ids, output token ids, logits tensor) -> logits tensor
     Callable[[list[int], list[int], Tensor], Tensor],
 ]
@@ -209,11 +211,12 @@ You can wrap the request-level logits processor by subclassing `AdapterLogitsPro
     ...
 
     from vllm.v1.sample.logits_processor import (
-        AdapterLogitsProcessor, # Wrapper base-class
-        RequestLogitsProcessor, # Request-level logitsproc type annotation
+        AdapterLogitsProcessor,  # Wrapper base-class
+        RequestLogitsProcessor,  # Request-level logitsproc type annotation
     )
 
     ...
+
 
     # Stand-in for your request-level logits processor:
     class DummyPerReqLogitsProcessor:
@@ -234,7 +237,9 @@ You can wrap the request-level logits processor by subclassing `AdapterLogitsPro
             logits[self.target_token] = val_to_keep
             return logits
 
+
     ...
+
 
     # Example of wrapping the request-level logits processor:
     class WrappedPerReqLogitsProcessor(AdapterLogitsProcessor):
@@ -247,9 +252,7 @@ You can wrap the request-level logits processor by subclassing `AdapterLogitsPro
                 "target_token"
             )
             if target_token is not None and not isinstance(target_token, int):
-                raise ValueError(
-                    f"target_token value {target_token} is not int"
-                )
+                raise ValueError(f"target_token value {target_token} is not int")
 
         def is_argmax_invariant(self) -> bool:
             return False
@@ -322,8 +325,10 @@ See examples below:
 
     ``` python
     # Pass in FQCN
-    engine_args = AsyncEngineArgs(model="facebook/opt-125m",
-                                  logits_processors=["your.module.path:DummyLogitsProcessor"])
+    engine_args = AsyncEngineArgs(
+        model="facebook/opt-125m",
+        logits_processors=["your.module.path:DummyLogitsProcessor"],
+    )
     async_llm = AsyncLLM.from_engine_args(engine_args)
     ```
 
@@ -368,9 +373,11 @@ You can pass one or more custom logits processor class objects to the `LLM` and 
     # Define custom logits processor locally
     from vllm.v1.sample.logits_processor import LogitsProcessor
 
+
     class DummyLogitsProcessor(LogitsProcessor):
         # See DummyLogitsProcessor implementation above
         ...
+
 
     # Pass class object to LLM constructor
     llm = LLM(
@@ -379,8 +386,9 @@ You can pass one or more custom logits processor class objects to the `LLM` and 
     )
 
     # Pass class object to AsyncLLM constructor
-    engine_args = AsyncEngineArgs(model="facebook/opt-125m",
-                                  logits_processors=[DummyLogitsProcessor])
+    engine_args = AsyncEngineArgs(
+        model="facebook/opt-125m", logits_processors=[DummyLogitsProcessor]
+    )
     async_llm = AsyncLLM.from_engine_args(engine_args)
     ```
 
@@ -419,19 +427,19 @@ The examples below show how a user would pass a custom argument (`target_token`)
 ??? code "Offline: configure custom logits processor for an `LLM` request"
 
     ``` python
-    outputs_logitproc = llm.generate("your prompt", 
-                                     SamplingParams(...,
-                                        extra_args={"target_token": 67}))
+    outputs_logitproc = llm.generate(
+        "your prompt", SamplingParams(..., extra_args={"target_token": 67})
+    )
     ```
 
 ??? code "Offline: configure custom logits processor for an `AsyncLLM` request"
 
     ``` python
-    async for out in engine.generate(request_id="your request id",
-                                     prompt="your prompt",
-                                     sampling_params=SamplingParams(...,
-                                        extra_args={"target_token": 67})):
-
+    async for out in engine.generate(
+        request_id="your request id",
+        prompt="your prompt",
+        sampling_params=SamplingParams(..., extra_args={"target_token": 67}),
+    ):
         # Process async request outputs
         ...
     ```
