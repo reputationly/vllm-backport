@@ -198,9 +198,35 @@ gpustack 版本 `rep-backport-parity2-custom`。相对生产基础镜像 `f1a14b
    **第一次尝试**，删除失败的实例重新拉起即成功（此时 `nvidia-smi` 已回落到 4 MiB）。
    处置：`DELETE` 失败的 model-instance，让 gpustack 用当前 spec 重新创建；不需要改配置。
    经验：**删实例后先等 20–30 秒再让下一个开始，或失败后直接重建**。
-2. **MaaS 网关令牌失效**：验收脚本用 `sk-Notq…` 调 `https://maas.ovaijisuan.com/v1` 返回
-   `401 无效的令牌 (new_api_error)`，所以本轮**终验改为直连各实例**（`http://10.0.0.x:400xx`），
-   未使用网关。网关侧需要新令牌才能再跑网关级对拍。
+2. **MaaS 网关令牌失效（已恢复，网关级终验已补跑）**：滚动期间令牌返回
+   `401 无效的令牌 (new_api_error)`，当时先用直连实例做了验证；令牌恢复后补跑了网关级对拍，结果见 8.3.3。
+
+### 8.3.3 升级后的网关级终验（2026-11-10 05:30）
+
+经 `https://maas.ovaijisuan.com/v1` 打**自部署渠道名**（`deepseek-v4-1-flash` /
+`qwen3.8-flash-fp8` / `minimax-m3.1-flash`）。
+
+客户 RAG 问句，`max_tokens=2000`，每模型每温度 12 次：
+
+| 模型 | T=1.0 | T=1.8 |
+|---|---|---|
+| `deepseek-v4-1-flash` | 异常 0/12、空 0 | 异常 0/12、空 0 |
+| `qwen3.8-flash-fp8` | 异常 0/12、空 0 | 异常 0/12、空 0 |
+| `minimax-m3.1-flash` | 异常 0/12、空 0 | 异常 0/12、空 0 |
+
+定向行为验证（同一网关）：
+
+| 用例 | 结果 | 结论 |
+|---|---|---|
+| Qwen `max_tokens=32` | `finish=length`，ct=3087 rt=3053，**正文 34** | WP5b 生效（门槛 ≤42） |
+| DeepSeek `thinking.type=enabled` + `reasoning_effort=none` | pt=59 rt=76，reasoning 267 字符 | 修复生效：渲染与采样一致，真的思考了 |
+| DeepSeek `thinking.type=disabled` | pt=33 rt=0 | 非思考路径未受影响 |
+| MiniMax `reasoning_effort=none` | **400** | 与厂商直连一致 |
+
+**网关侧一个遗留问题（非本次改动引入）**：官方对比渠道 `deepseek-v4-1-flash-261017`、
+`deepseek-v4.1-flash-1017`、`MiniMax-M3.1-Flash` 目前都返回
+`503 无可用渠道（distributor）`，所以本轮无法再跑"官方 vs 自部署"的逐参数对拍；
+`Qwen3.8-Flash` 与 `glm-5.3-flash-w4a8` 渠道正常。需要运维把这三个渠道的上游恢复后才能复跑对拍。
 
 ### 8.4 回滚
 
