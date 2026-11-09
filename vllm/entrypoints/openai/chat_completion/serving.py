@@ -495,20 +495,21 @@ class OpenAIServingChat(GenerateBaseServing):
         num_cache_creation_tokens = None
         tools_streamed = [False] * num_choices
         content_streamed = [False] * num_choices
-        answer_tokens = [0] * num_choices
         # Set once the answer-only budget (design D2) has been spent and the
         # engine has been aborted; the terminal chunk then reports "length".
         budget_spent = [False] * num_choices
         body_limit = getattr(request._vendor_state, "body_limit", None)
+        thinking = getattr(request._vendor_state, "thinking", True)
         policy = self.sampling_policy
-        if (
-            policy is None
-            or not policy.answer_only_max_tokens
-            or not getattr(request._vendor_state, "thinking", True)
-        ):
+        if policy is None or not policy.answer_only_max_tokens or not thinking:
             # Matches the DELTA switch in ``to_sampling_params``: without
             # thinking there is no separate answer budget to enforce.
             body_limit = None
+        # Answer tokens are counted by token id, not by decoded text: counting
+        # only non-whitespace content deltas undercounts markdown answers and
+        # lets the engine overshoot the budget.
+        answer_tokens = [0] * num_choices
+        answer_started = [not thinking] * num_choices
 
         previous_texts = [""] * num_choices
 
@@ -716,15 +717,28 @@ class OpenAIServingChat(GenerateBaseServing):
                         and not delta_message.content.isspace()
                     ):
                         content_streamed[i] = True
-                        answer_tokens[i] += len(output.token_ids)
 
-                    if body_limit is not None and answer_tokens[i] >= body_limit:
-                        # ``max_tokens`` caps the answer only (design D2): stop
-                        # the engine instead of letting it generate past the
-                        # budget and truncating the text afterwards.
-                        budget_spent[i] = True
-                        await self.engine_client.abort(request_id)
-                        break
+                    if body_limit is not None:
+                        delta_ids = as_list(output.token_ids)
+                        if delta_ids and not answer_started[i]:
+                            if parser is None or parser.is_reasoning_end(
+                                list(delta_ids)
+                            ):
+                                answer_started[i] = True
+                                if parser is not None:
+                                    delta_ids = parser.extract_content_ids(
+                                        list(delta_ids)
+                                    )
+                            else:
+                                delta_ids = []
+                        answer_tokens[i] += len(delta_ids)
+                        if answer_tokens[i] >= body_limit:
+                            # ``max_tokens`` caps the answer only (design D2):
+                            # stop the engine instead of letting it generate
+                            # past the budget and truncating the text later.
+                            budget_spent[i] = True
+                            await self.engine_client.abort(request_id)
+                            break
 
                     previous_texts[i] += delta_text
 
@@ -878,6 +892,30 @@ class OpenAIServingChat(GenerateBaseServing):
 
             # once the final token is handled, if stream_options.include_usage
             # is sent, send the usage
+            # A request the engine aborted on our behalf may end its output
+            # stream without a terminal chunk. Every choice must still report a
+            # finish_reason, so emit the missing ones here.
+            for i in range(num_choices):
+                if finish_reason_sent[i]:
+                    continue
+                choice_data = ChatCompletionResponseStreamChoice(
+                    index=i,
+                    delta=DeltaMessage(),
+                    logprobs=None,
+                    finish_reason="length" if budget_spent[i] else "stop",
+                )
+                finish_reason_sent[i] = True
+                chunk = ChatCompletionStreamResponse(
+                    id=request_id,
+                    object=chunk_object_type,
+                    created=created_time,
+                    choices=[choice_data],
+                    model=model_name,
+                )
+                if not include_usage and self.system_fingerprint is not None:
+                    chunk.system_fingerprint = self.system_fingerprint
+                yield f"data: {chunk.model_dump_json(exclude_unset=True)}\n\n"
+
             if include_usage:
                 completion_tokens = sum(previous_num_tokens)
                 final_usage = UsageInfo(

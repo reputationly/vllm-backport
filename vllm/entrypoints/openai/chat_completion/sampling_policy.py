@@ -218,6 +218,10 @@ def _deepseek_gate(data: dict[str, Any]) -> dict[str, Any]:
     )
     for key in ("presence_penalty", "frequency_penalty"):
         _require_range(data, key, -2.0, 2.0)
+    for key in ("max_tokens", "max_completion_tokens"):
+        value = data.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value < 1:
+            _reject(f"`{key}` must be at least 1", key, value)
 
     top_logprobs = data.get("top_logprobs")
     if isinstance(top_logprobs, int) and not isinstance(top_logprobs, bool):

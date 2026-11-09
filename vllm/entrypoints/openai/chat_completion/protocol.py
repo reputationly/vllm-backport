@@ -44,7 +44,6 @@ from vllm.entrypoints.openai.chat_completion.sampling_policy import (
     SamplingInputs,
     VendorProfile,
     VendorState,
-    profile_gate_enabled,
     thinking_enabled,
 )
 from vllm.entrypoints.serve.engine.protocol import OpenAIBaseModel, UsageInfo
@@ -548,14 +547,18 @@ class ChatCompletionRequest(OpenAIBaseModel):
         the generic OpenAI validation first.
         """
         profile = vendor.ACTIVE_PROFILE
-        if profile is None or not profile_gate_enabled() or not isinstance(data, dict):
+        if (
+            profile is None
+            or not vendor.profile_gate_enabled()
+            or not isinstance(data, dict)
+        ):
             return handler(data)
         return handler(profile.gate(dict(data)))
 
     @model_validator(mode="after")
     def _derive_vendor_state(self) -> "ChatCompletionRequest":
         profile = vendor.ACTIVE_PROFILE
-        if profile is None or not profile_gate_enabled():
+        if profile is None or not vendor.profile_gate_enabled():
             return self
         raw = dict(self.model_extra or {})
         raw.update(
@@ -643,7 +646,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             reasoning_effort=self.reasoning_effort,
         )
         profile = vendor.ACTIVE_PROFILE
-        if profile is not None and profile_gate_enabled():
+        if profile is not None and vendor.profile_gate_enabled():
             # The hosted API decides thinking on its own; the caller's
             # chat_template_kwargs never reach the template.
             state = self._vendor_state
