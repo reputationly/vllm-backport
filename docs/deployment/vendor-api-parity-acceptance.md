@@ -126,6 +126,14 @@ gpustack 版本名：`rep-backport-parity-custom`（已注册到 vLLM backend �
   `-pause` 占位容器、实例状态停在 `starting` 且不报错（本轮 MiniMax 卡了 22 分钟，
   Qwen/DeepSeek 各报过一次 `Failed to pull image`）。预 pull 后立刻恢复。
   建议把这一步固化到升级流程里。
+- **预 pull 要逐个确认成功**：本轮 `llm07` 静默失败——它的 `systemd-resolved` 两个
+  网卡都是 `Current Scopes: none`、没有上游 DNS，`swr.cn-central-221...` 解析不了，
+  `docker pull` 报 `lookup ... server misbehaving`。这个节点正好是 Qwen 一台实例的
+  主节点，导致那台实例反复加载-退出（每轮约 24 分钟），卡了 1 小时。
+  修法与其他节点一致：写 `/etc/systemd/resolved.conf.d/zz-upstream-dns.conf`
+  （`DNS=100.125.0.25`、`FallbackDNS=223.5.5.5`、`Domains=~.`）后
+  `systemctl restart systemd-resolved`，再 `getent hosts <registry>` 验证。
+  升级前建议在所有节点跑一次 `getent hosts swr.cn-central-221.ovaijisuan.com`。
 
 ### 8.2 必配环境变量
 
