@@ -556,12 +556,13 @@ QWEN3_8 = VendorProfile(
 def _minimax_gate(data: dict[str, Any]) -> dict[str, Any]:
     data = dict(data)
     _drop_stream_options_without_stream(data)
+    # The hosted API accepts top_p=0 (measured 3/3) even though its error text
+    # advertises (0, 1]; only values outside [0, 1] are rejected.
     _require_range(
         data,
         "top_p",
         0.0,
         1.0,
-        low_open=True,
         message="invalid params, param 'top_p' should be in (0,1] (2013)",
     )
     n = data.get("n")
@@ -650,10 +651,11 @@ def _minimax_state(data: Mapping[str, Any]) -> VendorState:
 
 
 def _minimax_sampling(inputs: SamplingInputs) -> SamplingInputs:
+    # top_p is pinned to 0.95, but keep SamplingParams happy for top_p=0 callers.
     return replace(
         inputs,
         temperature=1.0,
-        top_p=0.95,
+        top_p=0.95 if inputs.top_p > 0 else 1e-6,
         top_k=-1,
         min_p=0.0,
         repetition_penalty=1.0,

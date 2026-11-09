@@ -389,8 +389,10 @@ def test_minimax_temperature_ignored(profile):
 
 @MINIMAX
 def test_minimax_top_p_validated_and_pinned(profile):
-    _rejects(profile, "top_p", top_p=0)
+    """top_p=0 is accepted (measured 3/3 on the hosted channel)."""
+    assert _sampling(profile, top_p=0).top_p == pytest.approx(1e-6)
     _rejects(profile, "top_p", top_p=1.5)
+    _rejects(profile, "top_p", top_p=-0.1)
     assert _sampling(profile, top_p=0.5).top_p == 0.95
 
 
