@@ -39,7 +39,7 @@ Each request wraps the engine's `GenerateResponse`(s) together with the caller m
 ??? code
 
     ```python
-    --8 < --"vllm/entrypoints/scale_out/token_in_token_out/protocol.py:derender-chat-request"
+    --8<-- "vllm/entrypoints/scale_out/token_in_token_out/protocol.py:derender-chat-request"
     ```
 
 `/v1/completions/derender`:
@@ -47,7 +47,7 @@ Each request wraps the engine's `GenerateResponse`(s) together with the caller m
 ??? code
 
     ```python
-    --8 < --"vllm/entrypoints/scale_out/token_in_token_out/protocol.py:derender-completion-request"
+    --8<-- "vllm/entrypoints/scale_out/token_in_token_out/protocol.py:derender-completion-request"
     ```
 
 Oversized payloads are rejected with a `400` before any `tokenizer.decode()` or parser runs.

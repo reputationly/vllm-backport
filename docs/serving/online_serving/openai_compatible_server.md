@@ -50,7 +50,6 @@ To call the server, in your preferred text editor, create a script that uses an 
 
     ```python
     from openai import OpenAI
-
     client = OpenAI(
         base_url="http://localhost:8000/v1",
         api_key="token-abc123",
@@ -151,7 +150,7 @@ The following [sampling parameters](../../api/README.md#inference-parameters) ar
 ??? code
 
     ```python
-    --8 < --"vllm/entrypoints/openai/completion/protocol.py:completion-sampling-params"
+    --8<-- "vllm/entrypoints/openai/completion/protocol.py:completion-sampling-params"
     ```
 
 The following extra parameters are supported:
@@ -159,7 +158,7 @@ The following extra parameters are supported:
 ??? code
 
     ```python
-    --8 < --"vllm/entrypoints/openai/completion/protocol.py:completion-extra-params"
+    --8<-- "vllm/entrypoints/openai/completion/protocol.py:completion-extra-params"
     ```
 
 ### Chat API
@@ -182,7 +181,7 @@ The following [sampling parameters](../../api/README.md#inference-parameters) ar
 ??? code
 
     ```python
-    --8 < --"vllm/entrypoints/openai/chat_completion/protocol.py:chat-completion-sampling-params"
+    --8<-- "vllm/entrypoints/openai/chat_completion/protocol.py:chat-completion-sampling-params"
     ```
 
 The following extra parameters are supported:
@@ -190,7 +189,7 @@ The following extra parameters are supported:
 ??? code
 
     ```python
-    --8 < --"vllm/entrypoints/openai/chat_completion/protocol.py:chat-completion-extra-params"
+    --8<-- "vllm/entrypoints/openai/chat_completion/protocol.py:chat-completion-extra-params"
     ```
 
 ### Responses API
@@ -207,7 +206,7 @@ The following extra parameters in the request object are supported:
 ??? code
 
     ```python
-    --8 < --"vllm/entrypoints/openai/responses/protocol.py:responses-extra-params"
+    --8<-- "vllm/entrypoints/openai/responses/protocol.py:responses-extra-params"
     ```
 
 The following extra parameters in the response object are supported:
@@ -215,5 +214,5 @@ The following extra parameters in the response object are supported:
 ??? code
 
     ```python
-    --8 < --"vllm/entrypoints/openai/responses/protocol.py:responses-response-extra-params"
+    --8<-- "vllm/entrypoints/openai/responses/protocol.py:responses-response-extra-params"
     ```

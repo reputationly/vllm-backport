@@ -88,8 +88,8 @@ jina-reranker-v3 is a listwise document reranker model with a novel `last but no
 The following [pooling parameters][vllm.PoolingParams] are supported.
 
 ```python
---8 < --"vllm/pooling_params.py:common-pooling-params"
---8 < --"vllm/pooling_params.py:embed-pooling-params"
+--8<-- "vllm/pooling_params.py:common-pooling-params"
+--8<-- "vllm/pooling_params.py:embed-pooling-params"
 ```
 
 ### `LLM.encode`

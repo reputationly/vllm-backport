@@ -48,9 +48,7 @@ pip install -U "autogen-agentchat" "autogen-ext[openai]"
             },
         )
 
-        messages = [
-            UserMessage(content="Write a very short story about a dragon.", source="user")
-        ]
+        messages = [UserMessage(content="Write a very short story about a dragon.", source="user")]
 
         # Create a stream.
         stream = model_client.create_stream(messages=messages)

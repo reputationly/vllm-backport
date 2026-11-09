@@ -25,8 +25,7 @@ Declare supported languages and capabilities:
     from vllm.config import ModelConfig, SpeechToTextConfig
     from vllm.inputs import PromptType
     from vllm.model_executor.models.interfaces import SupportsTranscription
-
-
+    
     class YourASRModel(nn.Module, SupportsTranscription):
         # Map of ISO 639-1 language codes to language names
         supported_languages: ClassVar[Mapping[str, str]] = {
@@ -34,7 +33,7 @@ Declare supported languages and capabilities:
             "it": "Italian",
             # ... add more as needed
         }
-
+        
         # If your model only supports audio-conditioned generation
         # (no text-only generation), enable this flag.
         supports_transcription_only: ClassVar[bool] = True
@@ -78,7 +77,6 @@ Return a dict containing `multi_modal_data` with the audio, and either a `prompt
     ```python
     from vllm.config.speech_to_text import SpeechToTextParams
 
-
     class YourASRModel(nn.Module, SupportsTranscription):
         ...
 
@@ -114,7 +112,6 @@ Return a dict with separate `encoder_prompt` and `decoder_prompt` entries:
 
     ```python
     from vllm.config.speech_to_text import SpeechToTextParams
-
 
     class YourASRModel(nn.Module, SupportsTranscription):
         ...
@@ -242,12 +239,8 @@ if supports_transcription(model):
 When enabled, the server initializes the transcription and translation handlers:
 
 ```python
-state.openai_serving_transcription = (
-    OpenAIServingTranscription(...) if "transcription" in supported_tasks else None
-)
-state.openai_serving_translation = (
-    OpenAIServingTranslation(...) if "transcription" in supported_tasks else None
-)
+state.openai_serving_transcription = OpenAIServingTranscription(...) if "transcription" in supported_tasks else None
+state.openai_serving_translation = OpenAIServingTranslation(...) if "transcription" in supported_tasks else None
 ```
 
 No extra registration is required beyond having your model class available via the model registry and implementing `SupportsTranscription`.

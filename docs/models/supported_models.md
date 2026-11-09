@@ -38,7 +38,6 @@ Checking if the modeling backend is Transformers is as simple as:
 
 ```python
 from vllm import LLM
-
 llm = LLM(model=...)  # Name or path of your model
 llm.apply_model(lambda model: print(type(model)))
 ```
@@ -98,9 +97,9 @@ To make your model compatible with the Transformers modeling backend:
 <summary>modeling_my_model.py</summary>
 
 ```python
+
 from transformers import PreTrainedModel
 from torch import nn
-
 
 class MyAttention(nn.Module):
     is_causal = False  # Only do this for encoder-only models
@@ -127,11 +126,10 @@ class MyAttention(nn.Module):
         )
         ...
 
-
 # Only do this for mixture-of-experts models
 class MyExperts(nn.ModuleList):
-    def forward(self, hidden_states, top_k_index, top_k_weights): ...
-
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        ...
 
 # Only do this for mixture-of-experts models
 class MySparseMoEBlock(nn.Module):
@@ -145,8 +143,8 @@ class MySparseMoEBlock(nn.Module):
         hidden_states = self.experts(hidden_states, top_k_index, top_k_weights)
         ...
 
-
-class MyModel(PreTrainedModel): ...
+class MyModel(PreTrainedModel):
+    ...
 ```
 
 </details>
@@ -165,8 +163,8 @@ For your model to be compatible with vLLM's tensor parallel and/or pipeline para
 <summary>configuration_my_model.py</summary>
 
 ```python
-from transformers import PretrainedConfig
 
+from transformers import PretrainedConfig
 
 class MyConfig(PretrainedConfig):
     base_model_tp_plan = {

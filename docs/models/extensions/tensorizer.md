@@ -57,9 +57,8 @@ Or, with `LLM()`:
 
 ```python
 from vllm import LLM
-
 llm = LLM(
-    "s3://my-bucket/vllm/facebook/opt-125m/v1",
+    "s3://my-bucket/vllm/facebook/opt-125m/v1", 
     load_format="tensorizer",
     enable_lora=True,
 )
@@ -94,9 +93,8 @@ Or with `LLM()`:
 
 ```python
 from vllm import LLM
-
 llm = LLM(
-    "s3://my-bucket/vllm/facebook/opt-125m/v1",
+    "s3://my-bucket/vllm/facebook/opt-125m/v1", 
     load_format="tensorizer",
     enable_lora=True,
     model_loader_extra_config={"deserialization_kwargs": {"num_readers": 2}},
