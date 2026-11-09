@@ -655,8 +655,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
             state = self._vendor_state
             extra_kwargs.pop("reasoning_effort", None)
             if profile.thinking_style == "deepseek":
+                # The V4.1 renderer treats reasoning_effort="none" as "do not
+                # think", so only forward an effort the caller actually asked
+                # for; otherwise leave it unset and let the renderer pick its
+                # default while still thinking.
                 extra_kwargs["thinking"] = state.thinking
-                extra_kwargs["reasoning_effort"] = state.effort or "none"
+                if state.effort is not None:
+                    extra_kwargs["reasoning_effort"] = state.effort
             elif profile.thinking_style == "qwen":
                 extra_kwargs["enable_thinking"] = state.thinking
                 if state.effort is not None:
