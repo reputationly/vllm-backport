@@ -496,6 +496,19 @@ class OpenAIServingChat(GenerateBaseServing):
         tools_streamed = [False] * num_choices
         content_streamed = [False] * num_choices
         answer_tokens = [0] * num_choices
+        # Set once the answer-only budget (design D2) has been spent and the
+        # engine has been aborted; the terminal chunk then reports "length".
+        budget_spent = [False] * num_choices
+        body_limit = getattr(request._vendor_state, "body_limit", None)
+        policy = self.sampling_policy
+        if (
+            policy is None
+            or not policy.answer_only_max_tokens
+            or not getattr(request._vendor_state, "thinking", True)
+        ):
+            # Matches the DELTA switch in ``to_sampling_params``: without
+            # thinking there is no separate answer budget to enforce.
+            body_limit = None
 
         previous_texts = [""] * num_choices
 
@@ -705,14 +718,11 @@ class OpenAIServingChat(GenerateBaseServing):
                         content_streamed[i] = True
                         answer_tokens[i] += len(output.token_ids)
 
-                    body_limit = getattr(request._vendor_state, "body_limit", None)
-                    if (
-                        body_limit is not None
-                        and answer_tokens[i] >= body_limit
-                    ):
+                    if body_limit is not None and answer_tokens[i] >= body_limit:
                         # ``max_tokens`` caps the answer only (design D2): stop
                         # the engine instead of letting it generate past the
                         # budget and truncating the text afterwards.
+                        budget_spent[i] = True
                         await self.engine_client.abort(request_id)
                         break
 
@@ -806,6 +816,11 @@ class OpenAIServingChat(GenerateBaseServing):
                         # hosted APIs do not special-case a named tool_choice.
                         if tools_streamed[i]:
                             finish_reason_ = "tool_calls"
+                        elif budget_spent[i]:
+                            # The engine reports "abort" because we stopped it;
+                            # the caller asked for a capped answer, so the
+                            # hosted-API reason is "length".
+                            finish_reason_ = "length"
                         else:
                             finish_reason_ = (
                                 output.finish_reason if output.finish_reason else "stop"
@@ -972,11 +987,75 @@ class OpenAIServingChat(GenerateBaseServing):
         created_time = int(time.time())
         final_res: RequestOutput | None = None
 
+        # ``max_tokens`` caps the answer only (design D2). The engine therefore
+        # runs with ``RequestOutputKind.DELTA`` and we stop it as soon as the
+        # answer budget is spent, instead of letting it generate a much longer
+        # sequence and truncating the text afterwards.
+        body_limit = getattr(request._vendor_state, "body_limit", None)
+        policy = self.sampling_policy
+        if policy is None or not policy.answer_only_max_tokens:
+            body_limit = None
+        thinking = getattr(request._vendor_state, "thinking", True)
+        answer_tokens: dict[int, int] = {}
+        answer_started: dict[int, bool] = {}
+        budget_spent = False
+        prompt_logprobs = None
+        last_res: RequestOutput | None = None
+
         try:
             async for res in result_generator:
-                final_res = res
+                if body_limit is None:
+                    final_res = res
+                    continue
+                last_res = res
+                if budget_spent:
+                    # The engine is aborting; drop the tail it still emits.
+                    continue
+                if final_res is None:
+                    final_res = res
+                    prompt_logprobs = res.prompt_logprobs
+                else:
+                    final_res.add(res, aggregate=True)
+                for output in res.outputs:
+                    i = output.index
+                    delta_ids = as_list(output.token_ids)
+                    if not delta_ids:
+                        continue
+                    if not answer_started.get(i, parser is None or not thinking):
+                        if parser.is_reasoning_end(list(delta_ids)):
+                            answer_started[i] = True
+                            delta_ids = parser.extract_content_ids(list(delta_ids))
+                        else:
+                            continue
+                    answer_tokens[i] = answer_tokens.get(i, 0) + len(delta_ids)
+                if any(count >= body_limit for count in answer_tokens.values()):
+                    budget_spent = True
+                    await self.engine_client.abort(request_id)
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
+
+        if body_limit is not None and final_res is not None:
+            # DELTA mode hands prompt logprobs to the first chunk only, and
+            # ``RequestOutput.add`` does not merge the finish-only payloads.
+            final_res.prompt_logprobs = prompt_logprobs
+            if last_res is not None:
+                for output in final_res.outputs:
+                    source = next(
+                        (o for o in last_res.outputs if o.index == output.index),
+                        None,
+                    )
+                    if source is None:
+                        continue
+                    if output.routed_experts is None:
+                        output.routed_experts = source.routed_experts
+                    if output.sampling_mask is None:
+                        output.sampling_mask = source.sampling_mask
+                    if output.spec_decode_metrics is None:
+                        output.spec_decode_metrics = source.spec_decode_metrics
+            if budget_spent:
+                for output in final_res.outputs:
+                    if output.finish_reason is None:
+                        output.finish_reason = "length"
 
         if final_res is None:
             return self.create_error_response(

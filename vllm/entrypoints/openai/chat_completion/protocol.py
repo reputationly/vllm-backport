@@ -782,6 +782,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
         presence_penalty = self.presence_penalty
         frequency_penalty = self.frequency_penalty
         thinking_token_budget = self.thinking_token_budget
+        # Set when ``max_tokens`` caps the answer only: the non-streaming path
+        # then needs per-token deltas to know when the budget is spent.
+        answer_budget = False
         # Apply the model family's hosted sampling semantics (see
         # sampling_policy.py); models without a policy are untouched.
         policy = sampling_policy if envs.VLLM_VENDOR_SAMPLING_POLICY else None
@@ -816,7 +819,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
             # Qwen: ``max_tokens`` caps the answer only, thinking has its own
             # budget (design D2). The engine limit covers both.
-            if policy.answer_only_max_tokens and state.body_limit is not None:
+            if (
+                policy.answer_only_max_tokens
+                and state.body_limit is not None
+                and state.thinking
+            ):
                 budget = (self.model_extra or {}).get("thinking_budget")
                 if budget is None:
                     budget = {
@@ -826,6 +833,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     }.get(state.effort or "", 131072)
                 thinking_token_budget = budget
                 max_tokens = max_tokens + budget
+                answer_budget = True
 
         # Merge server-default stop_token_ids (e.g., model-specific tokens
         # like </call> for gpt-oss) with any request-specified ones
@@ -877,7 +885,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             include_stop_str_in_output=self.include_stop_str_in_output,
             output_kind=(
-                RequestOutputKind.DELTA if self.stream else RequestOutputKind.FINAL_ONLY
+                RequestOutputKind.DELTA
+                if self.stream or answer_budget
+                else RequestOutputKind.FINAL_ONLY
             ),
             stream_interval=self.stream_interval,
             structured_outputs=self.extract_structured_outputs(),
