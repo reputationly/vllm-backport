@@ -68,8 +68,8 @@
 | 模型 | 结果 | 说明 |
 |---|---|---|
 | Qwen3.8-Flash | **50/51** | 唯一差异 `max_completion_tokens=64` 的 `finish_reason`，重复 5 次证明是 64 token 边界的随机性（官方自己一次 `stop` 一次 `length`，我们 5/5 `stop`） |
-| MiniMax-M3.1-Flash | 38/51 → 待复测 | 13 条差异里 4 条是**网关把 4xx 包成 200+空 choices**、1 条是网关吞字段，剩下是随机性；真差异只有 `top_p=0`（官方 3/3 接受，我们 400），已修 |
-| DeepSeek-V4.1-Flash | **未做** | dev 空闲机只有 4 台且被 MiniMax 占用；需再排一次 4 节点 |
+| DeepSeek-V4.1-Flash | **50/51** | 唯一差异 `tools_auto` 的思考长度（官方 rl>0、我们 rl=0），同一 prompt 的随机性 |
+| MiniMax-M3.1-Flash | 38/51，真差异 1 条已修 | 13 条差异里 4 条是**网关把 4xx 包成 200+空 choices**、1 条是网关吞字段，其余是随机性；真差异只有 `top_p=0`（官方 3/3 接受，我们 400），修后端到端复测 3/3 通过 |
 
 网关可比性问题（重要）：MiniMax 渠道对 4xx 请求返回 **HTTP 200 + `choices: []`**，
 Qwen 渠道返回正常 400。所以 MiniMax 的"校验类"行无法经网关判定，只能靠设计文档里
@@ -83,6 +83,7 @@ Qwen 渠道返回正常 400。所以 MiniMax 的"校验类"行无法经网关判
 | Qwen 旧版 `functions`/`function_call` | 200，`message.function_call` + `finish_reason="function_call"` | 字段被丢，模型按 prompt 直接回答 | 闸门转成 `tools`/`tool_choice`，响应转回旧形状（流式也支持） |
 | MiniMax `top_p=0` | 200（3/3） | 400 | 接受，内部钉 1e-6 |
 | DeepSeek `max_tokens=0` | 400 | 200 | 闸门补 `>= 1` |
+| DeepSeek 默认请求**完全不思考** | 每例都有 reasoning | rl=0 全线 | `resolved_template_kwargs` 无条件传 `reasoning_effort="none"`，V4.1 renderer 把 `none` 解释成"不思考"。改为只在调用方真给了 effort 时才传 |
 | `VLLM_VENDOR_API_PROFILE` 开关 | — | 无效（按值导入） | 改 `vendor.profile_gate_enabled()` |
 
 ### B4 / B5 结论
