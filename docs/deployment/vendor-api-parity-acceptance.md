@@ -231,6 +231,17 @@ gpustack 改 `env` 或删实例后会按副本逐个重建，所以整个过程 
 去开头换行）——这些只能端到端验证，补单元测试需要先把
 async 生成器里的逻辑抽成纯函数，留作后续。
 
+### 8.6 从现网镜像（`9497ff2f`）到 master 的逐模型净变化
+
+出包前必须按模型核对，不能笼统说"只有 Qwen 有变化"：
+
+| 模型 | 净变化 | 说明 |
+|---|---|---|
+| `qwen3.8-flash-fp8` | **3 处** | ①正文预算达上限即关闭该 choice，引擎 abort 前的尾巴不再外推、撞上限的 delta 正常计入；②`thinking_budget` 类型校验（原来传字符串在 `max_tokens + budget` 处抛 TypeError → 500）；③非思考缺省 `temperature` 1.0→0.7、`presence_penalty` 0.0→1.5 |
+| `deepseek-v4-1-flash` | **2 处** | ①`thinking.type=enabled` 与 `reasoning_effort="none"` 同传时，现网把 `reasoning_effort="none"` 透给 renderer，V4.1 因此按**不思考**渲染，而采样侧仍按思考处理（温度钉 1.0、top_p 下限 0.95）——新代码以 `thinking.type` 为准，渲染与采样一致；②思考态 `top_p` 不再继承模型 `generation_config`，固定 1.0。经查现网 6 台实例节点（llm10/llm21/llm26/na28/na33/na34）的 `DeepSeek-V4.1-Flash-1017` 目录**都没有** `generation_config.json`，引擎缺省即 1.0，故此条今天不改行为，价值在于去掉"将来换模型目录会静默继承"的隐患 |
+| `minimax-m3.1-flash` | **无** | "always" 分支保留调用方 `chat_template_kwargs` 的改动对它无效——它的闸门早已把这些字段删掉，传进来本来就是空 |
+| `glm-5.3-flash-w4a8` | **无** | 现网跑的是 `whcs-fae/vllm-ascend:glm53-kda`，与本仓库镜像无关 |
+
 ## 9. 遗留
 
 - 现网升级（见 §8）。
