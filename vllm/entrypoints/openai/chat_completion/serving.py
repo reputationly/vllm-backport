@@ -75,6 +75,55 @@ from vllm.utils.serial_utils import numpy2base64
 logger = init_logger(__name__)
 
 
+def _tool_calls_finish_reason(
+    *,
+    profiled: bool,
+    tool_choice: Any,
+    auto_tools_called: bool,
+    has_tool_calls: bool,
+    engine_finish_reason: str | None,
+) -> bool:
+    """Whether the response should report ``finish_reason="tool_calls"``.
+
+    A model with a vendor profile reports it for every emitted tool call. A
+    model without one keeps vLLM's own rule, which is also what the OpenAI
+    clients that gate tool execution on this field expect.
+    """
+    if profiled:
+        return bool(auto_tools_called or has_tool_calls)
+    return bool(
+        auto_tools_called
+        or (
+            tool_choice and tool_choice == "required" and engine_finish_reason == "stop"
+        )
+    )
+
+
+def _stream_finish_reason(
+    *,
+    profiled: bool,
+    legacy_functions: bool,
+    tools_streamed: bool,
+    budget_spent: bool,
+    tool_choice_function_name: str | None,
+    engine_finish_reason: str | None,
+) -> str:
+    """The ``finish_reason`` for a terminal streaming chunk."""
+    if not profiled:
+        if tools_streamed and not tool_choice_function_name:
+            return "tool_calls"
+        return engine_finish_reason or "stop"
+    if tools_streamed and legacy_functions:
+        return "function_call"
+    if tools_streamed:
+        return "tool_calls"
+    if budget_spent:
+        # The engine reports "abort" because we stopped it; the caller asked
+        # for a capped answer, so the hosted-API reason is "length".
+        return "length"
+    return engine_finish_reason or "stop"
+
+
 def _get_mm_token_counts(engine_input: EngineInput) -> dict[str, int]:
     """Sum per-modality placeholder tokens from ``mm_placeholders``.
 
@@ -181,7 +230,11 @@ class OpenAIServingChat(GenerateBaseServing):
         set_active_profile(self.sampling_policy)
         # The gate enforces each family's stop-string rule; pydantic still
         # applies VLLM_MAX_STOP_STRINGS afterwards, and it defaults to 4.
-        if self.sampling_policy is not None and envs.VLLM_MAX_STOP_STRINGS < 64:
+        if (
+            self.sampling_policy is not None
+            and self.sampling_policy.requires_stop_strings
+            and envs.VLLM_MAX_STOP_STRINGS < 64
+        ):
             raise ValueError(
                 "VLLM_MAX_STOP_STRINGS must be >= 64 when serving a model "
                 f"with a vendor API profile (got {envs.VLLM_MAX_STOP_STRINGS})"
@@ -510,6 +563,11 @@ class OpenAIServingChat(GenerateBaseServing):
         legacy_functions = bool(
             getattr(request._vendor_state, "legacy_functions", False)
         )
+        tool_choice_function_name = (
+            request.tool_choice.function.name
+            if isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam)
+            else None
+        )
 
         previous_texts = [""] * num_choices
 
@@ -653,7 +711,9 @@ class OpenAIServingChat(GenerateBaseServing):
                 for output in res.outputs:
                     i = output.index
                     parser = parsers[i]
-                    if finish_reason_sent[i]:
+                    if finish_reason_sent[i] or budget_spent[i]:
+                        # Already closed (the answer budget ran out and the
+                        # terminal chunk went out); drop the engine's tail.
                         continue
 
                     if request.logprobs and (
@@ -839,22 +899,14 @@ class OpenAIServingChat(GenerateBaseServing):
                         self._raise_if_error(output.finish_reason, request_id)
 
                         # Send the finish response for each request.n only once
-                        # In OpenAI's API, when a tool is called, the
-                        # Any streamed tool call reports "tool_calls"; the
-                        # hosted APIs do not special-case a named tool_choice.
-                        if tools_streamed[i] and legacy_functions:
-                            finish_reason_ = "function_call"
-                        elif tools_streamed[i] and self.sampling_policy is not None:
-                            finish_reason_ = "tool_calls"
-                        elif budget_spent[i]:
-                            # The engine reports "abort" because we stopped it;
-                            # the caller asked for a capped answer, so the
-                            # hosted-API reason is "length".
-                            finish_reason_ = "length"
-                        else:
-                            finish_reason_ = (
-                                output.finish_reason if output.finish_reason else "stop"
-                            )
+                        finish_reason_ = _stream_finish_reason(
+                            profiled=self.sampling_policy is not None,
+                            legacy_functions=legacy_functions,
+                            tools_streamed=tools_streamed[i],
+                            budget_spent=budget_spent[i],
+                            tool_choice_function_name=tool_choice_function_name,
+                            engine_finish_reason=output.finish_reason,
+                        )
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=i,
                             delta=delta_message,
@@ -906,7 +958,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     data = chunk.model_dump_json(exclude_unset=True)
                     yield f"data: {data}\n\n"
 
-                    if budget_exhausted_here:
+                    if budget_exhausted_here and not finish_reason_sent[i]:
                         # We decided to stop; close the choice now so anything
                         # the engine produced before the abort landed is
                         # dropped instead of appended after the budget.
@@ -1273,13 +1325,12 @@ class OpenAIServingChat(GenerateBaseServing):
             # metadata cached on the reasoning parser.
             message = self._finalize_response_message(message, parser=parser)
 
-            # Every emitted tool call reports finish_reason="tool_calls".
-            # The hosted APIs of the models we serve do the same for a named
-            # tool_choice, where vLLM would otherwise report "stop".
-            # Only the profiled families deviate from OpenAI here; a model
-            # without a profile keeps vLLM's own finish_reason.
-            is_finish_reason_tool_calls = self.sampling_policy is not None and (
-                auto_tools_called or bool(getattr(message, "tool_calls", None))
+            is_finish_reason_tool_calls = _tool_calls_finish_reason(
+                profiled=self.sampling_policy is not None,
+                tool_choice=request.tool_choice,
+                auto_tools_called=auto_tools_called,
+                has_tool_calls=bool(getattr(message, "tool_calls", None)),
+                engine_finish_reason=output.finish_reason,
             )
             if is_finish_reason_tool_calls and getattr(
                 request._vendor_state, "legacy_functions", False

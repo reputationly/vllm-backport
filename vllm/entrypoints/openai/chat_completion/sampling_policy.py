@@ -89,6 +89,10 @@ class VendorProfile:
     answer_only_max_tokens: bool = False
     #: Qwen: the template emits a blank line after ``</think>``.
     strip_leading_newlines: bool = False
+    #: The family needs ``VLLM_MAX_STOP_STRINGS`` raised so its stop-string
+    #: rule fits through pydantic. GLM-5.3 has no measured request rules yet,
+    #: so it must not inherit that deployment requirement.
+    requires_stop_strings: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +352,7 @@ DEEPSEEK_V4 = VendorProfile(
     gate=_deepseek_gate,
     sampling=_deepseek_sampling,
     state=_deepseek_state,
+    requires_stop_strings=True,
 )
 
 
@@ -579,6 +584,7 @@ QWEN3_8 = VendorProfile(
     state=_qwen_state,
     answer_only_max_tokens=True,
     strip_leading_newlines=True,
+    requires_stop_strings=True,
 )
 
 
@@ -718,6 +724,7 @@ MINIMAX_M3 = VendorProfile(
     gate=_minimax_gate,
     sampling=_minimax_sampling,
     state=_minimax_state,
+    requires_stop_strings=True,
 )
 
 

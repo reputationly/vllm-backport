@@ -216,8 +216,19 @@ gpustack 改 `env` 或删实例后会按副本逐个重建，所以整个过程 
   `ACTIVE_PROFILE` 的闸门产生；传一个非激活的 policy 时会用错状态。现在只要
   `ACTIVE_PROFILE is not policy` 就用传入的 policy 重新推导。
 
-仍未做：**服务层新逻辑没有单测**（提前停止、终止块补发、`functions` 旧形状、
-去开头换行、`finish_reason` 覆盖）——这些只能端到端验证，补单元测试需要先把
+第二轮评审又抓到一个我自己引入的回归，记录在案：
+
+| 问题 | 原因 | 处置 |
+|---|---|---|
+| **没有规则表的模型，工具调用 `finish_reason` 全变成 `stop`** | 上一轮为了把 `tool_calls` 限定在画像模型，直接在判断条件前加了 `self.sampling_policy is not None`，把合并前"无画像也报 `tool_calls`"的行为一起改掉了。很多 OpenAI 客户端靠这个字段决定是否执行工具，等于断掉工具链路 | 把两条判断抽成纯函数 `_tool_calls_finish_reason` / `_stream_finish_reason`：有画像走新语义，无画像**原样恢复合并前逻辑**（非流式 `auto_tools_called or (tool_choice=="required" and finish_reason=="stop")`；流式 `tools_streamed and not tool_choice_function_name`）。新增 `test_vendor_finish_reason.py` 19 例锁住 |
+| Qwen 流式达预算时可能发**两个**结束块 | 撞上限的 delta 若同时带引擎 `finish_reason`，常规结束块已发一次，后面又补发一个 | 补发前判断 `not finish_reason_sent[i]` |
+| Qwen 流式达预算且 `delta_message is None` 时提前 `continue` | 跳过了关闭逻辑，引擎在途的尾巴继续外推 | 逐个 output 处理前加 `if budget_spent[i]: continue`，由循环后的兜底补发 `length` |
+| GLM-5.3 被连带要求 `VLLM_MAX_STOP_STRINGS>=64` 才能启动 | 恢复成完整 `VendorProfile` 后继承了启动检查 | 新增 `requires_stop_strings` 字段，仅 DeepSeek / Qwen / MiniMax 置 True |
+
+设计文档 `vendor-api-parity-design.md` 也已随本轮提交进 master（此前代码注释引用了它，但仓库里没有）。
+
+仍未做：**服务层其余新逻辑没有单测**（提前停止的其余分支、`functions` 旧形状、
+去开头换行）——这些只能端到端验证，补单元测试需要先把
 async 生成器里的逻辑抽成纯函数，留作后续。
 
 ## 9. 遗留
