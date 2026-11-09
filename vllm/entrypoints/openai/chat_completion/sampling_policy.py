@@ -611,7 +611,21 @@ def _minimax_gate(data: dict[str, Any]) -> dict[str, Any]:
     if data.get("max_tokens") == 0:
         _drop(data, "max_tokens")
 
-    if data.get("tool_choice") is not None and data.get("tool_choice") != "auto":
+    # The model always splits reasoning out of the answer, so the vendor
+    # rejects an explicit opt-out (measured 3/3).
+    if data.get("reasoning_split") is False:
+        _reject(
+            'invalid params, model "MiniMax-M3.1-Flash" requires '
+            "reasoning_split=true (2013)",
+            "reasoning_split",
+            False,
+        )
+
+    # ``none`` is honoured (measured 3/3 against the vendor endpoint: no tool
+    # call, a plain answer). Every other value behaves like ``auto``.
+    if data.get("tool_choice") == "none" and data.get("tools"):
+        _drop(data, "tools", "tool_choice")
+    elif data.get("tool_choice") is not None and data.get("tool_choice") != "auto":
         logger.info(
             "vendor-profile[minimax]: rewriting tool_choice=%r to 'auto' "
             "(hosted API only implements auto)",

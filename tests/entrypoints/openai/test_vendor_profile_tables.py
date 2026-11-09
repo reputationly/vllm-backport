@@ -437,8 +437,21 @@ def test_minimax_response_format_ignored(profile):
 
 @MINIMAX
 def test_minimax_tool_choice_rewritten_to_auto(profile):
-    for choice in ("required", "none"):
+    for choice in ("required", {"type": "function", "function": {"name": "get_weather"}}):
         assert _parse(profile, tools=TOOLS, tool_choice=choice).tool_choice == "auto"
+
+
+@MINIMAX
+def test_minimax_tool_choice_none_drops_tools(profile):
+    """``none`` is honoured by the vendor (measured 3/3): answer, no tool call."""
+    req = _parse(profile, tools=TOOLS, tool_choice="none")
+    assert not req.tools
+
+
+@MINIMAX
+def test_minimax_reasoning_split_false_rejected(profile):
+    _rejects(profile, "reasoning_split", reasoning_split=False)
+    assert _parse(profile, reasoning_split=True)
 
 
 @MINIMAX
@@ -464,7 +477,7 @@ def test_minimax_effort_rules(profile):
 @MINIMAX
 @pytest.mark.parametrize(
     "key",
-    ["enable_thinking", "chat_template_kwargs", "reasoning_split", "service_tier"],
+    ["enable_thinking", "chat_template_kwargs", "service_tier"],
 )
 def test_minimax_ignored_fields(profile, key):
     assert _parse(profile, **{key: {"enable_thinking": False}
