@@ -984,9 +984,11 @@ class OpenAIServingChat(GenerateBaseServing):
             # once the final token is handled, if stream_options.include_usage
             # is sent, send the usage
             # A request the engine aborted on our behalf may end its output
-            # stream without a terminal chunk. Every choice must still report a
-            # finish_reason, so emit the missing ones here.
-            for i in range(num_choices):
+            # stream without a terminal chunk, and a profiled family's caller
+            # expects one. Models without a profile keep vLLM's own behaviour:
+            # no synthetic terminal chunk is invented for them.
+            missing = range(num_choices) if self.sampling_policy is not None else ()
+            for i in missing:
                 if finish_reason_sent[i]:
                     continue
                 choice_data = ChatCompletionResponseStreamChoice(
