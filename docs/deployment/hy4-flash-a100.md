@@ -93,10 +93,33 @@ AGREEMENT 16/16 = 100%   IDENTICAL True
 
 这次比对覆盖了：权重加载器、sm80 稀疏 MLA、IndexPool 打分、Engram 查表、LatentMoE、iHC、SWA 层、sink。
 
-### 4.2 服务可用性（dummy 权重 / tiny 配置）
+### 4.2 视觉路径（小规模真实权重）
+同一份 checkpoint + 同一张合成图（"VISION OK 42"），两边贪心 8 token：
+
+```
+REF_TEXT   'erberb})\\開發оси进行判断 otraserb'
+VLLM_TEXT  'erberb})\\開發оси进行判断 otraserb'
+TEXT_IDENTICAL True        PROMPT_TOKENS_IDENTICAL True (140 vs 140)
+```
+
+prompt 140 token 覆盖了图像 patch 展开（含每行换行 token），说明 ViT → 2×2 merge →
+projector → mRoPE → 主干 的整条视觉链路与参考实现一致。
+
+### 4.3 服务可用性（dummy 权重 / tiny 配置）
 `Application startup complete`，`GPU KV cache size: 2,865,707 tokens`，text / chat / image 三种请求均 200。
 
-## 5. 容量规划
+## 5. 上线脚本
+
+`docs/deployment/hy4-flash-a100/` 下：
+
+| 脚本 | 用途 |
+|---|---|
+| `run_tp8.sh` | 2 节点 × 4×A100-40G，TP8，官方 FP8 权重，含全部必需环境变量 |
+| `smoke.py` | 中文 / 数学 / 代码 / 长文捞针 四项接受测试 |
+| `vision_test.py` | 四张带标准答案的合成图（数字 7、5 个红圆、"VISION OK 42"、蓝绿红顺序） |
+| `bench.sh` | TTFT / TPOT / 吞吐基线（c=1、c=8、32K 长输入） |
+
+## 6. 容量规划
 
 | 权重 | 卡上常驻 | 最少卡数 |
 |---|---|---|
@@ -105,7 +128,7 @@ AGREEMENT 16/16 = 100%   IDENTICAL True
 
 KV：只有 12 个稀疏层吃全上下文（约 13.8 KB/token bf16），30 个 SWA 层被 512 窗钉住。
 
-## 6. 未完成
+## 7. 未完成
 
 1. 官方权重端到端（缺 8 卡）；
 2. 视觉 4/4 答案验收（同上）；
@@ -113,7 +136,7 @@ KV：只有 12 个稀疏层吃全上下文（约 13.8 KB/token bf16），30 个 
    `fp8_ds_mla` KV，与 sm80 的 per-tensor fp8 路径冲突，需另立项；
 4. CUDA graph：目前用 `--enforce-eager`；FULL graph 下需把 `record_logical_topk_ready` 换成真 event。
 
-## 7. 可以回馈上游的两条
+## 8. 可以回馈上游的两条
 
 1. `_align_pages_to_mla_rows`：packed 布局 + 行扁平寻址混用时，任何非行宽整数倍的稀疏缓存页面都需要对齐；
 2. `triton_mla_sparse_kernel` 的 `return_lse`：sink 支持不该只有 FlashMLA 一条路。
