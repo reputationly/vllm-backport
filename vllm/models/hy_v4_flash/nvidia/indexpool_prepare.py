@@ -198,7 +198,26 @@ def _write_tails(
     )
 
 
+def _use_triton_prep() -> bool:
+    """Triton prep hangs in-engine on this A100 host; torch is the default."""
+    import os
+
+    return os.environ.get("VLLM_HY4_TRITON_PREP", "0") == "1"
+
+
 def prepare_groups(keys, positions, tail, table, starts, lengths, tokens, ratio):
+    if not _use_triton_prep():
+        from .indexpool_prepare_torch import prepare_groups as _torch_impl
+
+        return _torch_impl(
+            keys, positions, tail, table, starts, lengths, tokens, ratio
+        )
+    return _prepare_groups_triton(
+        keys, positions, tail, table, starts, lengths, tokens, ratio
+    )
+
+
+def _prepare_groups_triton(keys, positions, tail, table, starts, lengths, tokens, ratio):
     batch, device = lengths.numel(), keys.device
     slots = (tokens + batch * (ratio - 1)) // ratio
     prefix = torch.empty(batch, dtype=torch.int32, device=device)
@@ -216,6 +235,26 @@ def prepare_groups(keys, positions, tail, table, starts, lengths, tokens, ratio)
             starts, lengths, prefix, batch, ratio, triton.next_power_of_2(batch)
         )
     if slots:
+        import os as _os
+
+        if _os.environ.get("HY4_KERNEL_DEBUG"):
+            print(
+                "HY4_KERNEL_DEBUG gather_groups",
+                "batch", batch,
+                "tokens", tokens,
+                "slots", slots,
+                "ratio", ratio,
+                "ring", tail.shape[1],
+                "key_row", keys.stride(0),
+                "key_col", keys.stride(1),
+                "pos_plane", positions.stride(0) if positions.ndim == 2 else 0,
+                "pos_token", positions.stride(-1),
+                "ndim2", positions.ndim == 2,
+                "tail_row", tail.stride(1),
+                "table_row", table.stride(0),
+                "dtype", keys.dtype,
+                flush=True,
+            )
         _gather_groups[(slots,)](
             keys,
             positions,
@@ -271,6 +310,14 @@ def prepare_groups(keys, positions, tail, table, starts, lengths, tokens, ratio)
 
 
 def write_tails(keys, positions, tail, table, starts, lengths):
+    if not _use_triton_prep():
+        from .indexpool_prepare_torch import write_tails as _torch_impl
+
+        return _torch_impl(keys, positions, tail, table, starts, lengths)
+    return _write_tails_triton(keys, positions, tail, table, starts, lengths)
+
+
+def _write_tails_triton(keys, positions, tail, table, starts, lengths):
     if lengths.numel():
         _write_tails[(lengths.numel(), tail.shape[1])](
             keys,

@@ -252,8 +252,10 @@ class HYV4FlashConfig(HYV4Config):
                     )
 
     def verify_parallel_config(self, parallel: "ParallelConfig") -> None:
+        # Pipeline parallelism is allowed (TP4xPP2 keeps TP intra-node and removes
+        # the cross-node all-reduce/all-to-all from the critical path); context
+        # parallelism still has to stay off.
         for name in (
-            "pipeline_parallel_size",
             "prefill_context_parallel_size",
             "decode_context_parallel_size",
         ):

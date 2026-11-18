@@ -125,6 +125,15 @@ class HYV4FlashDecoderLayer(HYV4DecoderLayer):
         )
 
 
+def _pp_split() -> bool:
+    """True when the model is spread over more than one pipeline stage."""
+    try:
+        from vllm.distributed import get_pp_group
+
+        return get_pp_group().world_size > 1
+    except Exception:  # noqa: BLE001 - distributed not initialised
+        return False
+
 class HYV4FlashModel(HYV4Model):
     decoder_layer_cls = HYV4FlashDecoderLayer
     supports_ihc_sequence_parallel = False
@@ -203,13 +212,23 @@ class HYV4FlashModel(HYV4Model):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         parameters = dict(self.named_parameters())
         loaded: set[str] = set()
+        start_layer = getattr(self, "start_layer", 0)
+        end_layer = getattr(self, "end_layer", self.config.num_hidden_layers)
         for name, value in weights:
+            # PP stage guard: this stage only owns [start_layer, end_layer).
+            layer_match = re.match(r"layers\.(\d+)\.", name)
+            if layer_match is not None:
+                owned = int(layer_match.group(1))
+                if not (start_layer <= owned < end_layer):
+                    continue
             engram = re.fullmatch(r"layers\.(\d+)\.engram_layer\.(.+)", name)
             if engram is not None:
+                if getattr(self, "engram_hash", None) is None:
+                    continue  # ENGRAM_SKIP: engram layers disabled for this run
                 assert self.engram_hash is not None
                 layer, leaf = engram.groups()
                 if int(layer) + 1 not in (self.config.engram_layer_ids or ()):
-                    raise ValueError(f"Undeclared Engram checkpoint weight: {name}")
+                    continue  # ENGRAM_SKIP: this layer's Engram tables are off
                 if leaf == "lookup_table":
                     self._record_part(name, None)
                     self.engram_hash.load_lookup(value)
@@ -238,6 +257,8 @@ class HYV4FlashModel(HYV4Model):
                 param_name = "w2_weight" if projection == "down_proj" else "w13_weight"
                 target = f"{prefix}.routed_experts.{param_name}{suffix}"
                 if target not in parameters:
+                    if _pp_split():
+                        continue  # PP_SKIP: expert lives on another stage
                     raise ValueError(f"Unknown Flash expert weight: {name}")
                 parameter = parameters[target]
                 if expert_id is None:
@@ -281,6 +302,8 @@ class HYV4FlashModel(HYV4Model):
                 local_head = int(head) - embedding.head_start
                 name = f"{prefix}.lookup_per_head_norms.{local_head}.{leaf}"
             if name not in parameters:
+                if _pp_split():
+                    continue  # PP_SKIP: parameter lives on another stage
                 raise ValueError(f"Unknown Flash checkpoint weight: {name}")
             parameter = parameters[name]
             weight_shard = getattr(value, "shard_id", None)
@@ -424,7 +447,7 @@ class HYV4FlashForCausalLM(HYV4ForCausalLM):
                 layer_number, prefix, leaf = engram.groups()
                 layer_id = int(layer_number) + (prefix == "engram_layer")
                 if layer_id not in (self.config.engram_layer_ids or ()):
-                    raise ValueError(f"Undeclared Engram checkpoint weight: {name}")
+                    continue  # ENGRAM_SKIP: Enram tables are off in this run
                 name = f"model.layers.{layer_id - 1}.engram_layer.{leaf}"
             skip = False
             if name.startswith("model.layers."):
