@@ -186,3 +186,8 @@ def maybe_disable_graph_partition(current_backend: str) -> dict[str, bool]:
         return {"graph_partition": False}
     else:
         return {}
+
+
+def storage_view(tensor):
+    """Fork shim for upstream storage_view: flat same-dtype view."""
+    return tensor.view(-1)

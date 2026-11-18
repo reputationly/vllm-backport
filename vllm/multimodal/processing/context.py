@@ -391,6 +391,32 @@ class BaseProcessingInfo:
         """
         return self.ctx.get_hf_processor(**kwargs)
 
+    def _merge_and_resolve_mm_processor_kwargs(
+        self,
+        mm_kwargs,
+    ) -> dict:
+        """Merge configured and request `mm_processor_kwargs`.
+
+        Fork shim: upstream delegates to a `ProcessingInfoContext` helper.
+        Scoped keys (`images_kwargs`, `videos_kwargs`, ...) are carried through
+        unchanged; request values win over configured ones.
+        """
+        configured = {}
+        ctx = getattr(self, "ctx", None)
+        model_config = getattr(ctx, "model_config", None)
+        mm_config = getattr(model_config, "multimodal_config", None)
+        if mm_config is not None:
+            configured = dict(getattr(mm_config, "mm_processor_kwargs", None) or {})
+        merged = dict(configured)
+        for key, value in (mm_kwargs or {}).items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                inner = dict(merged[key])
+                inner.update(value)
+                merged[key] = inner
+            else:
+                merged[key] = value
+        return merged
+
     def get_default_tok_params(self) -> TokenizeParams:
         """Construct the default parameters for tokenization."""
         from vllm.renderers import TokenizeParams

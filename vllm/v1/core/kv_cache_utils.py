@@ -2197,6 +2197,39 @@ def _largest_divisor_at_most(value: int, limit: int) -> int:
     return 1
 
 
+def _align_pages_to_mla_rows(kv_cache_spec):
+    """Round cache pages up so a packed block keeps MLA rows addressable.
+
+    In the block-outermost layout one physical block is the concatenation of
+    every layer's page, while the sparse-MLA kernels walk their own cache as flat
+    ``kv_lora_rank + qk_rope`` rows (``flat_kv_row_view`` asserts the block stride
+    is a whole number of rows). Ratio-compressed IndexPool pages and the tail ring
+    are not row-sized, so align them here, once, instead of at every construction
+    site.
+    """
+    row_bytes = 0
+    for spec in kv_cache_spec.values():
+        block = getattr(spec, "block_size", 0) or 1
+        row_bytes = max(row_bytes, spec.page_size_bytes // block)
+    if row_bytes <= 1:
+        return kv_cache_spec
+    out = {}
+    for name, spec in kv_cache_spec.items():
+        page = spec.page_size_bytes
+        if page % row_bytes:
+            padded = ((page + row_bytes - 1) // row_bytes) * row_bytes
+            spec = replace(spec, page_size_padded=padded)
+            logger.info(
+                "KV page alignment: %s page %d -> %d bytes (row %d)",
+                name,
+                page,
+                padded,
+                row_bytes,
+            )
+        out[name] = spec
+    return out
+
+
 def get_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -2211,6 +2244,7 @@ def get_kv_cache_groups(
     Returns:
         The generated KVCacheGroups
     """
+    kv_cache_spec = _align_pages_to_mla_rows(kv_cache_spec)
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         unify_hybrid_kv_cache_specs(kv_cache_spec)
 

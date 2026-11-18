@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from __future__ import annotations
+from enum import StrEnum
 
 import copy
 from collections import Counter
@@ -1413,3 +1414,9 @@ class KVCacheConfig:
         bytes to NaN/Inf. Uniform-precision caches skip zeroing.
         """
         return self.has_mamba_layers or self.has_mixed_precision_kv_cache
+
+
+# ---- grafted from upstream PR #68296 (v1/kv_cache_interface.py) ----
+class SparseCacheRole(StrEnum):
+    SPARSE = "sparse"
+    INDEXER = "indexer"

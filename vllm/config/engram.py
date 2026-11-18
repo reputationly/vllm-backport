@@ -21,6 +21,8 @@ _ENGRAM_LAYER_FIELDS = {
     "Qwen4ExpForCausalLM": "ple_layer_ids",
     "Qwen4ExpForConditionalGeneration": "ple_layer_ids",
     "DeepseekV41ForCausalLM": "engram_layer_ids",
+    "HYV4FlashForCausalLM": "engram_layer_ids",
+    "HYV4FlashVLForConditionalGeneration": "engram_layer_ids",
 }
 
 
@@ -44,6 +46,12 @@ class EngramConfig:
     An explicit value takes precedence over the legacy environment variable.
     For DeepSeek V4.1 each rank offloads its assigned hash heads, so host
     table storage and lookup traffic scale with the heads assigned to it."""
+
+    disk_offload: bool = False
+    """Keep the tables on disk; rejected by HYV4 Flash's lookup path."""
+
+    dp_shared_memory: bool = False
+    """Share one table across DP replicas through host memory."""
 
     embedding_across_dp: bool = False
     """Shard embeddings across TP and all DP ranks when enabled.

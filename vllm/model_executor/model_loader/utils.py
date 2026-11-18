@@ -1,3 +1,4 @@
+from vllm.config import replace
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Utilities for selecting and loading models."""
@@ -13,6 +14,7 @@ from typing_extensions import assert_never
 
 import vllm.envs as envs
 from vllm.config import ModelConfig, VllmConfig, set_current_vllm_config
+from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import is_deferred_attention_layer
 from vllm.model_executor.layers.hpc import HpcModule
@@ -316,3 +318,43 @@ def configure_quant_config(
             quant_config.apply_vllm_mapper(hf_to_vllm_mapper.get_rename_mapper())
         if packed_mapping is not None:
             quant_config.packed_modules_mapping = packed_mapping
+
+
+def is_draft_model_cacheable(*args, **kwargs):
+    """Lazy wrapper: the real helper lives in weight_cache, which imports back
+    into this loader package (circular at module scope)."""
+    from vllm.model_executor.model_loader.weight_cache.utils import (
+        is_draft_model_cacheable as _impl,
+    )
+
+    return _impl(*args, **kwargs)
+
+# ---- grafted from upstream PR #68296 (model_executor/model_loader/utils.py) ----
+def get_draft_load_config(vllm_config: VllmConfig) -> LoadConfig:
+    """Get load config for the speculative draft model."""
+    speculative_config = vllm_config.speculative_config
+    if (
+        speculative_config is not None
+        and speculative_config.draft_load_config is not None
+    ):
+        return speculative_config.draft_load_config
+    load_config = vllm_config.load_config
+    if load_config is not None and load_config.load_format not in (
+        "ipc_cache",
+        "peer_cache",
+    ):
+        return load_config
+    kwargs = (
+        # Route the draft to the daemon's draft group.
+        {
+            "model_loader_extra_config": {
+                **load_config.model_loader_extra_config,
+                "is_draft": True,
+            }
+        }
+        if is_draft_model_cacheable(speculative_config)
+        # No daemon draft group for this method; load from disk instead of
+        # hitting the target daemon with a mismatching fingerprint.
+        else {"load_format": "auto", "model_loader_extra_config": {}}
+    )
+    return replace(load_config, **kwargs)

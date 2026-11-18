@@ -190,6 +190,9 @@ def _sparse_mla_kernel_final(
     indices_ptr,
     fp8_lut_ptr,
     out_ptr,
+    lse_ptr,
+    stride_lse_token,
+    stride_lse_head,
     seq_kv,
     h_q,
     stride_q_token,
@@ -210,6 +213,8 @@ def _sparse_mla_kernel_final(
     BLOCK_DPE: tl.constexpr,
     IS_FP8_KV: tl.constexpr,
     KV_SCALE: tl.constexpr,
+    LOGE2: tl.constexpr,
+    HAS_LSE: tl.constexpr,
 ):
     """Single-pass fast path: full topk, write final bf16 output directly."""
     cur_q = tl.program_id(0)
@@ -220,7 +225,7 @@ def _sparse_mla_kernel_final(
     cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
     mask_h = (cur_head < (cur_head_id + 1) * VALID_BLOCK_H) & (cur_head < h_q)
 
-    acc, _, e_sum = _sparse_mla_compute_tile(
+    acc, e_max, e_sum = _sparse_mla_compute_tile(
         q_buffer,
         k_buffer,
         indices_ptr,
@@ -259,6 +264,12 @@ def _sparse_mla_kernel_final(
         (acc / e_sum_safe[:, None]).to(tl.bfloat16),
         mask=mask_h[:, None],
     )
+    if HAS_LSE:
+        tl.store(
+            lse_ptr + cur_q * stride_lse_token + cur_head * stride_lse_head,
+            (e_max + tl.log2(e_sum_safe)) * LOGE2,
+            mask=mask_h,
+        )
 
 
 @triton.autotune(
@@ -370,6 +381,9 @@ def _sparse_mla_kernel_split(
 def _sparse_mla_merge_kernel(
     mid_out_ptr,
     out_ptr,
+    lse_ptr,
+    stride_lse_token,
+    stride_lse_head,
     h_q,
     stride_mid_token,
     stride_mid_head,
@@ -381,6 +395,7 @@ def _sparse_mla_merge_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     BLOCK_DV_TILE: tl.constexpr,
+    HAS_LSE: tl.constexpr,
 ):
     """Stage 2: N-way online-softmax merge of per-split `(out, lse)` tiles.
 
@@ -439,6 +454,12 @@ def _sparse_mla_merge_kernel(
         (acc / e_sum_safe[:, None]).to(tl.bfloat16),
         mask=mask_h[:, None] & mask_dv[None, :],
     )
+    if HAS_LSE and cur_dv_tile == 0:
+        tl.store(
+            lse_ptr + cur_q * stride_lse_token + cur_head * stride_lse_head,
+            e_max + tl.log(e_sum_safe),
+            mask=mask_h,
+        )
 
 
 @functools.lru_cache(maxsize=256)
@@ -469,7 +490,8 @@ def triton_mla_sparse_attention(
     num_kv_splits: int | None = None,
     sm_count: int | None = None,
     kv_scale: float = 1.0,
-) -> torch.Tensor:
+    return_lse: bool = False,
+):
     """Sparse MLA attention over topk indices.
 
     Args:
@@ -527,6 +549,13 @@ def triton_mla_sparse_attention(
         device=q.device,
     )
 
+    if return_lse:
+        lse = torch.empty(
+            (num_tokens, num_heads_q), dtype=torch.float32, device=q.device
+        )
+    else:
+        lse = torch.empty((1, 1), dtype=torch.float32, device=q.device)
+
     if num_kv_splits == 1:
         _sparse_mla_kernel_final[(num_tokens, num_head_groups)](
             q_buffer=q,
@@ -534,6 +563,9 @@ def triton_mla_sparse_attention(
             indices_ptr=indices,
             fp8_lut_ptr=fp8_lut,
             out_ptr=out,
+            lse_ptr=lse,
+            stride_lse_token=lse.stride(0),
+            stride_lse_head=lse.stride(1),
             seq_kv=kv.shape[0],
             h_q=num_heads_q,
             stride_q_token=q.stride(0),
@@ -553,8 +585,10 @@ def triton_mla_sparse_attention(
             BLOCK_DPE=block_dpe,
             IS_FP8_KV=is_fp8_kv,
             KV_SCALE=kv_scale,
+            LOGE2=LOGE2,
+            HAS_LSE=return_lse,
         )
-        return out
+        return (out, lse) if return_lse else out
 
     # Split-KV: partial fp32 output + LSE per (token, head, split).
     mid_out = torch.empty(
@@ -595,6 +629,9 @@ def triton_mla_sparse_attention(
     _sparse_mla_merge_kernel[(num_tokens, num_heads_q, _NUM_MERGE_DV_TILES)](
         mid_out_ptr=mid_out,
         out_ptr=out,
+        lse_ptr=lse,
+        stride_lse_token=lse.stride(0),
+        stride_lse_head=lse.stride(1),
         h_q=num_heads_q,
         stride_mid_token=mid_out.stride(0),
         stride_mid_head=mid_out.stride(1),
@@ -607,5 +644,6 @@ def triton_mla_sparse_attention(
         BLOCK_DV=_BLOCK_DV,
         BLOCK_DV_TILE=_MERGE_BLOCK_DV_TILE,
         num_warps=2,
+        HAS_LSE=return_lse,
     )
-    return out
+    return (out, lse) if return_lse else out

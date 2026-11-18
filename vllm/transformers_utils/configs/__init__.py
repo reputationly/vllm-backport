@@ -49,6 +49,9 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "Glm5NextVisionConfig": "vllm.transformers_utils.configs.glm5_next",
     "HYV3Config": "vllm.transformers_utils.configs.hy_v3",
     "HYV4Config": "vllm.transformers_utils.configs.hy_v4",
+    "HYV4FlashConfig": "vllm.models.hy_v4_flash.configs",
+    "HYV4FlashVLConfig": "vllm.models.hy_v4_flash.configs",
+    "HYV4VLConfig": "vllm.transformers_utils.configs.hy_v4",
     "HyperCLOVAXConfig": "vllm.transformers_utils.configs.hyperclovax",
     "IsaacConfig": "vllm.transformers_utils.configs.isaac",
     # RWConfig is for the original tiiuae/falcon-40b(-instruct) and

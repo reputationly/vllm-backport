@@ -1,3 +1,10 @@
+from functools import partial
+from torch import nn
+from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.quant_utils import get_and_maybe_dequant_weights
+from vllm.model_executor.utils import storage_view
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
@@ -1457,3 +1464,92 @@ class SparseAttnIndexer(CustomOp):
                 )
 
         return topk_indices_buffer
+
+
+def bf16_linear(build, quant_config):
+    """Fork shim for upstream's DequantLinear helper (module not ported here).
+
+    Keep the freshly built layer when it is unquantized, otherwise rebuild it
+    without quantization so the indexer always runs in BF16.
+    """
+    from vllm.model_executor.layers.quantization.base_config import (
+        UnquantizedLinearMethod,
+    )
+
+    layer = build(quant_config=quant_config)
+    if isinstance(getattr(layer, "quant_method", None), UnquantizedLinearMethod):
+        return layer
+    return build(quant_config=None)
+
+# ---- grafted from upstream PR #68296 (model_executor/layers/sparse_attn_indexer.py) ----
+def init_indexer_wk_weights_proj(
+    indexer: nn.Module,
+    hidden_size: int,
+    quant_config: QuantizationConfig | None,
+    prefix: str,
+) -> None:
+    """Build the indexer's checkpoint layers `wk` (BF16, or FP8 as the
+    checkpoint stores it and run in BF16: `bf16_linear`) and
+    `weights_proj` (BF16), and `wk_weights_proj`, the BF16 linear that runs
+    both as one GEMM. Its weight is not a parameter: it holds `wk` and
+    `weights_proj`'s rows and is refilled after every load and every in-place
+    reload of the runtime weights (`fuse_indexer_wk_weights_proj` from the
+    indexer's post-load hook)."""
+    # wk stays exact (e.g. under online quantization): the fused GEMM is BF16
+    indexer.wk = bf16_linear(
+        partial(
+            ReplicatedLinear,
+            hidden_size,
+            indexer.head_dim,
+            bias=False,
+            prefix=f"{prefix}.wk",
+        ),
+        quant_config,
+    )
+    indexer.refresh_derived_weights = indexer.process_weights_after_loading
+    indexer.weights_proj = ReplicatedLinear(
+        hidden_size, indexer.n_head, bias=False, prefix=f"{prefix}.weights_proj"
+    )
+    fused = MergedColumnParallelLinear(
+        hidden_size,
+        [indexer.head_dim, indexer.n_head],
+        bias=False,
+        disable_tp=True,
+        prefix=f"{prefix}.wk_weights_proj",
+    )
+    weight = fused.weight.data
+    del fused.weight
+    fused.weight = weight  # a plain attribute: loaders and reloads skip it
+    indexer.wk_weights_proj = fused
+    # wk and weights_proj own no storage: their weights are views of the fused
+    # one. weights_proj's is its rows after wk's. wk's starts at offset 0 in
+    # the dtype it loads: FP8 bytes occupy the first half of wk's rows until
+    # post-load processing dequantizes them (through a temporary) into those
+    # rows; a direct reload views them back to FP8 at the same address.
+    indexer.weights_proj.weight.data = weight[indexer.head_dim :]
+    wk_weight = indexer.wk.weight
+    indexer.wk.weight.data = storage_view(
+        weight.untyped_storage(),
+        0,
+        wk_weight.shape,
+        wk_weight.stride(),
+        wk_weight.dtype,
+    )
+
+
+# ---- grafted from upstream PR #68296 (model_executor/layers/sparse_attn_indexer.py) ----
+def fuse_indexer_wk_weights_proj(indexer: nn.Module) -> None:
+    """Fill the fused BF16 `wk_weights_proj` weight in place (captured CUDA
+    graphs keep its address) from `wk` and `weights_proj`, copying only a
+    part that is not already a view of its rows (e.g. dots3's own
+    `weights_proj`)."""
+    proj = indexer.wk_weights_proj
+    if proj.weight.is_meta:  # weight cache IPC load: only parameters arrive
+        proj.weight = torch.empty_like(proj.weight, device=indexer.wk.weight.device)
+    row = 0
+    for layer in (indexer.wk, indexer.weights_proj):
+        part = get_and_maybe_dequant_weights(layer, out_dtype=proj.weight.dtype)
+        rows = proj.weight[row : row + part.shape[0]]
+        row += part.shape[0]
+        if part.data_ptr() != rows.data_ptr() or part.stride() != rows.stride():
+            rows.copy_(part)

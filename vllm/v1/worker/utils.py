@@ -1,3 +1,4 @@
+from dataclasses import replace
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
@@ -805,3 +806,17 @@ class EncoderTimingStats:
             "encoder_forward_secs": self.encoder_forward_secs,
             "num_encoder_calls": self.num_encoder_calls,
         }
+
+
+# ---- grafted from upstream PR #68296 (v1/worker/utils.py) ----
+def customize_attention_spec(
+    backend: type[AttentionBackend], spec: AttentionSpec, layer_name: str
+) -> AttentionSpec:
+    """The backend's spec. Blocks larger than every kernel block size a backend
+    takes are split into kernel blocks, which packed blocks must keep whole."""
+    spec = backend.customize_spec(spec)
+    sizes = backend.get_supported_kernel_block_sizes_for_layers(spec, [layer_name])
+    fixed_sizes = [s for s in sizes if isinstance(s, int)]
+    if spec.block_stride_alignment is None and sizes and fixed_sizes == sizes:
+        spec = replace(spec, block_stride_alignment=MultipleOf(max(fixed_sizes)))
+    return spec

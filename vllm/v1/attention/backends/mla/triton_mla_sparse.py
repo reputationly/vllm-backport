@@ -79,6 +79,15 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
             self._sm_count = num_compute_units(self.topk_indices_buffer.device.index)
         self._warmup_autotune()
 
+    def record_logical_topk_ready(self) -> None:
+        """Mark the shared top-k buffer as filled for this step.
+
+        Fork shim: upstream stores a CUDA event so FULL cudagraph capture can
+        order attention after the indexer. Stream order already provides that
+        under eager execution, so this is a no-op until FULL graphs are enabled.
+        """
+        return None
+
     def _warmup_autotune(self) -> None:
         """Prime `@triton.autotune` caches at init so the first request
         doesn't pay the inline config-sweep cost."""

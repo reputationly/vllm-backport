@@ -471,8 +471,8 @@ class NgramHashState(nn.Module):
         dead_mask: torch.Tensor,
         lookback_token_ids: torch.Tensor,
         lookback_dead_mask: torch.Tensor,
-        slot_mapping: torch.Tensor | None,
-        block_table: torch.Tensor | None,
+        slot_mapping: torch.Tensor | None = None,
+        block_table: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute [tokens, layers, hash columns] int32 n-gram hashes.
 

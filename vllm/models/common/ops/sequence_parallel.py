@@ -1,3 +1,4 @@
+from functools import lru_cache
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -66,3 +67,18 @@ def sp_padding_mask(
     chunk = is_padding.shape[0] // tp_size
     tp_rank = get_tensor_model_parallel_rank()
     return is_padding[tp_rank * chunk : (tp_rank + 1) * chunk]
+
+
+# ---- grafted from upstream PR #68296 (models/common/ops/sequence_parallel.py) ----
+@lru_cache
+def is_sequence_parallel_active(
+    is_enabled: bool, num_tokens: int, min_tokens: int = 0
+) -> bool:
+    """Whether a batch of `num_tokens` shards the stream along the sequence.
+
+    Below one token per rank the shards are mostly padding, so the batch
+    stays replicated. A model may raise this lower bound with `min_tokens`.
+    """
+    return is_enabled and num_tokens >= max(
+        get_tensor_model_parallel_world_size(), min_tokens
+    )

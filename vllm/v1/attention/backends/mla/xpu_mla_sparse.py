@@ -88,6 +88,9 @@ class XPUMLASparseMetadata(AttentionMetadata):
     block_size: int = 1
     topk_tokens: int = 2048
 
+    # Per-request KV length; HYV4 Flash's Engram path reads it.
+    seq_lens: torch.Tensor | None = None
+
     # The shared MLA layer (`mla_attention.py::forward_impl`) reads these
     # decode/prefill counts unconditionally for every MLA metadata (it asserts
     # `num_decodes`/`num_prefills`/`num_decode_tokens is not None` and uses
@@ -177,6 +180,7 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
             slot_mapping=common_attn_metadata.slot_mapping,
             block_table=common_attn_metadata.block_table_tensor,
             req_id_per_token=req_id_per_token,
+            seq_lens=common_attn_metadata.seq_lens[: common_attn_metadata.num_reqs],
             block_size=self.kv_cache_spec.block_size,
             topk_tokens=self.topk_tokens,
             # Route every token through the sparse MQA path (see the field

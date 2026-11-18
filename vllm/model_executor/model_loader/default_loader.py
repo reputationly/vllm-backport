@@ -445,8 +445,10 @@ class DefaultModelLoader(BaseModelLoader):
             self.track_weights_loading(model, loaded_weights)
 
     def track_weights_loading(
-        self, model: nn.Module, loaded_weights: set[str] | None
+        self, model: nn.Module, loaded_weights: set[str] | None, **kwargs
     ) -> None:
+        # Upstream grew extra keyword hints (e.g. `quantized=`); this fork's
+        # checker does not need them, so tolerate and ignore them.
         weights_to_load = {name for name, _ in model.named_parameters()}
         if loaded_weights is not None:
             # ignore online quantization scales

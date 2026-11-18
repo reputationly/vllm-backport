@@ -134,6 +134,11 @@ _TEXT_GENERATION_MODELS = {
     "HrmTextForCausalLM": ("hrm_text", "HrmTextForCausalLM"),
     "HYV3ForCausalLM": ("hy_v3", "HYV3ForCausalLM"),
     "HYV4ForCausalLM": ("vllm.models.hy_v4", "HYV4ForCausalLM"),
+    "HYV4FlashForCausalLM": ("vllm.models.hy_v4_flash", "HYV4FlashForCausalLM"),
+    "HYV4FlashVLForConditionalGeneration": (
+        "vllm.models.hy_v4_flash",
+        "HYV4FlashVLForConditionalGeneration",
+    ),
     "HCXVisionV2ForCausalLM": ("hyperclovax_vision_v2", "HCXVisionV2ForCausalLM"),
     "HyperCLOVAXForCausalLM": ("hyperclovax", "HyperCLOVAXForCausalLM"),
     "InternLM2ForCausalLM": ("internlm2", "InternLM2ForCausalLM"),

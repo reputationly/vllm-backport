@@ -803,3 +803,47 @@ __all__ = [
     "get_mn_major_tma_aligned_packed_ue8m0_tensor",
     "get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor",
 ]
+
+
+# ---- grafted from upstream PR #68296 (utils/deep_gemm.py) ----
+@functools.cache
+def mqa_logits_use_mx_scales() -> bool:
+    """Whether the MQA logits kernels take only MX-scaled inputs.
+
+    On SM100 they need MXFP8/MXFP4 Q and K with packed UE8M0 scales, and the
+    head weights pick the reduction: FP32 weights reduce in FP32, BF16 weights
+    in BF16 and emit BF16 logits. FP8 indexer K caches then store each
+    token's power-of-two scale as four equal UE8M0 bytes instead of an fp32.
+    """
+    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+        100
+    )
+
+
+# ---- grafted from upstream PR #68296 (utils/deep_gemm.py) ----
+def mqa_logits_mx_inputs(
+    q: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    weights: torch.Tensor,
+    logits_dtype: torch.dtype,
+) -> tuple[torch.Tensor | None, torch.Tensor]:
+    """Adapt indexer Q scales and weights to the SM100 MQA logits kernels.
+
+    FP8 Q folds its per-(token, head) power-of-two scale into `weights`, so
+    it is passed with unit MX scales, which is exact since relu commutes with
+    a positive scale. `weights` are cast to `logits_dtype`, so BF16 logits
+    reduce in BF16 and FP32 logits in FP32. Returns `(q_scale, weights)`
+    unchanged off SM100.
+    """
+    if not mqa_logits_use_mx_scales():
+        return q_scale, weights
+    if q_scale is None:
+        numel = q.numel() // q.shape[-1]
+        bufs = _unit_mx_scales.setdefault(q.device, [])
+        if not bufs or bufs[-1].numel() < numel:
+            size = max(numel, 2 * bufs[-1].numel() if bufs else 0)
+            bufs.append(
+                torch.full((size,), _UNIT_UE8M0_X4, dtype=torch.int32, device=q.device)
+            )
+        q_scale = bufs[-1][:numel].view(q.shape[:-1])
+    return q_scale, weights.to(logits_dtype)
