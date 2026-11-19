@@ -32,7 +32,7 @@ from .indexpool_ops import (
 )
 from vllm.v1.attention.ops.mqa_logits_triton import fp8_paged_mqa_logits_triton
 
-from .indexpool_prepare import prepare_groups, write_tails
+from .indexpool_prepare import prepare_groups, write_tails_argb
 
 
 class FlashCompressedIndexer(nn.Module):
@@ -144,7 +144,7 @@ class FlashCompressedIndexer(nn.Module):
             write_pool(
                 cache, km.block_table, group_owner, groups, group_live, quant, scales
             )
-        write_tails(
+        write_tails_argb(
             keys, positions, tail, tm.block_table, km.query_start_loc, km.seq_lens
         )
         query = self.query_projection(q_c)[0][:tokens].reshape(

@@ -112,10 +112,16 @@ def _step_index_math(starts_raw, lengths_raw, table_raw, positions, tokens, rati
         int(ring),
         int(dim),
     )
-    if _STEP_CACHE["key"] == key:
+    # Under torch.compile the traced call would populate this cache with fake
+    # tensors while keeping the same identity key, so the runtime call would
+    # then read fake values. Compilation also removes the launch overhead this
+    # cache exists to avoid, so it stays off there.
+    compiling = torch.compiler.is_compiling()
+    if not compiling and _STEP_CACHE["key"] == key:
         _note_cache(True)
         return _STEP_CACHE["bundle"]
-    _note_cache(False)
+    if not compiling:
+        _note_cache(False)
 
     starts = starts_raw.reshape(-1).to(torch.int64)
     lengths = lengths_raw.reshape(-1).to(torch.int64)
@@ -186,9 +192,10 @@ def _step_index_math(starts_raw, lengths_raw, table_raw, positions, tokens, rati
         "upper": upper,
         "live_t": live_t,
     }
-    _STEP_CACHE["key"] = key
-    _STEP_CACHE["bundle"] = bundle
-    _STEP_CACHE["pin"] = (starts_raw, lengths_raw, table_raw, positions)
+    if not compiling:
+        _STEP_CACHE["key"] = key
+        _STEP_CACHE["bundle"] = bundle
+        _STEP_CACHE["pin"] = (starts_raw, lengths_raw, table_raw, positions)
     return bundle
 
 

@@ -4,6 +4,8 @@
 
 import torch
 
+from vllm.utils.torch_utils import direct_register_custom_op
+
 from vllm.triton_utils import tl, triton
 
 
@@ -202,6 +204,7 @@ def _use_triton_prep() -> bool:
     """Triton prep hangs in-engine on this A100 host; torch is the default."""
     import os
 
+
     return os.environ.get("VLLM_HY4_TRITON_PREP", "0") == "1"
 
 
@@ -306,6 +309,43 @@ def _prepare_groups_triton(keys, positions, tail, table, starts, lengths, tokens
         logical,
         upper,
         token_live,
+    )
+
+
+def _write_tails_fake(
+    keys: torch.Tensor,
+    positions: torch.Tensor,
+    tail: torch.Tensor,
+    table: torch.Tensor,
+    starts: torch.Tensor,
+    lengths: torch.Tensor,
+) -> None:
+    return None
+
+
+def _write_tails_op(
+    keys: torch.Tensor,
+    positions: torch.Tensor,
+    tail: torch.Tensor,
+    table: torch.Tensor,
+    starts: torch.Tensor,
+    lengths: torch.Tensor,
+) -> None:
+    write_tails(keys, positions, tail, table, starts, lengths)
+
+
+direct_register_custom_op(
+    op_name="hy4_indexpool_write_tails",
+    op_func=_write_tails_op,
+    mutates_args=["tail"],
+    fake_impl=_write_tails_fake,
+)
+
+
+def write_tails_argb(keys, positions, tail, table, starts, lengths) -> None:
+    """Refresh the per-request key ring as an opaque (mutating) custom op."""
+    torch.ops.vllm.hy4_indexpool_write_tails(
+        keys, positions, tail, table, starts, lengths
     )
 
 

@@ -971,3 +971,55 @@ CUDA op 的方式在编译图里不安全。
 
 装饰器已撤回（服务恢复 eager + `FULL_DECODE_ONLY`，视觉 4/4 通过、TPOT 37.4 ms、地板 515 ms）；
 **Engram 的 custom op 包装保留**（对 eager 路径无影响，且是阶段 B 的基础）。
+
+## 30. 阶段 B 实测：又包了 2 个 KV 写入 op，但数值仍错——定位到 attention 段（2026-11-20）
+
+### 30.1 本轮新增的封装
+
+| op | 位置 | mutates_args | 理由 |
+|---|---|---|---|
+| `hy4_indexpool_write_pool` | `indexpool_ops.py` | `cache` | Triton scatter 通过裸指针写 indexer KV，Inductor 的函数式封装看不见副作用 |
+| `hy4_indexpool_write_tails` | `indexpool_prepare.py` | `tail` | 同上（tail ring 写入） |
+
+顺带修了两处编译期问题：
+- custom op 参数**必须有类型注解**（否则 `infer_schema` 报错）；
+- `_STEP_CACHE`（按步 index 数学缓存）在 `torch.compiler.is_compiling()` 时**必须关掉**——
+  否则 trace 阶段会把 fake tensor 塞进缓存，运行期 id 命中后读到假张量。
+
+### 30.2 四次判定实验（都编译成功，服务都能起）
+
+| 实验 | 编译 | 视觉 4/4 | TTFT 地板 |
+|---|---|---|---|
+| A：只包 Engram（PIECEWISE） | ✅ | ❌ 0/4 | **66 ms** |
+| B：再包 write_pool/write_tails + 关缓存（PIECEWISE） | ✅ | ❌ 0/4 | 63–65 ms |
+| C：B + **关闭 Engram**（PIECEWISE） | ✅ | ❌ 0/4 | 62–66 ms |
+| D：B + `FULL_DECODE_ONLY` | ✅ | ❌ 0/4 | 215 ms |
+
+**结论**：数值错误与 Engram 无关、与"图捕获模式"无关——是 `torch.compile` 的**语义问题**。
+
+### 30.3 定位到的下一个（也是最可能的）原因
+
+`models/hy_v4/nvidia/attention.py::_indexer_and_attn` 的 docstring 自己写着：
+
+> "Run the lightning indexer and MLA attention in one **eager segment**. Both read per-batch
+> attention metadata, so **under the breakable cudagraph they must not be captured**."
+
+也就是说这条路径只对 **CUDA graph** 做了保护（`eager_break_during_capture`），对
+**torch.compile 没有任何保护**：indexer 写 KV/top-k 缓冲、MLA attention 读写同一批 KV，
+这些都暴露在 Inductor 的图优化之下，写入与读取可能被重排或被当成"未修改的输入"。
+
+### 30.4 下一步（明确、可执行）
+
+把 `_indexer_and_attn`（连同 indexer 的 `forward`）整体注册成**一个 opaque custom op**
+（`mutates_args=["out"]`，内部完成 indexer→KV 写入→MLA attention 的完整序列），
+使 Inductor 无法跨越它重排。需要注意的实现点：custom op 必须是函数而非方法，
+所以要把 module 状态显式传入（或用 `functools.partial` + 注册时闭包）。
+
+做完这一条再验视觉 4/4；若通过，则"编译 + PIECEWISE"就能以 **63–66 ms 地板**上线
+（对照当前 eager 的 515 ms，7.8×）。
+
+### 30.5 当前状态
+
+装饰器撤回，服务恢复 eager（**视觉 4/4 通过**、TPOT 37.4 ms、地板 515 ms）；
+三个 custom op（Engram lookup、write_pool、write_tails）与缓存编译期关闭逻辑**全部保留**，
+是下一步的直接基础。

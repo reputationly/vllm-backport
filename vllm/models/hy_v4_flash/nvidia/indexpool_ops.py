@@ -3,6 +3,8 @@
 """Coarse IndexPool mathematics, independent of cache allocation."""
 
 import torch
+
+from vllm.utils.torch_utils import direct_register_custom_op
 import torch.nn.functional as F
 
 from vllm.model_executor.layers.rotary_embedding.mrope import apply_interleaved_rope
@@ -124,7 +126,16 @@ def _scatter_rows(
         tl.store(Dst + offset + columns, value, columns < WIDTH)
 
 
-def write_pool(cache, table, owners, groups, active, quant, scales):
+def _write_pool_impl(
+    cache: torch.Tensor,
+    table: torch.Tensor,
+    owners: torch.Tensor,
+    groups: torch.Tensor,
+    active: torch.Tensor,
+    quant: torch.Tensor,
+    scales: torch.Tensor,
+) -> None:
+    """Inner scatter; use `write_pool` (a custom op) from model code."""
     page_size = cache.shape[1]
     columns = (groups // page_size).clamp(0, table.shape[1] - 1)
     base = table[owners, columns].long() * cache.stride(0)
@@ -146,4 +157,36 @@ def write_pool(cache, table, owners, groups, active, quant, scales):
         4,
         4,
         4,
+    )
+
+
+def _write_pool_fake(
+    cache: torch.Tensor,
+    table: torch.Tensor,
+    owners: torch.Tensor,
+    groups: torch.Tensor,
+    active: torch.Tensor,
+    quant: torch.Tensor,
+    scales: torch.Tensor,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="hy4_indexpool_write_pool",
+    op_func=_write_pool_impl,
+    mutates_args=["cache"],
+    fake_impl=_write_pool_fake,
+)
+
+
+def write_pool(cache, table, owners, groups, active, quant, scales):
+    """Scatter pooled indexer keys into the paged KV cache.
+
+    Registered as a custom op so torch.compile keeps it opaque: the Triton
+    scatter writes the cache through raw pointers, which Inductor's functional
+    Triton wrapper cannot see, and mis-orders or elides it otherwise.
+    """
+    torch.ops.vllm.hy4_indexpool_write_pool(
+        cache, table, owners, groups, active, quant, scales
     )
