@@ -271,3 +271,15 @@ Hy4-flash 直连（2×4 A100-40G，TP8+EP，`--enforce-eager`）。同一脚本 
 | TP4×PP2（跨节点只 p2p）+ 图 + 无 EP | `AssertionError: DP adjusted local rank 7 is out of bounds for 4 devices`（mp 后端在 PP 下的 rank 布局限制） |
 
 结论：2 节点请用 `--enforce-eager`（TPOT ≈ 457 ms）；要可用吞吐请走**单机 8 卡**（H100/H200 或 8×A100-80G），那里 capture 与回放都正常。
+
+## 13. 交付验收清单（2026-11-19 最终复验）
+
+| 门 | 证据 | 状态 |
+|---|---|---|
+| (1) dummy 起服务 / 越过 FlashMLA cc 门 / sink | `BOOT OK`；`TRITON_MLA_SPARSE` 绑定；`HYV4 learnable sink enabled` | ✅ |
+| (2) 官方 FP8 权重 + 连贯文本 | 148/148 shard、KV 302,239 token；中文/英文/代码/带思考数学均连贯；同权重 606M A/B 与参考实现 **16/16 = 100%** | ✅ |
+| (3) 视觉 | `vision_test.py` **4/4**（数字 7、5 个圆、读出 "VISION OK 42"、蓝绿红顺序） | ✅ |
+| (4) 基线 + 分支 | TTFT 0.49 s@512、TPOT 456 ms、c=4 聚合 8 tok/s、34.5 GiB/卡；与 Qwen3.8/MiniMax-M3.1/DS-V4.1 对比表（§11）；分支 `hy4-flash-a100` 10 commit 已推送，含 `run_tp8.sh`/`serve_mp_node.sh`/`sweep.py`/`smoke.py`/`vision_test.py` | ✅ |
+
+**已知限制**：2 节点只能 `--enforce-eager`（TPOT 457 ms）；单机上 `FULL_DECODE_ONLY` 实测 15–16 ms（§12.1），
+因此上量建议走单机 8 卡。四门要求的"可行性配置基线"已按此前提给出。
