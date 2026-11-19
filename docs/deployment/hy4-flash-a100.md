@@ -425,3 +425,54 @@ if spec.kv_cache_dtype not in (None, "auto", "bfloat16", "fp8_ds_mla"):
 
 **结论**：DFly2 不是"改个 KV dtype"就能开的开关，需要一次框架级移植；建议放在 TP4×PP2 稳定交付之后再做，
 且优先争取"DFly + PP>1"的组合，否则单独 DFly 的收益会被 PP2 的收益吃掉。
+
+## 18. Chat API 与索引器开销实测（2026-11-19）
+
+### 18.1 Chat API：已接通并验证
+
+`/v1/chat/completions` 现在可用，配置只需两项（chat template 走 checkpoint 自带的
+`chat_template.jinja`，reasoning 拆到 `reasoning_content`）：
+
+```
+--chat-template /root/Models/Hy4-flash-FP8/chat_template.jinja
+--reasoning-parser hy_v4        # reasoning/__init__.py 中已注册
+```
+
+实测（TP4×PP2，全量权重）：
+
+| 用例 | content | reasoning_content |
+|---|---|---|
+| `reasoning_effort=high`："9.11 和 9.9 哪个大" | `9.9` ✅ | 192 字符完整思考过程 ✅ |
+| `reasoning_effort=no_think`："巴黎是哪个国家的首都" | `法国` ✅ | 空 ✅ |
+| 视觉（chat 接口传 image_url）：图中文字 | `HELLO7` ✅ | 空 |
+
+注：**PR 里没有 tool parser**（`entrypoints/openai/tool_parsers` 无 hy_v4 条目），
+所以 `--tool-call-parser` 目前不可用；工具调用格式由 `renderers/hy_v4.py` + 模板负责。
+
+### 18.2 索引器开销：是 launch bound，不是算力 bound
+
+在 idle 节点上按真实 shape 微基准（单卡，`bench_indexer.py`）：
+
+| shape | `prepare_groups`（我们的 torch 版） | `topk(logits, 2048)` |
+|---|---|---|
+| decode tokens=1 | **2.38 ms** | 0.10 ms |
+| decode tokens=6 | **2.38 ms** | 0.10 ms |
+| prefill 2048 | **2.42 ms** | 0.88 ms |
+| prefill 8192 | **2.42 ms** | 2.77 ms |
+
+关键观察：**`prepare_groups` 的耗时与 token 数无关（恒定 ~2.4 ms）** —— 它由 ~30 个
+小算子（每次 launch ~0.08 ms）主导，而不是 FLOPs。
+
+这直接影响"索引器按 TP 分片"的收益判断：
+
+- 每个 stage 有 6 个稀疏层，6 × 2.4 ms ≈ **14 ms/步**，约占我们 38.6 ms TPOT 的 **36%**；
+- 但 **TP 分片只会把 FLOPs 分掉，launch 数量不变**，所以分片对这块开销几乎无效
+  （DeepSeek 侧的 `VLLM_INDEXER_QUERY_SHARD` 省的是它自己重算 `q_quant` 的算力，而我们这里不是算力瓶颈）。
+
+**正确的下一步**（成本低、收益直接）：
+
+1. **按步缓存 index 数学**：`ends/context/req/group/member/source/block` 只依赖
+   `starts/lengths/table`，同一 step 内 6 个稀疏层完全相同 → 每步算一次，per-layer 只留 gather；
+   预估 2.4 ms → ~1.0 ms/层，每步省 ~8 ms（38.6 → ~31 ms）；
+2. 或重试 Triton 版 prep（单 kernel，~0.05 ms），但此前它在引擎进程内会卡在 JIT，需要先解决；
+3. TP 分片留到"索引器变成算力瓶颈"时再做（例如未来支持投机解码、batch 变大之后）。
