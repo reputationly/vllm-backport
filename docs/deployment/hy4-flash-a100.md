@@ -514,3 +514,41 @@ ValueError: Unknown speculative decoding method: dfly
 - 建议顺序：先在 **MRv2 + 当前无投机**的配置下验证 TP4×PP2 是否同样正常（这本身就能带来收益，
   `swa-bounded-replay` 等 MRv2 专享优化也才能用），再叠加 DFly。
 - 保留的 scaffolding（注册层 + dfly 包 + 白名单 + PP 放宽）不改变默认行为，可随时在 MRv2 上继续。
+
+## 20. 自写 HYV4 tool parser（2026-11-19）
+
+PR #68296 只带了 reasoning parser，没有 tool parser，所以 `--tool-call-parser` 一直不可用。
+按 checkpoint 模板里的真实格式补了一个：`vllm/tool_parsers/hy_v4_tool_parser.py`，注册名 **`hy_v4`**。
+
+### 20.1 格式（来自 `chat_template.jinja` 第 14–20 行）
+
+```
+<tool_calls:opensource>
+<tool_call:opensource>{name}<arg_key:opensource>{k1}</arg_key:opensource><arg_value:opensource>{v1}</arg_value:opensource>...</tool_call:opensource>
+</tool_calls:opensource>
+```
+
+即：**不是 JSON**，而是纯文本信封包 key/value 对。解析器把信封内的成对参数还原成 dict 再 `json.dumps`
+（符合 OpenAI `arguments` 是字符串的约定），信封外的文本作为 `content` 保留。
+
+### 20.2 实现要点
+
+- `extract_tool_calls`：正则切 `<tool_call…>` 块 → 名字取到第一个 `<arg_key…>` 之前 → 逐对抽 `arg_key/arg_value`；
+- `extract_tool_calls_streaming`：只在某个 `<tool_call…></tool_call…>` 闭合时整块吐出（不做半截参数猜测），
+  未闭合期间吞掉信封文本、正常文本照常流式；
+- 注册：`vllm/tool_parsers/__init__.py` 的 `_TOOL_PARSERS_TO_REGISTER` 增加 `"hy_v4"`。
+
+### 20.3 启动与实测
+
+```
+--reasoning-parser hy_v4 --enable-auto-tool-choice --tool-call-parser hy_v4
+```
+
+| 用例 | 结果 |
+|---|---|
+| 非流式 + `tools=[get_weather]`，问"北京天气" | `finish_reason=tool_calls`，`get_weather({"city": "北京", "unit": "c"})` ✅ |
+| 流式同一请求 | 收到 tool_call delta，`name=get_weather`，`arguments={"city": "北京"}` ✅ |
+| 视觉 4/4 回归（加了 tool parser 之后） | 4/4 ✅ |
+| reasoning + tools 共存 | ✅（思考照常进 `reasoning_content`） |
+
+（注：工具参数是字符串字典，`unit: "c"` 这类值由模型自己填，不做类型强制转换——与模板约定一致。）
