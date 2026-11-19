@@ -50,8 +50,13 @@ def validate_runtime(vllm_config: VllmConfig) -> None:
     spec = vllm_config.speculative_config
     if spec is not None and spec.method != "dfly":
         raise ValueError("HYV4 Flash supports only DFly speculative decoding")
-    if vllm_config.cache_config.cache_dtype not in ("auto", "bfloat16", "fp8_ds_mla"):
-        raise ValueError("HYV4 Flash requires BF16 or fp8_ds_mla KV storage")
+    if vllm_config.cache_config.cache_dtype not in (
+        "auto",
+        "bfloat16",
+        "fp8",
+        "fp8_ds_mla",
+    ):
+        raise ValueError("HYV4 Flash requires BF16, fp8 or fp8_ds_mla KV storage")
     if config.index_topk % 128 or config.index_topk < config.sliding_window:
         raise ValueError("index_topk must be 128-aligned and cover sliding_window")
     if config.engram_layer_ids and not config.enable_ihc:

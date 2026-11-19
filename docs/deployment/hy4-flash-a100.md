@@ -636,3 +636,27 @@ DFly 草稿模型的某个 MLA 投影输入维是 **1152**，在 **TP4** 下每�
 - MRv2 可用（为将来 `--swa-bounded-replay` 等 MRv2 专享优化铺路）；
 - DFly 的配置层与 6 关修复全部留在分支里，换 checkpoint/拓扑即可继续；
 - 默认部署仍是 **TP4×PP2 + v1 runner**（37.7 ms，c=16 177 tok/s）。
+
+## 23. fp8 KV 实测：容量 +48%，速度略降（A100 无 fp8 MMA）（2026-11-19）
+
+放开白名单（`models/hy_v4_flash/nvidia/model.py` 的 KV dtype 检查增加 `"fp8"`）后，
+`--kv-cache-dtype fp8` 可以正常起服务并产出正确结果——**但在这套硬件上没有速度收益**。
+
+| 指标 | bf16 KV | **fp8 KV** | 变化 |
+|---|---|---|---|
+| KV 容量（32K × N 并发） | 497,073 tokens | **734,705 tokens** | **+48%** |
+| TPOT（单流） | 37.4 ms | 38.3 ms | −2%（略慢） |
+| decode | 26.5 tok/s | 26.1 tok/s | −1.5% |
+| prefill @8K | 4,746 tok/s | 4,332 tok/s | **−9%** |
+| TTFT @8K | 1,687 ms | 1,894 ms | 更慢 |
+| 并发 c=16 | 179.0 tok/s | 181.9 tok/s | +1.6%（持平） |
+| 视觉 4/4 | ✅ | ✅ | 正确 |
+
+**原因**：A100（sm80）**没有 fp8 矩阵乘单元**，fp8 KV 只能省 HBM 带宽，而我们的
+`TRITON_MLA_SPARSE` 在 Triton 里要把 fp8 反量化成 bf16 再算，多出来的转换开销抵消甚至超过省下的带宽。
+（MiniMax 的 prefill 快 5× 不能归因于 fp8 KV 本身；他们用 16 卡、block=128、且 MLA 走的是成熟 fp8 通路。）
+
+**结论**：在本硬件上 **fp8 KV 是"容量模式"，不是"性能模式"**：
+
+- 默认部署仍用 **bf16 KV**（TTFT/prefill 更好）；
+- 需要长上下文/更大并发时用 `--kv-cache-dtype fp8`，用 2% 的 TPOT 换 48% 的 KV 容量。
