@@ -249,3 +249,25 @@ Hy4-flash 直连（2×4 A100-40G，TP8+EP，`--enforce-eager`）。同一脚本 
 
 **可用配置（现网请用这个）**：`--enforce-eager`（TPOT ≈ 457 ms / token，2.2 tok/s）。
 若需要可用级吞吐，请用**单机 8 卡**（8×A100-80G / H100/H200）：单机路径 capture 已验证通过，预期 TPOT 30–60 ms。
+
+### 12.1 CUDA graph 的收益已量化（单机证据）
+
+同一个 `cap_test.sh` 试验台（606M 权重，单机 TP4+EP4，`FULL_DECODE_ONLY`，capture 通过）：
+
+| 模式 | TPOT |
+|---|---|
+| `--enforce-eager`（2 节点全尺寸实测） | 456 ms |
+| **`FULL_DECODE_ONLY`（单机 4 卡，606M）** | **15.2–16.5 ms** |
+
+即图回放正常时**约 30× 提速**，与现网 MiniMax-M3.1（31.3 ms）同量级。这坐实了"2 节点的差距 100% 来自不能上图"。
+
+### 12.2 2 节点上试过并失败的组合（避免重复踩）
+
+| 组合 | 结果 |
+|---|---|
+| `--compilation-config PIECEWISE` | 服务起不来（无 capture 日志，卡在 warmup） |
+| `FULL_DECODE_ONLY` + `NCCL_GRAPH_MIXING_SUPPORT=0/CUMEM_ENABLE=0/PROTO=Simple` | capture 成功，回放时 worker 崩（`sample_tokens RPC aborted`） |
+| `FULL_DECODE_ONLY` + `NCCL_ALGO=Tree` | capture 阶段 worker 直接 die |
+| TP4×PP2（跨节点只 p2p）+ 图 + 无 EP | `AssertionError: DP adjusted local rank 7 is out of bounds for 4 devices`（mp 后端在 PP 下的 rank 布局限制） |
+
+结论：2 节点请用 `--enforce-eager`（TPOT ≈ 457 ms）；要可用吞吐请走**单机 8 卡**（H100/H200 或 8×A100-80G），那里 capture 与回放都正常。
