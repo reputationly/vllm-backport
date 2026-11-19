@@ -61,6 +61,7 @@ from vllm.models.hy_v4.nvidia.mrope import (
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.selector import get_attn_backend
+from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
@@ -266,6 +267,9 @@ class Indexer(nn.Module):
 
 
 class HYV4MLAAttention(nn.Module):
+    # Filled per instance by `_register_indexer_attn_op`; None keeps the eager
+    # path (subclasses that bypass this __init__ fall back safely).
+    _indexer_attn_op = None
     """Multi-head latent attention with optional sparse lightning indexer.
 
     Main reference: the DeepSeek-V2 paper and the FlashInfer implementation
@@ -298,6 +302,7 @@ class HYV4MLAAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self._indexer_attn_op = None
         self.hidden_size = hidden_size
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -525,6 +530,11 @@ class HYV4MLAAttention(nn.Module):
             RMSNorm(hidden_size, config.rms_norm_eps)
             if getattr(config, "attn_post_proj_norm", False)
             else None
+        )
+        # One opaque custom op per layer for the indexer + MLA attention segment,
+        # so torch.compile cannot reorder the KV/top-k writes against the reads.
+        self._indexer_attn_op = self._register_indexer_attn_op(
+            f"{prefix or 'layer'}_{layer_idx}"
         )
 
     @property
@@ -778,7 +788,78 @@ class HYV4MLAAttention(nn.Module):
         return self.post_proj_norm(out) if self.post_proj_norm is not None else out
 
     @eager_break_during_capture
+    def _register_indexer_attn_op(self, tag: str):
+        """Expose the indexer + MLA attention sequence as one opaque custom op.
+
+        The segment writes the indexer/top-k/KV buffers and then reads the KV in
+        the MLA attention, so torch.compile must not reorder across it. A custom
+        op closes over this module instead of passing it through the schema.
+        """
+        def _op(
+            hidden_states: torch.Tensor,
+            q_c: torch.Tensor,
+            positions: torch.Tensor,
+            q: torch.Tensor,
+            kv_c_normed: torch.Tensor,
+            k_pe: torch.Tensor,
+            out: torch.Tensor,
+        ) -> None:
+            self._indexer_and_attn_eager(
+                hidden_states,
+                None if q_c.numel() == 0 else q_c,
+                positions,
+                q,
+                kv_c_normed,
+                k_pe,
+                out,
+            )
+
+        def _fake(
+            hidden_states: torch.Tensor,
+            q_c: torch.Tensor,
+            positions: torch.Tensor,
+            q: torch.Tensor,
+            kv_c_normed: torch.Tensor,
+            k_pe: torch.Tensor,
+            out: torch.Tensor,
+        ) -> None:
+            return None
+
+        name = "hy4_indexer_and_attn_" + re.sub(r"[^0-9a-zA-Z_]", "_", tag)
+        direct_register_custom_op(
+            op_name=name,
+            op_func=_op,
+            mutates_args=["out"],
+            fake_impl=_fake,
+        )
+        return getattr(torch.ops.vllm, name)
+
     def _indexer_and_attn(
+        self,
+        hidden_states: torch.Tensor,
+        q_c: torch.Tensor | None,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        if self._indexer_attn_op is None:
+            self._indexer_and_attn_eager(
+                hidden_states, q_c, positions, q, kv_c_normed, k_pe, out
+            )
+            return
+        self._indexer_attn_op(
+            hidden_states,
+            positions.new_empty(0) if q_c is None else q_c,
+            positions,
+            q,
+            kv_c_normed,
+            k_pe,
+            out,
+        )
+
+    def _indexer_and_attn_eager(
         self,
         hidden_states: torch.Tensor,
         q_c: torch.Tensor | None,

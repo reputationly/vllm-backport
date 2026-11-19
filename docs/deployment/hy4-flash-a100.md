@@ -1023,3 +1023,45 @@ CUDA op 的方式在编译图里不安全。
 装饰器撤回，服务恢复 eager（**视觉 4/4 通过**、TPOT 37.4 ms、地板 515 ms）；
 三个 custom op（Engram lookup、write_pool、write_tails）与缓存编译期关闭逻辑**全部保留**，
 是下一步的直接基础。
+
+## 31. 阶段 C（1/12）：attention 段做成 opaque op → 视觉 2/4（明显进步，仍未达标）
+
+### 31.1 做法
+
+把 `_indexer_and_attn`（indexer 写 KV/top-k → MLA attention 读 KV 的**完整序列**）注册成一个
+**每层一个的 opaque custom op**：
+
+```python
+name = "hy4_indexer_and_attn_" + re.sub(r"[^0-9a-zA-Z_]", "_", f"{prefix}_{layer_idx}")
+direct_register_custom_op(op_name=name, op_func=_op, mutates_args=["out"], fake_impl=_fake)
+```
+- custom op 只能是函数，所以用**闭包捕获 `self`**，每层注册一个 op（schema 里不传 module）；
+- `q_c` 可能是 `None`（无 q_lora 时），schema 不支持 Optional → 用**空张量做哨兵**，op 内部 `numel()==0` 还原成 None；
+- `HYV4FlashAttention.__init__` **直接调 `nn.Module.__init__`**（不经过基类 `__init__`），所以两个类都要注册，
+  并在基类上加类属性 `_indexer_attn_op = None` 作为"未注册就回退 eager"的默认值。
+
+### 31.2 结果：从 0/4 变成 2/4
+
+| 用例 | 阶段 B | **阶段 C** |
+|---|---|---|
+| 大号数字 7 | ❌ 乱码 | ✅ **7** |
+| 5 个红圆 | ❌ 乱码 | ✅ **5** |
+| 读出 "VISION OK 42" | ❌ 乱码 | ❌ 退化成重复 |
+| 蓝绿红顺序 | ❌ 乱码 | ❌ 退化成重复 |
+
+即：**attention 段 opaque 之后，简单数值题已经正确**——说明 KV 写入/读取被重排确实是主因之一。
+但更长的生成仍会退化成重复（`蓝月亮是《新余甘孜然…`），并且长时间压测后
+worker 会死（`DistError` → `sample_tokens RPC aborted`），说明还有第二处语义/稳定性问题。
+
+### 31.3 下一步（下一轮）
+
+1. **判定退化是 decode 还是 vision 特有**：跑纯文本 prompt（无图）看是否也退化——
+   若纯文本正常，问题在 mm/视觉 token 的 KV 或 mRoPE；若也退化，问题在 decode 步；
+2. 把 `compressed_indexer.forward` 整体也做成 opaque op（目前 `prepare_groups`、`fwht_quantize`、
+   `gated_pool`、`rotate_indexer` 仍是透传的 torch 代码，其中 `fwht_quantize` 里有 Triton）；
+3. 查 worker 死亡原因（`DistError` 更像编译图里混入了集合通信/事件，可与 `VLLM_COMPILE_...` 开关对照）。
+
+### 31.4 状态
+
+装饰器已撤回，服务恢复 eager 并**验证视觉 4/4 通过**；但阶段 C 的全部代码（op 注册、哨兵、
+类默认值、import 修复）都保留在分支里，下一轮直接重新打开装饰器即可继续。

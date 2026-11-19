@@ -192,6 +192,9 @@ class HYV4FlashAttention(HYV4MLAAttention):
             and (self.is_window_layer or not config.dsa_skip_attn_post_norm)
             else None
         )
+        self._indexer_attn_op = self._register_indexer_attn_op(
+            f"{prefix or 'flash'}_{layer_idx}"
+        )
 
     def _select_backend(self):
         if self.flashmla_backend:
