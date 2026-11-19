@@ -6,7 +6,7 @@ PARA = ("人工智能推理系统的性能取决于预填充与解码两个阶�
         "在实际部署中，我们通常需要同时权衡首字延迟、每 token 时延与整体吞吐。")
 CHARS_PER_TOK = 1.55  # CJK-heavy prose tokenises at roughly 1.5 chars/token
 
-def measure(target_tokens, out=16):
+def measure(target_tokens, out=64):
     reps = max(1, int(target_tokens * CHARS_PER_TOK / len(PARA)))
     prompt = PARA * reps
     payload = {"model": "hy4-flash", "prompt": prompt, "max_tokens": out,
