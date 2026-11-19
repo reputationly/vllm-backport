@@ -200,3 +200,36 @@ Engram 按 stage 切分（`configs.py` 的 PP 校验已放开、跨 stage 权重
 
 1. `_align_pages_to_mla_rows`：packed 布局 + 行扁平寻址混用时，任何非行宽整数倍的稀疏缓存页面都需要对齐；
 2. `triton_mla_sparse_kernel` 的 `return_lse`：sink 支持不该只有 FlashMLA 一条路。
+
+## 11. 与现网三模型对比（单流，greedy，out=64，2026-11-19）
+
+数据来源：现网三模型经 gpustack manager `http://127.0.0.1/v1`（网关对 TTFT 约 +77 ms，见五路测试报告），
+Hy4-flash 直连（2×4 A100-40G，TP8+EP，`--enforce-eager`）。同一脚本 `sweep3.py`（decode = `completion_tokens` / 首末 token 间隔）。
+
+| 上下文 | Hy4 TTFT | Qwen3.8 TTFT | MiniMax-M3.1 TTFT | DS-V4.1 TTFT |
+|---|---|---|---|---|
+| 130 | 3842 ms¹ | 474 ms | 303 ms | 338 ms |
+| 520 | 471 ms | 452 ms | 282 ms | 353 ms |
+| 2054 | 1047 ms | 398 ms | 289 ms | 360 ms |
+| 8203 | 3505 ms | 749 ms | 328 ms | 386 ms |
+
+| 模型 | 拓扑 / 卡数 | prefill @8K | decode (TPOT) | 每卡 decode |
+|---|---|---|---|---|
+| **Hy4-flash（本分支）** | TP8 · **8 卡**（2 节点）· eager | 2,341 tok/s | **457 ms**（2.2 tok/s） | 0.27 tok/s |
+| qwen3.8-flash-fp8 | TP2×PP4 · 8 卡 · graphs + mtp×3 | 10,947 tok/s | 5.0 ms（200 tok/s） | 25 tok/s |
+| minimax-m3.1-flash | TP4×PP4 · 16 卡 · graphs，无投机 | 24,981 tok/s | 31.3 ms（32 tok/s） | 2.0 tok/s |
+| deepseek-v4-1-flash | TP8×PP3 · 24 卡 · graphs + dspark×5 | 21,267 tok/s | 4.4 ms（227 tok/s） | 9.5 tok/s |
+
+¹ 重启后首个请求，含 Triton JIT 预热。
+
+**归因（按贡献排序）**
+
+1. **没有 CUDA graph**（`--enforce-eager`；FULL/PIECEWISE 在本模型上 capture 都失败）。
+   证据：Hy4 的 TPOT 与上下文长度完全无关（128→8192 恒为 457 ms），前缀命中后 TTFT 也回到 ~490 ms，
+   即"一步空转"的成本；而结构最接近的 MiniMax（无投机、EP、同代 A100、有 graphs）是 31 ms → **约 15× 差距全在 launch 开销**。
+2. **没有投机解码**（DFly2 需要 target/draft 共享 KV 且 KV 必须 `fp8_ds_mla`，sm80 上不可用）。
+   Qwen/DS 的 4–5 ms 里包含 3–5 个投机 token/步。
+3. **prefill 慢 5–10×**（2.3k vs 11–25k tok/s）：同样受 launch 数量影响，只是 8K prefill 摊薄得更好。
+
+结论：把 decode 路径做成可 capture（shape 静态、无 `.item()`/`nonzero`/动态分配）是唯一能追平数量级的杠杆；
+预期修好后 2×4 A100 上 TPOT ≈ 30–60 ms，与 MiniMax 同量级，仍慢于带投机的 Qwen/DS。
