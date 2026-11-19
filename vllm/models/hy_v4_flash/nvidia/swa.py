@@ -56,10 +56,6 @@ def window_indices(positions: torch.Tensor, window: int, width: int) -> torch.Te
     return torch.where(live, indices, -1).int()
 
 
-_WINDOW_CACHE: dict[str, tuple] = {}
-_SWA_COUNT = [0, 0.0]
-
-
 class FlashWindowIndexer(nn.Module):
     def __init__(self, window: int, topk_indices_buffer, attention_prefix: str):
         super().__init__()
@@ -92,28 +88,7 @@ class FlashWindowIndexer(nn.Module):
         logical = meta.seq_lens[requests] - (starts[requests + 1] - starts[requests])
         logical = logical + rows - starts[requests]
         live = (rows < meta.num_actual_tokens) & (rows < starts[-1])
-        import time as _t
-
-        _SWA_COUNT[0] += 1
-        _now = _t.time()
-        if _now - _SWA_COUNT[1] >= 15.0:
-            print(f"HY4_RATE swa {_SWA_COUNT[0] / (_now - _SWA_COUNT[1]):.1f}/s", flush=True)
-            _SWA_COUNT[0], _SWA_COUNT[1] = 0, _now
-        key = (
-            int(positions.data_ptr()),
-            int(output.shape[0]),  # rows in this tile (cudagraph pads the batch)
-            int(meta.num_actual_tokens),
-            int(starts[-1]) if starts.numel() else 0,
-            output.shape[1],
-            self.window,
+        output.copy_(
+            window_indices(torch.where(live, logical, -1), self.window, output.shape[1])
         )
-        cached = _WINDOW_CACHE.get("key")
-        if cached is not None and cached[0] == key:
-            tiles = cached[1]
-        else:
-            tiles = window_indices(
-                torch.where(live, logical, -1), self.window, output.shape[1]
-            )
-            _WINDOW_CACHE["key"] = (key, tiles)
-        output.copy_(tiles)
         return output

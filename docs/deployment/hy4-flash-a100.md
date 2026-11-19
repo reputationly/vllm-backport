@@ -129,7 +129,36 @@ projector → mRoPE → 主干 的整条视觉链路与参考实现一致。
 KV：只有 12 个稀疏层吃全上下文（约 13.8 KB/token bf16），30 个 SWA 层被 512 窗钉住。
 
 
-## 9. 实测状态（2026-11-19）
+## 9. 实测结果（2026-11-19，官方 FP8 权重，2×4 A100-40G）
+
+### 9.1 可跑（结论）
+
+**启动方式是关键**：必须照搬生产 DS-V4.1 脚本（`/root/v41_launch5.sh`）的
+`--distributed-executor-backend mp --nnodes N --node-rank R` + **非 0 号节点 `--headless`**。
+用 torchrun/`external_launcher` 时每个 rank 都会起自己的 API server，TP8 组退化到
+**~0.1 层/秒**（表现为"请求几分钟不返回"）；换成 mp+headless 后同一个模型
+**16 token 7.7 秒**正常返回。详见 `hy4-flash-a100/run_tp8.sh`。
+
+### 9.2 验收
+
+| 项 | 结果 |
+|---|---|
+| 权重加载 | 148/148 shard，服务启动，`GPU KV cache size: 302,239 tokens`（32K 上下文 × 4 并发） |
+| 连贯文本 | ✅ 中文："MoE 推理时只激活部分专家……计算量远小于稠密模型"；英文："Paris"；代码能给出 `def add(a, b): return a + b` |
+| 视觉 4/4 | ✅ 大号数字 7 / 5 个红圆 → 5 / 读出 "VISION OK 42" / 蓝绿红顺序 |
+| 基线（c=1，512 token 提示） | TTFT **0.49 s**、TPOT **456 ms/token**（≈2.2 tok/s/流） |
+| 基线（c=4） | 聚合 **8.0 tok/s** |
+| 已知限制 | `--enforce-eager`（CUDA graph capture 对动态 IndexPool 路径不成立）、无 DFly2 投机解码、Marlin W8A16 MoE |
+
+### 9.3 踩过的两个坑（复现时最容易撞）
+
+1. **SWA 窗口索引不能跨 step 缓存**：曾按 `positions.data_ptr()` 缓存窗口 tile，
+   decode 时指针复用导致后续 step 拿到上一步的索引，输出退化成无限重复。
+   已移除该优化（`swa.py` 恢复上游行为），退化随即消失。
+2. **`--kv-cache-dtype fp8` 被拒**：模型白名单只允许 `bfloat16` / `fp8_ds_mla`，
+   sm80 上没有 `fp8_ds_mla`，因此用 bf16 KV。
+
+### 9.4 早期诊断（保留，供参考）
 
 | 项 | 结论 |
 |---|---|
