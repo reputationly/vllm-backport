@@ -390,3 +390,38 @@ Hy4-flash 直连（2×4 A100-40G，TP8+EP，`--enforce-eager`）。同一脚本 
 | `VLLM_PLE_CPU_OFFLOAD=1`（qwen） | ➖ 等价于我们已在用的 `--engram-config '{"cpu_offload": true}'` |
 | `VLLM_USE_BREAKABLE_CUDAGRAPH=0` | ➖ 默认即 0，无差别 |
 | `--reasoning-parser / --tool-call-parser` | ⏭ Hy4 有 `renderers/hy_v4.py`，接 chat API 时应配上对应 parser 名（尚未接） |
+
+## 17. DFly2 投机解码：可行性评估（2026-11-19，未跑通）
+
+### 17.1 先纠正一个前提：**bf16 KV 不是障碍**
+
+`models/hy_v4/dfly_config.py:314` 的校验是：
+
+```python
+if spec.kv_cache_dtype not in (None, "auto", "bfloat16", "fp8_ds_mla"):
+    raise ValueError("DFly requires BF16 or fp8_ds_mla draft MLA KV cache")
+```
+
+也就是说 **DFly 明确接受 `bfloat16`**。之前"DFly2 需要 fp8_ds_mla"的判断是错的，
+不是 KV dtype 卡住，而是下面四条。
+
+### 17.2 真正的四个阻碍
+
+| # | 阻碍 | 证据 |
+|---|---|---|
+| 1 | **DFly 要求 `pipeline_parallel_size == 1`** | `models/hy_v4/dfly_config.py:200-210` 对 `data_parallel_size / pipeline_parallel_size / pcp / dcp` 全部强制 =1。也就是说 DFly 只能配 TP8×PP1（跨节点 TP），和我们当前最优的 TP4×PP2（TPOT 38.6 ms）互斥 |
+| 2 | `method="dfly"` **不在 fork 的方法白名单里** | `config/speculative.py:72` 的 `SpeculativeMethod = Literal[...]` 没有 `"dfly"`（PR #68296 在第 115 行加了）；传 `--speculative-config '{"method":"dfly"}'` 直接被 pydantic 拒绝 |
+| 3 | PR 的 **speculator-config 注册层在 fork 里不存在** | PR 新增 `v1/worker/gpu/spec_decode/speculator_config.py`（**497 行**，`SpeculatorConfig`/`DraftModelSpeculatorConfig`/`get_method_config_class`/`get_speculator_config_class`）与 `spec_decode/dfly/` 包；fork 里两者都没有 |
+| 4 | fork 的 `config/speculative.py` **缺少 PR 依赖的钩子** | 统计：`_rope_only_sizes_cache` 0 处、`compile_factors` 0 处、`spec_pruning` 0 处（PR 的 `DraftModelSpeculatorConfig.configure()` 依赖这些） |
+
+### 17.3 工作量与建议
+
+- 需要移植：`speculator_config.py`（497 行）+ `dfly/config.py`（~70 行）+ `models/hy_v4/dfly_config.py`（318 行，已在外挂里）+
+  `config/speculative.py` 约 10 处调用点改造（`default_model` / `configure` / `get_speculator_config_class` / 方法白名单）。
+- 属于**框架级合并**：fork 的 `SpeculativeConfig` 与 PR 的注册层 API 有差异，风险高于之前所有模型侧改动，且**只有在 TP8×PP1 拓扑下才能验证**。
+- **收益评估**：即便跑通，k=5、接受率 ~50% 时约 2–2.5× 加速，而 TP8×PP1 基线是 87 ms → **预计 35–40 ms，和现在 TP4×PP2 的 38.6 ms 基本打平**。
+  真正有价值的是 **DFly + PP2 同时**：DFly 的 5 个 draft 目标层（25/29/33/37/41）在 PP2 下**全部落在 stage 1**，
+  所以结构上并非不可能，只是被 PR 的 `pipeline_parallel_size==1` 断言挡住 —— 值得向 PR 作者确认是否可放宽。
+
+**结论**：DFly2 不是"改个 KV dtype"就能开的开关，需要一次框架级移植；建议放在 TP4×PP2 稳定交付之后再做，
+且优先争取"DFly + PP>1"的组合，否则单独 DFly 的收益会被 PP2 的收益吃掉。
