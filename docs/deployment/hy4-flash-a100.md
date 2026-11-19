@@ -783,3 +783,57 @@ Hy4 为 4 节点×4 卡、MiniMax 为现网同构实例（经 gpustack 网关，
 
 **优化优先级**（按收益）：① 每请求固定 prefill 开销（短上下文 6× 差距的主因）；
 ② 每步 indexer 开销（TPOT 与并发的主因）；③ PP4 气泡（改用 2 个 TP4×PP2 副本做 DP 拿吞吐）。
+
+## 27. TTFT 的固定开销拆解：597 ms/请求 + 91.6 µs/token（2026-11-19）
+
+用"尺寸阶梯"拟合（2 节点 TP4×PP2，out=2，greedy，每组都跑同样 prompt 两次）：
+
+```
+TTFT ≈ 597 ms + 91.6 µs/token        （稳态 prefill 10.9k tok/s）
+```
+
+| prompt | TTFT |
+|---|---|
+| 46 | 689 ms（首个请求含预热） |
+| 414 | 531 ms |
+| 1,702 | 543 ms |
+| 6,946 | 1,468 ms |
+| 13,892 | 1,944 ms |
+| 27,784 | 3,061 ms |
+
+### 27.1 这个 597 ms 是**每请求一次**，与 chunk 数无关
+
+把 `--max-num-batched-tokens` 从 8192 提到 **32768**（让 27,784 token 的 prompt 从 4 个 chunk 变成 1 个），
+拟合结果**完全不变**（597 ms + 91.6 µs/token）。所以它不是"每 chunk 的 eager step 开销"，
+而是**每请求一次的固定成本**；代价是 KV 池从 497k 掉到 210,541 tokens（profile 峰值变大），因此不采用。
+
+### 27.2 极小请求的地板：1 个 token 也要 ~515 ms
+
+| prompt tokens | cold | 前缀命中 | 命中2 |
+|---|---|---|---|
+| 1 | 574 ms | **515 ms** | 516 ms |
+| 16 | 514 ms | 513 ms | 524 ms |
+| 520 | 521 ms | 524 ms | 522 ms |
+
+缓存命中不减少地板 → 这 515 ms **不是 prefill 计算**，而是"请求路径 + 首个 step"：
+首个 step 走的是 **prefill 路径（不走 decode 图）→ eager**，我们实测 eager 一步约 456–515 ms
+（42 层 × ~1800 次 Python 侧 kernel launch，ARM CPU 上每次 ~0.3 ms）。
+
+### 27.3 对照 MiniMax（同为 16 卡拓扑，经网关，网关约 +77 ms）
+
+| prompt | Hy4 地板 | MiniMax 地板 | 差距 |
+|---|---|---|---|
+| 1 | 515 ms | **284 ms**（≈207 ms 扣网关） | 2.5× |
+| 17 | 513 ms | 267 ms | 1.9× |
+| 520 | 522 ms | 268 ms | 1.9× |
+
+### 27.4 结论与唯一剩下的杠杆
+
+- TTFT 的两项都落后：**固定地板 2–2.5×**、**每 token 1.6–1.8×**；
+- 抬高 MAXBT、加大 PP、缓存 index 数学都不改变这两项；
+- **`FULL_AND_PIECEWISE`（把 prefill 也上图）需要 `torch.compile`**，而 Hy4-flash 在本 fork 里
+  `torch.compile` 不可用（启动即报 `model does not support it`），报错原文：
+  `piecewise CUDA graphs unavailable, model is not torch-compiled`；
+- 因此**唯一能同时消掉地板与斜率的动作是：让 Hy4-flash 支持 `torch.compile`**
+  （需要 dynamo 能 trace 我们的 Triton sparse MLA、IndexPool prep、Engram 查表与 sink）。
+  这是本轮之前所有优化里唯一还没碰过的大块，也是把 TTFT 拉到 MiniMax 量级的必经之路。
