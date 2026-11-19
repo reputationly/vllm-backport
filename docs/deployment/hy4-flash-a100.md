@@ -905,3 +905,69 @@ prefill 的每 token 成本也随 Python launch 消失而下降（我们稳态 9
 评估用的装饰器**已撤回**（否则默认启动会尝试编译并在 Engram 处失败，导致服务起不来）。
 当前部署仍是 eager + `FULL_DECODE_ONLY`（TPOT 37.4 ms、TTFT 地板 515 ms、KV 497k）。
 要推进就按 A→B→C→D 的顺序做，每步都能独立验证。
+
+## 29. 阶段 A 实测：编译打通了、TTFT 地板 515→66 ms，但**数值错了**（2026-11-20）
+
+### 29.1 做了什么
+
+把 Engram 的 host-pinned 查表包成 custom op（`vllm/models/hy_v4_flash/nvidia/engram.py`）：
+
+```python
+direct_register_custom_op(
+    op_name="hy4_engram_pinned_lookup",
+    op_func=_hy4_engram_pinned_lookup,      # UVA 视图 + Triton gather
+    mutates_args=["out"],
+    fake_impl=_hy4_engram_pinned_lookup_fake,  # 返回 None
+)
+```
+`FlashEmbedding._lookup` 改为调用 `torch.ops.vllm.hy4_engram_pinned_lookup(...)`，并重新加上
+`@support_torch_compile(dynamic_arg_dims=...)`。
+
+### 29.2 编译确实打通了
+
+```
+[backends.py:393] Compiling a graph for compile range (1, 2048) takes 133.39 s
+[decorators.py:719] saved AOT compiled function to /root/.cache/vllm/torch_compile_cache/...
+Application startup complete ✅
+```
+
+即 **Engram 这一关（评估里的第 1、2 项）确实清掉了**，模型能被 dynamo/AOT 完整编译。
+
+### 29.3 TTFT 地板：515 ms → 66 ms（7.8×）
+
+| prompt | 编译前（eager） | 编译后 PIECEWISE | 编译后 FULL_DECODE_ONLY |
+|---|---|---|---|
+| 1 token cold | 574 ms | **235 ms** | 351 ms |
+| 1 token 命中 | **515 ms** | **66 ms** | 223 ms |
+| 16 token 命中 | 513 ms | **63 ms** | 224 ms |
+| 520 token 命中 | 522 ms | **74 ms** | 218 ms |
+
+**地板从 515 ms 掉到 66 ms**，与 §27 的预测（515 → ~100 ms）完全吻合——Python launch 开销确实是那 450 ms 的来源。
+
+### 29.4 但数值是错的（这是关键结论）
+
+两种图模式都失败：
+
+| 模式 | 视觉 4/4 | 输出 |
+|---|---|---|
+| PIECEWISE（地板 66 ms） | ❌ 0/4 | 空白/乱码 |
+| FULL_DECODE_ONLY（地板 218 ms） | ❌ 0/4 | 空白/乱码 |
+
+说明问题**不在"图捕获"，而在"被编译后的语义"**：某些有副作用的 Triton 路径（indexer 打分、
+`write_pool`/`write_tails` 写 KV、稀疏 MLA、n-gram 哈希）没有被声明为 opaque custom op，
+dynamo 追踪它们的执行/别名关系时可能重排或错解；也可能是我这个 Engram op 传 CPU-pinned 张量进
+CUDA op 的方式在编译图里不安全。
+
+### 29.5 结论与下一步
+
+- **方向确认可行**：把地板砍到 66 ms 是真实的，收益巨大；
+- **但必须先补完"编译语义正确性"**：按评估清单把 3/4/5 号（`fp8_paged_mqa_logits_triton`、
+  `prepare_groups`/`write_tails`、`triton_mla_sparse_attention`）以及 n-gram 哈希内核
+  也注册成 custom op（`mutates_args` 精确声明），再做**逐 token 与 eager 基线对比**的数值验收；
+- 预估这仍是评估里的 B+C 阶段（约 1–1.5 人日），只是现在有了明确抓手：
+  **编译能跑、地板已知、只差对齐语义**。
+
+### 29.6 当前状态
+
+装饰器已撤回（服务恢复 eager + `FULL_DECODE_ONLY`，视觉 4/4 通过、TPOT 37.4 ms、地板 515 ms）；
+**Engram 的 custom op 包装保留**（对 eager 路径无影响，且是阶段 B 的基础）。
