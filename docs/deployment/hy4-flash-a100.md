@@ -150,7 +150,15 @@ KV：只有 12 个稀疏层吃全上下文（约 13.8 KB/token bf16），30 个 
 | 基线（c=4） | 聚合 **8.0 tok/s** |
 | 已知限制 | `--enforce-eager`（CUDA graph capture 对动态 IndexPool 路径不成立）、无 DFly2 投机解码、Marlin W8A16 MoE |
 
-### 9.3 踩过的两个坑（复现时最容易撞）
+### 9.3 使用注意
+
+- **采样参数**：模型卡推荐 `temperature=0.9, top_p=1.0`；贪心（`temperature=0`）+ `no_think`
+  做数学题（数列第 8 项）会答错（答 47，正确 71），开启 thinking 则能正确推理。
+- **长上下文**：`--max-num-batched-tokens` 必须 ≥ 单条 prompt 的 token 数，
+  否则 12k token 的 prompt 会直接 400（本次测试脚本用的是 8192）。
+- 视觉与中文/英文、代码生成均正常（见 9.2）。
+
+### 9.4 踩过的两个坑（复现时最容易撞）
 
 1. **SWA 窗口索引不能跨 step 缓存**：曾按 `positions.data_ptr()` 缓存窗口 tile，
    decode 时指针复用导致后续 step 拿到上一步的索引，输出退化成无限重复。
@@ -158,7 +166,7 @@ KV：只有 12 个稀疏层吃全上下文（约 13.8 KB/token bf16），30 个 
 2. **`--kv-cache-dtype fp8` 被拒**：模型白名单只允许 `bfloat16` / `fp8_ds_mla`，
    sm80 上没有 `fp8_ds_mla`，因此用 bf16 KV。
 
-### 9.4 早期诊断（保留，供参考）
+### 9.5 早期诊断（保留，供参考）
 
 | 项 | 结论 |
 |---|---|
