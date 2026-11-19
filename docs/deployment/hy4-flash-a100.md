@@ -1065,3 +1065,49 @@ worker 会死（`DistError` → `sample_tokens RPC aborted`），说明还有第
 
 装饰器已撤回，服务恢复 eager 并**验证视觉 4/4 通过**；但阶段 C 的全部代码（op 注册、哨兵、
 类默认值、import 修复）都保留在分支里，下一轮直接重新打开装饰器即可继续。
+
+## 32. 阶段 C（2/12）：worker 死因抓到了——编译后索引越界（CUDA IndexKernel 断言）
+
+### 32.1 本轮尝试
+
+想把整个 `FlashCompressedIndexer.forward` 也做成 opaque op（覆盖 `prepare_groups`、`fwht_quantize`、
+`gated_pool`、`rotate_indexer` 里剩余的 Triton 与动态形状代码）。**失败原因**：
+`forward(..., rope=self.indexer_rope_emb)` 里的 `rope` 是**一个 nn.Module**，而 custom op 的
+schema 只能承载张量，报：
+
+```
+Expected a value of type 'Tensor' for argument 'rope' but instead found type 'HYV4RotaryEmbedding'
+```
+→ 该 op 已回退（保留 attention 段的 opaque op）。
+
+### 32.2 但拿到了真正有价值的死因
+
+只保留 attention 段 opaque 的编译版本，**第一个纯文本请求就把 worker 打死**，日志是：
+
+```
+IndexKernel.cu:111: Assertion `-sizes[i] <= index && index < sizes[i] && "index out of bounds"` failed
+… RPC call to sample_tokens aborted: a worker process died
+```
+
+即**编译路径下我们的整数索引算出了越界下标**（torch 的 index/gather kernel 断言）。
+这与"符号形状 + Python `int` 混用"高度吻合：`prepare_groups` 里同时用了
+`int(lengths.numel())`、`tokens` 这类 Python 整数和 `torch.arange(slots)`、`torch.searchsorted`
+这类张量运算，在 `torch.compile` 下 `tokens/batch/slots` 变成符号量，而 fancy indexing
+（`table[owners, columns]`、`tail[block, member % ring]`）的边界校验就会失效。
+
+这也解释了阶段 C 的"2/4 通过、长生成退化"：短答案在越界发生前就结束了，长生成走到越界就崩。
+
+### 32.3 下一步（明确）
+
+把 **`prepare_groups` 单独**做成 custom op（它是纯函数、参数只有张量 + 2 个 int，无 module 依赖），
+让索引数学在 **eager 下以具体整数**执行，不再参与符号形状推导。两个可选实现：
+
+1. **多返回值 custom op**：`prepare_groups(...) -> tuple[Tensor, ...]`（9 个输出），需要确认
+   本 fork 的 `direct_register_custom_op` 支持 tuple 返回注解；
+2. **预分配 + 就地写**：调用方按已知形状分配 9 个输出，op 只做 `mutates_args=[9 个输出名]` 的写操作——更稳。
+
+推荐 2。做完后重跑：先纯文本（`1,2,3,4,5,` 续写），再视觉 4/4，最后长生成 128 token 查退化。
+
+### 32.4 状态
+
+装饰器已撤回，服务恢复 eager（视觉 4/4 通过）。阶段 C 的 attention opaque op 保留。

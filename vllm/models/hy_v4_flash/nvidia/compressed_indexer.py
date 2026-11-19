@@ -33,6 +33,8 @@ from .indexpool_ops import (
 from vllm.v1.attention.ops.mqa_logits_triton import fp8_paged_mqa_logits_triton
 
 from .indexpool_prepare import prepare_groups, write_tails_argb
+from vllm.utils.torch_utils import direct_register_custom_op
+import regex as re
 
 
 class FlashCompressedIndexer(nn.Module):
