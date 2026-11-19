@@ -837,3 +837,71 @@ TTFT ≈ 597 ms + 91.6 µs/token        （稳态 prefill 10.9k tok/s）
 - 因此**唯一能同时消掉地板与斜率的动作是：让 Hy4-flash 支持 `torch.compile`**
   （需要 dynamo 能 trace 我们的 Triton sparse MLA、IndexPool prep、Engram 查表与 sink）。
   这是本轮之前所有优化里唯一还没碰过的大块，也是把 TTFT 拉到 MiniMax 量级的必经之路。
+
+## 28. torch.compile 适配评估（2026-11-20，实测第一刀）
+
+### 28.1 编译是怎么被触发的
+
+- 模型类需要 `@support_torch_compile(dynamic_arg_dims={...})`；没有它时 vLLM 只打一行
+  warning（`model does not support it`）然后**静默走 eager** —— 这就是 TTFT 地板 515 ms 的来源；
+- 注意：`--compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}'` **本身就已经把
+  mode 设成 `VLLM_COMPILE`**，所以只要加上装饰器，默认配置就会真的开始编译
+  （不是只有显式 `PIECEWISE` 才会）。
+
+### 28.2 实测：加上装饰器后，dynamo 死在 Engram 的 host-pinned 查表
+
+`--compilation-config '{"cudagraph_mode": "PIECEWISE"}'` + 装饰器，`aot_compile_fullgraph` 报：
+
+```
+torch._dynamo.exc.Unsupported: Operator does not support running with fake tensors
+NotImplementedError: _C::get_cuda_view_from_cpu_tensor: attempted to run this operator with Meta tensors,
+  but there was no fake impl or Meta kernel registered.
+```
+
+调用栈精确定位：
+
+```
+model.py:249 forward → engram.py:414 forward → engram.py:335 forward → engram.py:311 _lookup
+  → get_accelerator_view_from_cpu_tensor(parameter)     # utils/torch_utils.py:910
+  → torch.ops._C.get_cuda_view_from_cpu_tensor(...)     # 无 fake impl
+```
+
+即 **Engram 的 CPU offload 表**（127 GB 主存 + UVA 视图）在 fake-tensor 追踪下无法表达。
+这不是"能容忍的 graph break"，是**硬失败**（`fullgraph_capture`）。
+
+### 28.3 需要包裹成 custom op 的清单
+
+| # | 位置 | 内容 | 处理 |
+|---|---|---|---|
+| 1 | `engram.py:311 _lookup` | UVA 视图 + `_lookup_ple_embedding_from_pinned_kernel` Triton gather | `custom_op` + `register_fake`（返回 out 形状空张量） |
+| 2 | `model.py:233 prepare_hashes_with_output` | n-gram 哈希 Triton kernel | 同上 |
+| 3 | `compressed_indexer.py:194 fp8_paged_mqa_logits_triton` | indexer 打分 | 同上 |
+| 4 | `indexpool_prepare_torch.prepare_groups` / `write_tails` | 动态形状 + fancy-index 写 KV | 同上（顺带消掉 recompile） |
+| 5 | `sm80_sink.py:60 triton_mla_sparse_attention` | 稀疏 MLA（带 lse） | 同上 |
+| 6 | iHC 层 / MoE | 纯 torch + vLLM 原生 | 预期无需处理 |
+
+### 28.4 工作量与收益
+
+| 阶段 | 内容 | 预估 |
+|---|---|---|
+| A | 包裹 1、2（Engram 两个内核） | 1–2 h，低风险 |
+| B | 包裹 3、4、5（indexer + prep + sparse MLA） | 3–5 h，中风险（fake impl 的 shape/dtype 必须精确） |
+| C | 迭代 recompiles / 剩余 graph break，直到 PIECEWISE 真正捕获 | 4–8 h |
+| D | 数值验收（视觉 4/4、连贯文本）+ 重新基线 | 2–3 h |
+
+**合计约 1.5–2 人日**。
+
+**预期收益**（按 §27 的测量反推）：每个请求少一次 eager step，TTFT 地板 **515 ms → ~100 ms 量级**；
+prefill 的每 token 成本也随 Python launch 消失而下降（我们稳态 91.6 µs/token vs MiniMax ~50–60），
+即短上下文 TTFT 有望从「8K 1.47 s」降到「0.5–0.7 s」，接近 MiniMax 的 0.33 s 量级。
+
+**风险**：① 我们的 Triton 内核彼此通过 KV/索引缓冲互相引用，fake impl 写错会导致"能编译但结果错"——
+必须靠视觉 4/4 + 与 bf16 参考逐 token 对比来把关；② 若 vLLM 侧 attention metadata 路径出现
+不可编译的 break，收益会被 graph break 抵消；③ `write_tails` 是对 packed KV 的跨步写，
+作为 custom op 需要注意 aliasing（`mutates_args`）。
+
+### 28.5 状态
+
+评估用的装饰器**已撤回**（否则默认启动会尝试编译并在 Engram 处失败，导致服务起不来）。
+当前部署仍是 eager + `FULL_DECODE_ONLY`（TPOT 37.4 ms、TTFT 地板 515 ms、KV 497k）。
+要推进就按 A→B→C→D 的顺序做，每步都能独立验证。
