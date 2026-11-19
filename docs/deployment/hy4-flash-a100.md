@@ -283,3 +283,28 @@ Hy4-flash 直连（2×4 A100-40G，TP8+EP，`--enforce-eager`）。同一脚本 
 
 **已知限制**：2 节点只能 `--enforce-eager`（TPOT 457 ms）；单机上 `FULL_DECODE_ONLY` 实测 15–16 ms（§12.1），
 因此上量建议走单机 8 卡。四门要求的"可行性配置基线"已按此前提给出。
+
+## 14. 为什么 2 节点不能上图——真因是 RoCE，不是多节点（2026-11-19 结论）
+
+**先看现网**：gpustack API 显示 `deepseek-v4-1-flash` 的实例是
+`--distributed-executor-backend=mp --nnodes=6 --node-rank=<0..5> --headless`，每节点 4 卡、共 24 卡（TP8×PP3）。
+也就是说**现网同样跨节点、按 PP/TP 组合跨机**，而且用 `FULL_DECODE_ONLY` 图跑得很好。
+它的 worker 网卡是 `enp131s0f0` / `10.0.0.x`（普通 socket 网络）。
+
+**我们的对照实验**（同一模型、同一 8 卡拓扑、同一 mp+headless 启动方式，只改传输层）：
+
+| 传输 | capture | 回放 | 单流 TPOT | 视觉 4/4 |
+|---|---|---|---|---|
+| RoCE（`NCCL_IB_DISABLE=0`, `mlx5_0`, GID 3） | ❌ `cudaErrorStreamCaptureInvalidated` | — | 456 ms（只能 eager） | ✅ |
+| RoCE + `NCCL_GRAPH_MIXING_SUPPORT=0/CUMEM_ENABLE=0/PROTO=Simple` | ✅ | ❌ worker 崩（`sample_tokens RPC aborted`） | — | — |
+| **TCP（`NCCL_IB_DISABLE=1`）+ 图** | ✅ | ✅ | **87–95 ms** | ✅ **4/4** |
+
+结论：**是 NCCL 的 verbs/RoCE 路径在 CUDA graph 下不安全**（缺 graph 注册 / GDR 支持，这套 NCCL 版本上如此），
+而 socket 传输可以入图。我们 dev 节点恰好配了 Mellanox CX-6 + RoCE，之前"顺手打开 RoCE"正好把传输切到了唯一不能上图的那条路上。
+
+**顺带**：`NCCL_SOCKET_NTHREADS=8 / NCCL_NSOCKS_PERTHREAD=8 / NCCL_BUFFSIZE=8MB` 会造成 EngineDead，别加。
+
+**当前推荐配置（2×4 A100-40G）**：`NCCL_IB_DISABLE=1` + `--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'`
+→ TPOT ≈ 87–95 ms（11 tok/s），视觉/文本正确性不变。decode 此时被 TCP 集合通信延迟主导
+（42 层 × 2 次 all-reduce × ~1 ms）。要再快需要：TP 收进单节点（TP4×PP2，当前被 mp 后端 PP rank 布局断言挡住）、
+或单机 8 卡（NVLink），或把 verbs-in-graph 打通。
