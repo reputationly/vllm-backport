@@ -233,3 +233,19 @@ Hy4-flash 直连（2×4 A100-40G，TP8+EP，`--enforce-eager`）。同一脚本 
 
 结论：把 decode 路径做成可 capture（shape 静态、无 `.item()`/`nonzero`/动态分配）是唯一能追平数量级的杠杆；
 预期修好后 2×4 A100 上 TPOT ≈ 30–60 ms，与 MiniMax 同量级，仍慢于带投机的 Qwen/DS。
+
+## 12. CUDA graph：canonical 结论（2026-11-19）
+
+| 试验 | 配置 | 结果 |
+|---|---|---|
+| tiny 606M，单卡 TP1 | `FULL_DECODE_ONLY` | ✅ capture 通过 |
+| tiny 606M，单机 TP4 + EP4 | `FULL_DECODE_ONLY` | ✅ capture 通过 |
+| 官方权重，2 节点 TP8 | `FULL_DECODE_ONLY`，默认 NCCL | ❌ `cudaErrorStreamCaptureInvalidated` |
+| 官方权重，2 节点 TP8 | 加 `NCCL_GRAPH_MIXING_SUPPORT=0` + `NCCL_CUMEM_ENABLE=0` + `NCCL_PROTO=Simple` | ⚠️ **capture 通过，但回放时 worker 崩溃**：`RPC call to sample_tokens aborted: a worker process died` |
+
+结论：**模型侧的 Python/Triton 代码（torch 版 IndexPool prep、SWA 窗口索引、Engram 主机查表、sink 的 LSE 缩放）在单机上都能被 capture**；
+2 节点的问题来自 **NCCL collective 入图**，关掉 graph-mixing 后能 capture，但图回放时 worker 崩溃 ——
+下一步要在两步之间定位：① 用 `CUDA_LAUNCH_BLOCKING=1` + 只捕获 decode 单层确认崩溃点；② 检查我们 `_apply_sink` / `write_tails` 在回放时的张量绑定（它们引用外部指针）。
+
+**可用配置（现网请用这个）**：`--enforce-eager`（TPOT ≈ 457 ms / token，2.2 tok/s）。
+若需要可用级吞吐，请用**单机 8 卡**（8×A100-80G / H100/H200）：单机路径 capture 已验证通过，预期 TPOT 30–60 ms。
