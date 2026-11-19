@@ -660,3 +660,50 @@ DFly 草稿模型的某个 MLA 投影输入维是 **1152**，在 **TP4** 下每�
 
 - 默认部署仍用 **bf16 KV**（TTFT/prefill 更好）；
 - 需要长上下文/更大并发时用 `--kv-cache-dtype fp8`，用 2% 的 TPOT 换 48% 的 KV 容量。
+
+## 24. 长上下文：1M 不可行，上限约 797K（fp8 KV）；实测冷请求 TTFT/TPOT（2026-11-19）
+
+### 24.1 1M 的硬结论
+
+把 `--max-model-len 1048576` + fp8 KV + `util 0.95` 直接开，vLLM 给出确切数字：
+
+```
+To serve at least one request with the model's max seq len (1048576),
+8.65 GiB KV cache is needed, which is larger than the available KV cache
+memory (6.9 GiB). Based on the available memory, the estimated maximum model
+length is 796928.
+```
+
+即：**1M 需要 8.65 GiB KV，我们只有 6.9 GiB**，差 25%；这套 8×A100-40G 的**上下文上限 ≈ 796,928 tokens（fp8 KV）/ ≈ 550K（bf16 KV）**。
+
+### 24.2 实测冷请求（自然语言中文，prefill 分块 16K/步，无前缀缓存）
+
+| prompt tokens | TTFT | prefill 速率 | TPOT | 备注 |
+|---|---|---|---|---|
+| 13,398 | 7.59 s\* | 1,766 tok/s | 38.2 ms | \*首个请求含 JIT 预热 |
+| 54,912 | **7.21 s** | 7,616 tok/s | 34.9 ms | |
+| 109,890 | **10.22 s** | 10,753 tok/s | 33.1 ms | |
+| 219,780 | **21.88 s** | 10,044 tok/s | **28.0 ms** | |
+
+两个值得注意的规律：
+
+1. **prefill 速率随长度上升并稳定在 ~10–10.8k tok/s**（13K 的 1.77k 是预热；55K 起就进入稳态），
+   说明分块 prefill 摊薄了每步固定开销；
+2. **TPOT 随上下文变长而下降**（38.2 → 28.0 ms）——因为 Hy4 是稀疏注意力（top-k 2048 groups），
+   decode 只读固定的 top-k，**不随上下文线性变慢**。这正是稀疏 indexer 的价值所在。
+
+### 24.3 按实测斜率外推 1M（假设 KV 装得下）
+
+- TTFT ≈ 1,000,000 / 10,000 ≈ **100 s**（约 1.7 分钟）；
+- TPOT ≈ **25–28 ms**（稀疏注意力下与长度基本无关）；
+- 但这需要 **8.65 GiB KV**，当前硬件只有 6.9 GiB → **必须扩卡**（例如 12 卡或换 80G 卡）。
+
+跨节点对比参考：现网 DS-V4.1 在 1M 配置下，五路报告里的 128K/256K TTFT 分别是 18.93 s / 45.06 s；
+我们 110K/220K 是 10.2 s / 21.9 s，**同长度下我们是它的 1.8–2.1× 快**（但我们要的 KV 更多、上限更低）。
+
+### 24.4 长上下文模式启动参数
+
+```
+MAX_LEN=262144 MAXBT=16384 MAXSEQS=4 UTIL=0.95 KVDTYPE=bfloat16   # 实测 KV 755,113 tokens
+```
+（默认部署仍是 32K × 16 并发；长上下文按上面四个变量切。）
