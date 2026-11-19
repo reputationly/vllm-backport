@@ -586,3 +586,53 @@ GPU kernel，所以 `prepare_groups` 的 CPU 侧 2.4 ms 从来就不在 decode �
 - 保留该优化：数值严格等价、隔离快 4×、CPU 压力更低（高并发下有余量），代价是一段可读的缓存代码；
 - 但它**不是**当前 TPOT 的瓶颈。38 ms 现在是纯 GPU 时间（层计算 + 每层 2 次集合通信）；
   要再压只能从"减少每步 GPU 工作"下手：投机解码（DFly2，需 MRv2）、或降低每层通信量（TP 更细/单机更大）。
+
+## 22. MRv2 通了；DFly2 卡在 FP8 128 块与 TP 分片的冲突（2026-11-19）
+
+### 22.1 拓扑对比（全量权重，单流 greedy out=64）
+
+| 拓扑 | TPOT | prefill @8K | c=16 聚合 | KV |
+|---|---|---|---|---|
+| **TP4×PP2（v1 runner，最优）** | **37.7 ms** | 4,746 tok/s | **177.5 tok/s** | 497k |
+| TP2×PP4（v1） | 36.1 ms | 4,476 tok/s | 105.5 tok/s | **636k** |
+| TP4×PP2 + **MRv2**（`VLLM_USE_V2_MODEL_RUNNER=1`） | 37.4 ms | 4,864 tok/s | 179.0 tok/s | 497k |
+
+- **MRv2 在我们的 sm80 外挂上完全正常**：视觉 4/4、TPOT 与 v1 持平、prefill 略快（+2.5%）、c=16 略高。
+- TP2×PP4：单流 TPOT 最好（36.1）且 KV 最多（636k），但**并发吞吐明显差**（PP 段多 → 气泡），综合不如 TP4×PP2。
+
+### 22.2 DFly2 打通的 6 关（依次）
+
+| # | 报错 | 处理 |
+|---|---|---|
+| 1 | `method` 不在 `SpeculativeMethod` 白名单 | 加 `"dfly"` |
+| 2 | `num_speculative_tokens was provided but without speculative model` | `__post_init__` 加 dfly 分支（model 取 target） |
+| 3 | `Unsupported speculative method: 'dfly'`（config 第二处 dispatch） | 放行 |
+| 4 | `Unknown speculative decoding method: dfly`（v1 `gpu_model_runner`） | 确认 DFly 只有 MRv2 实现 → 切 `VLLM_USE_V2_MODEL_RUNNER=1` |
+| 5 | `Model Runner V2 does not yet support: speculative method 'dfly'` + `parallel drafting` | MRv2 白名单加 dfly（含 parallel_drafting 判定） |
+| 6 | `No module named ...online.lm_head` → 再 `Nvfp4WeightOnlyOnlineLinearMethod` 缺失 | 拷 PR 的 `online/{lm_head,fp8_requant,loading,requantization,lut_b,shared_expert}.py`，nvfp4 导入加 try/except |
+| 7 | `HYV4 Flash requires FP8 128x128 weight blocks`（draft 的 ModelConfig 不带 block 信息） | 只对非 `runner=="draft"` 生效 |
+
+### 22.3 最后一道坎（结构性，不是补丁能绕的）
+
+```
+ValueError: Weight input_size_per_partition = 288 is not divisible by
+            weight quantization block_k = 128.
+```
+
+DFly 草稿模型的某个 MLA 投影输入维是 **1152**，在 **TP4** 下每卡 1152/4 = **288**，而 FP8 权重是 **128×128 块量化**，
+要求分片后的输入维必须是 128 的倍数 → 288 ✗（TP8 更差：144 ✗）。
+
+可行的组合只有：
+- **TP1 / TP3**（1152/3 = 384 ✓）——TP1 装不下 160 GB 权重，TP3 与 8 卡拓扑不整除；
+- 或**草稿用 bf16**（需 fp8→bf16 反量化加载，vLLM 当前不支持从 fp8 checkpoint 直接载入 bf16 draft）；
+- 或上游给 draft 做块量化重排（对齐 128 的 TP 分片规则）。
+
+**结论**：在当前"官方 FP8 checkpoint + 8×A100-40G"的约束下，DFly2 **不可达**；
+这与我们之前"DFly 需要 fp8_ds_mla"的判断不同——真正的冲突是**块量化 + TP 分片整除性**。
+若换 BF16 权重（16 卡）或 FP8 非块量化 checkpoint，上述第 7 关之后即可继续。
+
+### 22.4 保留的成果
+
+- MRv2 可用（为将来 `--swa-bounded-replay` 等 MRv2 专享优化铺路）；
+- DFly 的配置层与 6 关修复全部留在分支里，换 checkpoint/拓扑即可继续；
+- 默认部署仍是 **TP4×PP2 + v1 runner**（37.7 ms，c=16 177 tok/s）。

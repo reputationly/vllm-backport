@@ -65,7 +65,11 @@ def validate_runtime(vllm_config: VllmConfig) -> None:
         )
     elif quantization == "fp8":
         fp8_quant = vllm_config.quant_config
-        if list(getattr(fp8_quant, "weight_block_size", None) or []) != [128, 128]:
+        block = list(getattr(fp8_quant, "weight_block_size", None) or [])
+        # A DFly draft is built from the same checkpoint as the target, whose
+        # block size is already validated; the draft's own quant config is a
+        # fresh ModelConfig and does not carry weight_block_size through.
+        if block != [128, 128] and vllm_config.model_config.runner != "draft":
             raise ValueError("HYV4 Flash requires FP8 128x128 weight blocks")
     elif quantization == "online":
         from vllm.config.quantization import QuantizationConfigArgs, QuantSpec
