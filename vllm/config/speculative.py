@@ -76,6 +76,7 @@ SpeculativeMethod = Literal[
     "draft_model",
     "suffix",
     "custom_class",
+    "dfly",
     EagleModelTypes,
     NgramGPUTypes,
     DSparkModelTypes,
@@ -1153,6 +1154,12 @@ class SpeculativeConfig:
                 self.model = "suffix"
             elif self.method == "extract_hidden_states":
                 self.model = "extract_hidden_states"
+            elif self.method == "dfly":
+                if self.target_model_config is None:
+                    raise ValueError("target_model_config must be present for dfly")
+                self.model = self.target_model_config.model
+                if not self.quantization:
+                    self.quantization = self.target_model_config.quantization
             elif self.method == "custom_class":
                 # method was set explicitly, but model should already contain the
                 # custom module path. If not, this is a configuration error.
@@ -1361,7 +1368,7 @@ class SpeculativeConfig:
                             "multiple times of forward on same MTP layer"
                             ",which may result in lower acceptance rate"
                         )
-                elif self.method == "draft_model":
+                elif self.method in ("draft_model", "dfly"):
                     pass
                 else:
                     raise NotImplementedError(
@@ -1910,6 +1917,26 @@ class SpeculativeConfig:
 
     def use_dspark(self) -> bool:
         return self.method == "dspark"
+
+    def use_dfly(self) -> bool:
+        return self.method == "dfly"
+
+    @property
+    def speculator_config(self):
+        """The configured speculator's config (derived per access)."""
+        from vllm.v1.worker.gpu.spec_decode.speculator_config import (
+            get_speculator_config_class,
+        )
+
+        return get_speculator_config_class(self)(self)
+
+    @property
+    def uses_target_hidden_states(self) -> bool:
+        return self.speculator_config.uses_target_hidden_states
+
+    @property
+    def uses_aux_hidden_states(self) -> bool:
+        return self.speculator_config.uses_aux_hidden_states
 
     def uses_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None

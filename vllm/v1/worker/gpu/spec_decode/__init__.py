@@ -26,6 +26,10 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
         )
 
         return DFlashSpeculator(vllm_config, device)
+    elif speculative_config.method == "dfly":
+        from vllm.models.hy_v4.nvidia.dfly_speculator import HYV4DFlySpeculator
+
+        return HYV4DFlySpeculator(vllm_config, device)
     elif speculative_config.method == "dspark":
         from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
             DSparkSpeculator,

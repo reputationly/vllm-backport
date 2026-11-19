@@ -199,9 +199,11 @@ class HYV4DFlySpeculatorConfig(DFlySpeculatorConfig):
 
     @classmethod
     def verify_target_parallel_config(cls, spec: "SpeculativeConfig") -> None:
+        # Pipeline parallelism is allowed: the DFly draft attaches to a fixed set
+        # of target layers (dfly_target_kv_layers) and works as long as they all
+        # live on the last stage, which holds the draft and its KV.
         for field in (
             "data_parallel_size",
-            "pipeline_parallel_size",
             "prefill_context_parallel_size",
             "decode_context_parallel_size",
         ):

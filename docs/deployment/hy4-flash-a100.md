@@ -476,3 +476,41 @@ if spec.kv_cache_dtype not in (None, "auto", "bfloat16", "fp8_ds_mla"):
    预估 2.4 ms → ~1.0 ms/层，每步省 ~8 ms（38.6 → ~31 ms）；
 2. 或重试 Triton 版 prep（单 kernel，~0.05 ms），但此前它在引擎进程内会卡在 JIT，需要先解决；
 3. TP 分片留到"索引器变成算力瓶颈"时再做（例如未来支持投机解码、batch 变大之后）。
+
+## 19. DFly + PP>1 实测：卡在"模型运行器代际"，不是 PP（2026-11-19）
+
+### 19.1 已完成的移植（4 处，全部通过）
+
+按 PR #68296 的最小化移植（已在外挂里、**默认不激活**）：
+
+1. 拷入 `v1/worker/gpu/spec_decode/speculator_config.py`（497 行注册层，PR 原样，只依赖 `resolve_obj_by_qualname`）；
+2. 拷入 `v1/worker/gpu/spec_decode/dfly/`（`DFlySpeculatorConfig`）与 `v1/worker/gpu/sample/greedy_argmax.py`（64 行）；
+3. `config/speculative.py`：方法白名单加 `"dfly"`、`__post_init__` 增加 `elif self.method == "dfly"` 分支（model 取 target checkpoint）、
+   放宽第二处 `Unsupported speculative method`、新增 `speculator_config` / `uses_target_hidden_states` / `uses_aux_hidden_states` / `use_dfly`；
+4. `models/hy_v4/dfly_config.py`：**放开 `pipeline_parallel_size == 1` 断言**（DFly 的 5 个 draft 目标层 25/29/33/37/41 在 PP2 下全在 stage 1，
+   draft 及其 KV 都在该 stage，结构上可行）。
+
+配置层现在完全接受 `--speculative-config '{"method":"dfly","num_speculative_tokens":5}'`（已越过 pydantic 校验、白名单、两处 dispatch）。
+
+### 19.2 真正的拦路虎：DFly 只有 **MRv2**（model runner v2）实现
+
+启动推进到 worker 侧后报：
+
+```
+ValueError: Unknown speculative decoding method: dfly
+  at vllm/v1/worker/gpu_model_runner.py:698   ← v1 runner 的 proposer 分派
+```
+
+- PR 的 `HYV4DFlySpeculator` 继承 `v1/worker/gpu/spec_decode/speculator.py::DraftModelSpeculator`，
+  依赖 `ModelState` / `InputBatch` / `DpasyncState` / `build_slot_mappings_by_layer` 等 **MRv2 基础设施**；
+- 我们这条线一直跑在 **v1 model runner**（`VLLM_USE_V2_MODEL_RUNNER` 默认未设），v1 里根本没有 DFly proposer，只有 ngram/eagle/medusa/dflash/dspark 等；
+- 因此要让 DFly 跑起来，必须切到 `VLLM_USE_V2_MODEL_RUNNER=1`，而那意味着**整个 sm80 外挂要在 MRv2 上重新验证**
+  （我们的 TRITON_MLA_SPARSE 绑定、SWA 后端、sink、IndexPool prep、页对齐等全部是在 v1 上调通的）。
+
+### 19.3 结论与建议
+
+- **"DFly + PP>1" 技术上没有被 PP 挡住**（断言已放开，且层归属分析支持它）；挡住它的是 runner 代际。
+- 前置条件变成：把整条链切到 MRv2 并在 sm80 上重新跑四门（预计是又一轮完整适配，不是小补丁）。
+- 建议顺序：先在 **MRv2 + 当前无投机**的配置下验证 TP4×PP2 是否同样正常（这本身就能带来收益，
+  `swa-bounded-replay` 等 MRv2 专享优化也才能用），再叠加 DFly。
+- 保留的 scaffolding（注册层 + dfly 包 + 白名单 + PP 放宽）不改变默认行为，可随时在 MRv2 上继续。
