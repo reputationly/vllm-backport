@@ -552,3 +552,37 @@ PR #68296 只带了 reasoning parser，没有 tool parser，所以 `--tool-call-
 | reasoning + tools 共存 | ✅（思考照常进 `reasoning_content`） |
 
 （注：工具参数是字符串字典，`unit: "c"` 这类值由模型自己填，不做类型强制转换——与模板约定一致。）
+
+## 21. 按步缓存 index 数学：实现完成，但收益被 CUDA graph 吃掉了（2026-11-19）
+
+### 21.1 做了什么
+
+`prepare_groups`（torch 版）拆成"每步不变量 + 每层 gather"：
+
+- 不变量：`ends/context/req/group/member/old/source/src_ok/src_idx/block/first%ring/member%ring/
+  use_xyz/pos_values/req_t/logical/upper/live_t` —— 只依赖 `query_start_loc`、`seq_lens`、
+  `block_table`、`positions` 与本步的 `tokens/ratio/ring/dim`；
+- 缓存键用**原始张量的 id**（并在缓存里持有强引用，防止 id 被回收后复用），因此"命中"严格等价于"同一 step"；
+- 命中统计（`HY4_CACHE_STATS=1`）实测：**hit 5–8 / miss 2，命中率 0.71–0.80**（每个 stage 6 个稀疏层）。
+
+### 21.2 数值与隔离性能
+
+- 与旧实现逐元素对比（1/6/2048/8192 token、命中与未命中路径）：**max|d| = 0.000e+00，完全一致**；
+- 单函数隔离基准：**2.53–2.57 ms → 0.61–0.64 ms（约 4×）**。
+
+### 21.3 端到端：只快了 2%（38.6 → 37.7 ms）——原因明确
+
+| 配置 | TPOT | decode | prefill @8K | c=16 聚合 |
+|---|---|---|---|---|
+| 优化前 | 38.6 ms | 25.9 tok/s | 4,773 tok/s | 176.4 tok/s |
+| 优化后 | **37.7 ms** | 26.5 tok/s | 4,746 tok/s | 177.5 tok/s |
+
+原因：**开了 `FULL_DECODE_ONLY` 之后，decode 步的 Python 代码根本不重跑**——CUDA graph 回放只重放捕获到的
+GPU kernel，所以 `prepare_groups` 的 CPU 侧 2.4 ms 从来就不在 decode 的关键路径上。我上一轮"每步省 8 ms"的
+估算，在**图开启**的配置下不成立（在 eager 模式下才成立，那时 456 ms 的步骤里相当一部分正是这些 launch）。
+
+### 21.4 结论
+
+- 保留该优化：数值严格等价、隔离快 4×、CPU 压力更低（高并发下有余量），代价是一段可读的缓存代码；
+- 但它**不是**当前 TPOT 的瓶颈。38 ms 现在是纯 GPU 时间（层计算 + 每层 2 次集合通信）；
+  要再压只能从"减少每步 GPU 工作"下手：投机解码（DFly2，需 MRv2）、或降低每层通信量（TP 更细/单机更大）。

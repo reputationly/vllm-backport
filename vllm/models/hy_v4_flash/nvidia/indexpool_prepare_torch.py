@@ -50,26 +50,83 @@ def _live_ends(starts: torch.Tensor, lengths: torch.Tensor, ratio: int):
     return torch.cumsum(count, dim=0), context
 
 
-def prepare_groups(keys, positions, tail, table, starts, lengths, tokens, ratio):
-    device = keys.device
-    _dbg("prepare_groups", keys=keys, positions=positions, tail=tail, table=table, starts=starts, lengths=lengths, tokens=tokens, ratio=ratio)
-    starts = starts.reshape(-1).to(torch.int64)
-    lengths = lengths.reshape(-1).to(torch.int64)
+_STEP_CACHE: dict[str, object] = {"key": None, "bundle": None, "pin": None}
+_CALL_COUNTS: dict[str, list] = {}
+
+
+def _count(label: str) -> None:
+    """Print a per-15s call rate for `label` when HY4_TIMING is set."""
+    import os
+    import time as _t
+
+    if not os.environ.get("HY4_TIMING"):
+        return
+    slot = _CALL_COUNTS.setdefault(label, [0, _t.time()])
+    slot[0] += 1
+    now = _t.time()
+    if now - slot[1] >= 15.0:
+        print(f"HY4_RATE {label} {slot[0] / (now - slot[1]):.1f}/s", flush=True)
+        slot[0], slot[1] = 0, now
+
+
+_CACHE_STATS = {"hit": 0, "miss": 0, "since": 0.0}
+
+
+def _note_cache(hit: bool) -> None:
+    import os
+    import time as _t
+
+    if not os.environ.get("HY4_CACHE_STATS"):
+        return
+    _CACHE_STATS["hit" if hit else "miss"] += 1
+    now = _t.time()
+    if _CACHE_STATS["since"] == 0.0:
+        _CACHE_STATS["since"] = now
+    elif now - _CACHE_STATS["since"] >= 15.0:
+        h, m = _CACHE_STATS["hit"], _CACHE_STATS["miss"]
+        total = h + m
+        print(
+            f"HY4_CACHE hit={h} miss={m} rate={h / total:.2f}",
+            flush=True,
+        )
+        _CACHE_STATS.update(hit=0, miss=0, since=now)
+
+
+def _step_index_math(starts_raw, lengths_raw, table_raw, positions, tokens, ratio, ring,
+                     dim, device):
+    """Index math shared by every sparse layer of one forward step.
+
+    `ends/context/req/group/member/source/block` only depend on the scheduler's
+    `query_start_loc`, `seq_lens`, `block_table` and the step's positions, so the
+    six sparse layers of a stage would otherwise recompute the same ~20 small
+    tensors six times. Keyed on the *original* tensor identities and pinned so an
+    id cannot be recycled between steps, which makes a hit exactly "same step".
+    """
+    key = (
+        id(starts_raw),
+        id(lengths_raw),
+        id(table_raw),
+        id(positions),
+        int(tokens),
+        int(ratio),
+        int(ring),
+        int(dim),
+    )
+    if _STEP_CACHE["key"] == key:
+        _note_cache(True)
+        return _STEP_CACHE["bundle"]
+    _note_cache(False)
+
+    starts = starts_raw.reshape(-1).to(torch.int64)
+    lengths = lengths_raw.reshape(-1).to(torch.int64)
     batch = int(lengths.numel())
     slots = (tokens + batch * (ratio - 1)) // ratio
-    dim = keys.shape[-1]
     ends, context = _live_ends(starts, lengths, ratio)
-    # NOTE: never materialise `tail` here - under PP/packed layouts it is a
-    # strided view over the whole KV buffer and `.contiguous()` would copy it.
-    tail_c = tail
-    ring = tail.shape[1]
 
-    # ---- per slot: which request, which group, which members ----
     slot = torch.arange(slots, device=device, dtype=torch.int64)
-    req = torch.searchsorted(ends, slot, right=True)  # first r with ends[r] > slot
+    req = torch.searchsorted(ends, slot, right=True)
     slot_live = req < batch
     req_c = torch.clamp(req, max=max(batch - 1, 0))
-
     start_s = starts[req_c]
     end_s = starts[req_c + 1]
     ctx_s = torch.clamp(lengths[req_c] - (end_s - start_s), min=0)
@@ -80,34 +137,26 @@ def prepare_groups(keys, positions, tail, table, starts, lengths, tokens, ratio)
     )
     group = ctx_s // ratio + slot - prev
     first = group * ratio
-    block = table.reshape(-1)[req_c].to(torch.int64)
+    block = table_raw.reshape(-1)[req_c].to(torch.int64)
 
-    member = first[:, None] + torch.arange(ratio, device=device, dtype=torch.int64)
+    members = torch.arange(ratio, device=device, dtype=torch.int64)
+    member = first[:, None] + members
     old = member < ctx_s[:, None]
     source = start_s[:, None] + member - ctx_s[:, None]
     src_ok = (source >= 0) & (source < tokens)
     src_idx = torch.clamp(source, 0, max(tokens - 1, 0))
 
-    retained = tail_c[block[:, None], member % ring, :dim]
-    current = _gather_rows(keys, src_idx.reshape(-1)).reshape(slots, ratio, dim)
-    raw = torch.where(old[:, :, None], retained, torch.where(
-        src_ok[:, :, None], current, torch.zeros_like(current)
-    )).to(keys.dtype)
-    raw = torch.where(slot_live[:, None, None], raw, torch.zeros_like(raw))
-
-    # ---- per group: the first member's mRoPE coordinates ----
-    xyz = tail_c[block, first % ring, dim : dim + 3]
+    # coordinates fall back to the token positions for the group's first member
     source_first = start_s + first - ctx_s
     sf = torch.clamp(source_first, 0, max(tokens - 1, 0))
-    pos = _pos_of(positions, sf)
-    coordinates = torch.where((first < ctx_s)[:, None], xyz, pos.to(xyz.dtype))
-    coordinates = torch.where(slot_live[:, None], coordinates, torch.zeros_like(coordinates))
-    coordinates = coordinates.transpose(0, 1).contiguous()  # [3, slots]
+    pos_values = _pos_of(positions, sf).contiguous()
+    use_xyz = (first < ctx_s)[:, None]
 
-    # ---- per token metadata ----
     tok = torch.arange(tokens, device=device, dtype=torch.int64)
     req_t = torch.clamp(
-        torch.searchsorted(starts, tok, right=True) - 1, min=0, max=max(batch - 1, 0)
+        torch.searchsorted(starts, tok, right=True) - 1,
+        min=0,
+        max=max(batch - 1, 0),
     )
     start_t = starts[req_t]
     end_t = starts[req_t + 1]
@@ -116,35 +165,76 @@ def prepare_groups(keys, positions, tail, table, starts, lengths, tokens, ratio)
     logical = torch.clamp(ctx_t, min=0) + tok - start_t
     upper = torch.where(live_t, logical // ratio, torch.zeros_like(logical))
 
-    group_positions = coordinates if positions.ndim == 2 else coordinates[0]
+    bundle = {
+        "slots": slots,
+        "batch": batch,
+        "member_row": (member % ring).reshape(-1),
+        "member_sel": member % ring,
+        "first_row": first % ring,
+        "old": old,
+        "src_ok": src_ok,
+        "src_idx": src_idx.reshape(-1),
+        "block": block,
+        "use_xyz": use_xyz,
+        "pos_values": pos_values,
+        "slot_live": slot_live,
+        "req_c": req_c,
+        "group": group,
+        "flat_positions": positions.ndim != 2,
+        "req_t": req_t,
+        "logical": logical,
+        "upper": upper,
+        "live_t": live_t,
+    }
+    _STEP_CACHE["key"] = key
+    _STEP_CACHE["bundle"] = bundle
+    _STEP_CACHE["pin"] = (starts_raw, lengths_raw, table_raw, positions)
+    return bundle
+
+
+def prepare_groups(keys, positions, tail, table, starts, lengths, tokens, ratio):
+    device = keys.device
+    _dbg(
+        "prepare_groups", keys=keys, positions=positions, tail=tail, table=table,
+        starts=starts, lengths=lengths, tokens=tokens, ratio=ratio,
+    )
+    dim = keys.shape[-1]
+    ring = tail.shape[1]
+    inv = _step_index_math(
+        starts, lengths, table, positions, tokens, ratio, ring, dim, device
+    )
+    slots = inv["slots"]
+    old, src_ok, slot_live = inv["old"], inv["src_ok"], inv["slot_live"]
+    block = inv["block"]
+
+    retained = tail[block[:, None], inv["member_sel"], :dim]
+    current = _gather_rows(keys, inv["src_idx"]).reshape(slots, ratio, dim)
+    raw = torch.where(
+        old[:, :, None],
+        retained,
+        torch.where(src_ok[:, :, None], current, torch.zeros_like(current)),
+    ).to(keys.dtype)
+    raw = torch.where(slot_live[:, None, None], raw, torch.zeros_like(raw))
+
+    xyz = tail[block, inv["first_row"], dim : dim + 3]
+    coordinates = torch.where(inv["use_xyz"], xyz, inv["pos_values"].to(xyz.dtype))
+    coordinates = torch.where(
+        slot_live[:, None], coordinates, torch.zeros_like(coordinates)
+    )
+    coordinates = coordinates.transpose(0, 1).contiguous()
+
+    group_positions = coordinates if not inv["flat_positions"] else coordinates[0]
     return (
         raw.contiguous(),
         group_positions.contiguous(),
-        req_c.to(torch.int32).contiguous(),
-        group.contiguous(),
+        inv["req_c"].to(torch.int32).contiguous(),
+        inv["group"].contiguous(),
         slot_live.contiguous(),
-        req_t.to(torch.int32).contiguous(),
-        logical.contiguous(),
-        upper.to(torch.int32).contiguous(),
-        live_t.contiguous(),
+        inv["req_t"].to(torch.int32).contiguous(),
+        inv["logical"].contiguous(),
+        inv["upper"].to(torch.int32).contiguous(),
+        inv["live_t"].contiguous(),
     )
-
-
-_COUNTS: dict[str, list] = {}
-
-
-def _count(label: str) -> None:
-    import time as _t
-
-    slot = _COUNTS.setdefault(label, [0, _t.time()])
-    slot[0] += 1
-    now = _t.time()
-    if now - slot[1] >= 15.0:
-        print(
-            f"HY4_RATE {label} {slot[0] / (now - slot[1]):.1f}/s",
-            flush=True,
-        )
-        slot[0], slot[1] = 0, now
 
 
 def _timed(label, fn, *a, **kw):
