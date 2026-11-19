@@ -349,3 +349,44 @@ Hy4-flash 直连（2×4 A100-40G，TP8+EP，`--enforce-eager`）。同一脚本 
 
 结论：**TP 收进节点内是决定性的一步**（456 → 38.6 ms，11.8×）。与 MiniMax 同量级，
 与 Qwen/DS 的差距剩下的是个位数毫秒级 + 投机解码（Hy4 的 DFly2 需要 `fp8_ds_mla` KV，sm80 不可用）。
+
+## 16. 现网参数对照：我们借鉴了什么、哪些用不了（2026-11-19）
+
+从 gpustack API 取到现网三个模型的**完整** `backend_parameters` + `env`，逐项对照：
+
+### 16.1 已借鉴并生效（TP4×PP2 上实测）
+
+| 参数 | 现网取值 | 我们的取值 | 效果 |
+|---|---|---|---|
+| `--max-num-seqs` | 16 | **16**（原 2） | 并发聚合吞吐 c=1 22.3 → c=8 94.2 → c=16 **176.4 tok/s** |
+| `--compilation-config` | `max_cudagraph_capture_size: 32`（minimax） | 同 | 覆盖 1–32 各种 batch，避免反复重捕获 |
+| `--max-num-queued-tokens / --max-num-queued-reqs` | 1750000 / 48 | 同 | 队列控制，长 prompt 混跑不饿死 |
+| `--no-enable-flashinfer-autotune` | qwen 在用 | 同 | 避免首请求 autotune 停顿 |
+| `--prefix-match-unit` | 16 | 同 | 前缀缓存粒度对齐 16 |
+| `--long-prefill-token-threshold` | 8192 | 同 | 超长 prefill 分块 |
+| `--enable-prefix-caching` | 显式开 | 同 | 命中 TTFT 从 3.5 s → 0.5 s |
+| `--disable-access-log-for-endpoints=/metrics` | gpustack 注入 | 同 | 去掉 metrics 刷屏 |
+| `OMP_NUM_THREADS` | 8 | 同 | 与现网一致 |
+| `NCCL_TIMEOUT / NCCL_IB_TIMEOUT` | 3600 / 22 | 同 | 长任务不误判超时 |
+
+调优后实测（官方 FP8 全量权重，TP4×PP2，单机 4 卡 ×2 节点）：
+
+- 单流：TTFT 571 ms @2K、**TPOT 38.7 ms**、prefill 4,792 tok/s @8K；
+- 并发：**c=1 22.3 / c=8 94.2 / c=16 176.4 tok/s**，TTFT p50 ≈ 1.25 s；
+- **KV 497,073 tokens**（32K × 15.17 并发）；
+- 视觉 4/4 仍通过。
+
+### 16.2 试了但不适用 / 不兼容
+
+| 项 | 结论 |
+|---|---|
+| `--block-size 128`（现网 minimax） | ❌ Hy4 必须 64：页对齐后 `block stride 1396224 != page 16896`，BLNHC 布局校验直接报错 |
+| `--moe-backend=marlin`（minimax） | ❌ 该开关只对 DeepSeek-V4 生效（`config/kernel.py` 里显式限制） |
+| `--swa-bounded-replay`（DS-V4.1） | ❌ 只在 `models/deepseek_v4_1/attention.py` 里实现，Hy4 走自己的 SWA 后端 |
+| `VLLM_INDEXER_QUERY_SHARD=1`（DS-V4.1） | ❌ 只作用于 `v1/attention/backends/mla/indexer.py`；Hy4 是自研 `compressed_indexer.py`。**但值得移植**：它的门槛只是 `tp>1 && dcp==1 && !pcp`，Hy4 的 IndexPool 目前在 TP 上是全复制的，按查询分片可省 4× 索引器算力 |
+| `--speculative-config`（qwen mtp×3 / DS dspark×5） | ❌ Hy4 的 DFly2 需要 target/draft 共享 KV 且 KV 必须 `fp8_ds_mla`，sm80 不可用 |
+| `--kv-cache-dtype fp8` | ⚠️ Hy4 白名单只接受 `bfloat16` / `fp8_ds_mla`；后者在 sm80 未验证 |
+| `--kv-transfer-config` Mooncake | ⏭ 需要 Mooncake 集群（现网 38 台都跑 `mooncake_client`），属基础设施级，未接入 |
+| `VLLM_PLE_CPU_OFFLOAD=1`（qwen） | ➖ 等价于我们已在用的 `--engram-config '{"cpu_offload": true}'` |
+| `VLLM_USE_BREAKABLE_CUDAGRAPH=0` | ➖ 默认即 0，无差别 |
+| `--reasoning-parser / --tool-call-parser` | ⏭ Hy4 有 `renderers/hy_v4.py`，接 chat API 时应配上对应 parser 名（尚未接） |
