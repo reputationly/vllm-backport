@@ -308,3 +308,44 @@ Hy4-flash 直连（2×4 A100-40G，TP8+EP，`--enforce-eager`）。同一脚本 
 → TPOT ≈ 87–95 ms（11 tok/s），视觉/文本正确性不变。decode 此时被 TCP 集合通信延迟主导
 （42 层 × 2 次 all-reduce × ~1 ms）。要再快需要：TP 收进单节点（TP4×PP2，当前被 mp 后端 PP rank 布局断言挡住）、
 或单机 8 卡（NVLink），或把 verbs-in-graph 打通。
+
+## 15. TP4×PP2：把 TP 收进节点内后，全量权重拿到 38.6 ms TPOT（2026-11-19）
+
+### 15.1 做法
+
+`--tensor-parallel-size 4 --pipeline-parallel-size 2`（2 节点 × 4 卡），**不用 EP**
+（TP4 下专家中间维 1536/4 = 384 = 3×128，Marlin FP8 可用），
+`FULL_DECODE_ONLY` 图 + `NCCL_IB_DISABLE=0`（RoCE 可用），`--max-model-len 32768`。
+
+为让 PP 成立补的四处代码（`vllm/models/hy_v4_flash/nvidia/model.py` + `indexpool_prepare_torch.py`）：
+
+1. **Engram 只在本 stage 拥有的层上构建**（关键）：否则每个 stage 都要求 stage-0 的 Engram 权重，
+   报 `Missing Flash checkpoint weights: layers.0.engram_layer.*`；
+2. **Engram 前向 PP 化**：非首 stage 从 `intermediate_tensors["hidden_states"]` 取激活
+   （`copy_pp_buffers` 同步缓冲），非末 stage 返回 `IntermediateTensors`
+   （iHC 模式按 `hidden.flatten(1)` 传），并只遍历 `[start_layer, end_layer)`；
+3. **`verify_loaded_parts` 跳过非本 stage 的 Engram 部件**；
+4. **`prepare_groups` 去掉 `tail.contiguous()`**：packed 布局下 tail 是跨步视图，
+   contiguous 会把整块 KV（9.95 GiB）拷一份 → PP 下直接 OOM。
+
+### 15.2 实测（官方 FP8 全量权重，2×4 A100-40G，单流 greedy out=64）
+
+| 配置 | TPOT | decode | prefill @8K | TTFT @8K |
+|---|---|---|---|---|
+| TP8×EP，eager（旧） | 456 ms | 2.2 tok/s | 2,261 tok/s | 3,505 ms |
+| TP8×EP，TCP+图 | 87 ms | 11.4 tok/s | 2,261 tok/s | 3,628 ms |
+| **TP4×PP2，RoCE+图** | **38.6 ms** | **25.9 tok/s** | **4,773 tok/s** | **1,718 ms** |
+
+视觉 `vision_test.py` **4/4** 通过（同一配置），说明 PP 路径数值正确。
+
+与现网对比（同为单流）：
+
+| 模型 | TPOT | 卡数 |
+|---|---|---|
+| **Hy4-flash（TP4×PP2）** | **38.6 ms** | 8 |
+| minimax-m3.1-flash | 31.3 ms | 16 |
+| qwen3.8-flash-fp8 | 5.0 ms | 8（TP 在节点内 + mtp×3 投机） |
+| deepseek-v4-1-flash | 4.4 ms | 24（TP 在节点内 + dspark×5 投机） |
+
+结论：**TP 收进节点内是决定性的一步**（456 → 38.6 ms，11.8×）。与 MiniMax 同量级，
+与 Qwen/DS 的差距剩下的是个位数毫秒级 + 投机解码（Hy4 的 DFly2 需要 `fp8_ds_mla` KV，sm80 不可用）。

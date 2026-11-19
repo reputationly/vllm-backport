@@ -16,11 +16,13 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.models.hy_v4.nvidia.hc import HYV4HCLayer
 from vllm.models.hy_v4.nvidia.model import (
+    copy_pp_buffers,
     HYV4DecoderLayer,
     HYV4ForCausalLM,
     HYV4Model,
 )
 from vllm.models.hy_v4_flash.configs import HYV4FlashConfig
+from vllm.distributed import get_pp_group
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
@@ -148,7 +150,14 @@ class HYV4FlashModel(HYV4Model):
             self.engram_hash = FlashNgramHashState(
                 self.config, dummy=vllm_config.load_config.load_format == "dummy"
             )
+            start_layer = getattr(self, "start_layer", 0)
+            end_layer = getattr(self, "end_layer", self.config.num_hidden_layers)
             for layer_id in self.config.engram_layer_ids:
+                # Only the pipeline stage that owns this layer builds its Engram
+                # module; otherwise every stage would require the stage-0 Engram
+                # checkpoint weights and weight loading fails under PP.
+                if not (start_layer <= layer_id - 1 < end_layer):
+                    continue
                 self.layers[layer_id - 1].engram_layer = FlashEngram(
                     vllm_config,
                     self.engram_hash.layout,
@@ -158,6 +167,16 @@ class HYV4FlashModel(HYV4Model):
         self.token_lookback_depth = (
             self.config.engram_max_ngram_size - 1 if self.engram_hash is not None else 0
         )
+        self._owned_engram_layers = tuple(
+            layer_id
+            for layer_id in (self.config.engram_layer_ids or ())
+            if self._owns_layer(layer_id - 1)
+        )
+
+    def _owns_layer(self, index: int) -> bool:
+        start = getattr(self, "start_layer", 0)
+        end = getattr(self, "end_layer", self.config.num_hidden_layers)
+        return start <= index < end
 
     def forward(
         self,
@@ -167,17 +186,23 @@ class HYV4FlashModel(HYV4Model):
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self.engram_hash is None:
+        if self.engram_hash is None or not self._owned_engram_layers:
             return super().forward(
                 input_ids, positions, intermediate_tensors, inputs_embeds
             )
         if input_ids is None:
             raise ValueError("Flash Engram requires original input token IDs")
-        hidden = (
-            inputs_embeds
-            if inputs_embeds is not None
-            else self.embed_input_ids(input_ids)
-        )
+        if get_pp_group().is_first_rank:
+            hidden = (
+                inputs_embeds
+                if inputs_embeds is not None
+                else self.embed_input_ids(input_ids)
+            )
+        else:
+            # Later pipeline stages receive the activations, not embeddings.
+            assert intermediate_tensors is not None
+            hidden = intermediate_tensors["hidden_states"]
+            copy_pp_buffers(intermediate_tensors, self.pp_buffers)
         hashes = input_ids.new_empty(
             (
                 len(self.config.engram_layer_ids),
@@ -189,18 +214,30 @@ class HYV4FlashModel(HYV4Model):
         self.engram_hash.prepare_hashes_with_output(
             input_ids,
             lookback_token_ids,
-            self.layers[0].self_attn.mla_attn.layer_name,
+            self.layers[self._owned_engram_layers[0] - 1].self_attn.mla_attn.layer_name,
             hashes,
         )
         hash_indices = {
             layer_id - 1: index
             for index, layer_id in enumerate(self.config.engram_layer_ids)
         }
-        for index, layer in enumerate(self.layers):
-            if index in hash_indices:
+        start = getattr(self, "start_layer", 0)
+        end = getattr(self, "end_layer", len(self.layers))
+        for index in range(start, end):
+            layer = self.layers[index]
+            if index in hash_indices and getattr(layer, "engram_layer", None) is not None:
                 hidden = layer.hc_attn_layer.prepare_input(hidden)
                 hidden = layer.engram_layer(hidden, hashes[hash_indices[index]])
             hidden, _ = layer(positions, hidden, None)
+        if not get_pp_group().is_last_rank:
+            buffers = {k: v[: positions.shape[0]] for k, v in self.pp_buffers.items()}
+            if self.enable_ihc:
+                return IntermediateTensors(
+                    {"hidden_states": hidden.flatten(1), **buffers}
+                )
+            return IntermediateTensors(
+                {"hidden_states": hidden, "residual": None, **buffers}
+            )
         return self.norm(self.hc_head(hidden))
 
     def _record_part(self, name: str, part: Any) -> None:
@@ -318,6 +355,9 @@ class HYV4FlashModel(HYV4Model):
 
     def verify_loaded_parts(self) -> None:
         for layer_id in self.config.engram_layer_ids or ():
+            # Stage owns only its slice; other stages simply have no Engram part.
+            if not self._owns_layer(layer_id - 1):
+                continue
             prefix = f"layers.{layer_id - 1}.engram_layer."
             required = {
                 prefix + "lookup_table",

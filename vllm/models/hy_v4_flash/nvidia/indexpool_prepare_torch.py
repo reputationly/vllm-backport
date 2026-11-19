@@ -59,8 +59,10 @@ def prepare_groups(keys, positions, tail, table, starts, lengths, tokens, ratio)
     slots = (tokens + batch * (ratio - 1)) // ratio
     dim = keys.shape[-1]
     ends, context = _live_ends(starts, lengths, ratio)
-    tail_c = tail.contiguous()
-    ring = tail_c.shape[1]
+    # NOTE: never materialise `tail` here - under PP/packed layouts it is a
+    # strided view over the whole KV buffer and `.contiguous()` would copy it.
+    tail_c = tail
+    ring = tail.shape[1]
 
     # ---- per slot: which request, which group, which members ----
     slot = torch.arange(slots, device=device, dtype=torch.int64)
