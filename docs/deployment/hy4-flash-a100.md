@@ -1242,3 +1242,41 @@ Python 侧算子冲突。**66 ms 地板的路线仍需重写 op（方案 A）**�
 
 默认已切到**编译版**：`TP4×PP2 / bf16 KV / FULL_DECODE_ONLY + mode=3 / KV 484,729 tokens`，
 实测 TTFT 地板 356 ms、TPOT 30.0 ms、视觉 4/4。高并发场景可退回到 `CGMODE` 不变、把装饰器撤掉（eager）。
+
+## 36. 阶段 C（6/12）：PIECEWISE 仍被"padding 安全性"挡住
+
+### 36.1 本轮尝试
+
+针对 §33 的回放期越界，给三个 KV 写入路径加了**防御性 clamp**：
+- `prepare_groups`：`block = inv["block"].clamp(0, tail.shape[0]-1)`；
+- `write_tails`：`block = block.clamp(0, tail.shape[0]-1)`；
+- `write_pool`：`owners.clamp(0, table.shape[0]-1)`。
+（踩坑：第一个 clamp 误插到 `_step_index_math`，那里没有 `tail`，导致 `NameError`；已改到真正做 gather 的 `prepare_groups`。）
+
+### 36.2 结果：仍是同一个越界，但**位置变了**
+
+```
+IndexKernel.cu:111: Assertion `-sizes[i] <= index && index < sizes[i]` failed
+```
+
+我们的三个写入路径已 clamp，说明这次的越界发生在**非 opaque 的追踪区**（inducer 编译的普通 torch 代码），
+而 PIECEWISE 捕获时会用 **padding 后的 dummy batch**，padding 行的输入是垃圾值，某个索引算子（最可能是
+MoE 路由/EAGLE 之外的 gather、或 iHC/embedding 的 index）直接用到了它们。
+
+### 36.3 技术结论：PIECEWISE 要求整模型"padding 安全"
+
+vLLM 的 piecewise 图在回放时**不执行 Python**，所以：
+- 我们在 op 里用 `num_actual_tokens` 这类 **Python int** 推出的尺寸在捕获期就被冻结；
+- padding 行的内容没人保证合法，任何"用输入行数当边界"的索引都会越界。
+
+要真正支持 piecewise，必须让**整个 traced 区域**做到 padding-safe（每个索引按 metadata 张量做掩码），
+这是比"再包几个 custom op"大得多的重构；本 fork 里其它能跑 piecewise 的模型（DeepSeek 系列）
+本来就是按这个前提写的。
+
+### 36.4 当前交付（可用且更快）
+
+`FULL_DECODE_ONLY + mode=VLLM_COMPILE`（§35）：视觉 4/4、文本与 eager 一致、
+TTFT 地板 515→356 ms（1.45×）、TPOT 37.4→30.0 ms（1.25×）；高并发劣于 eager。
+
+**66 ms 地板未达成**，差距明确：需要把 attention/indexer/engram 的 Python 编排改成
+padding-safe 的单 kernel/custom-op 实现（方案 A），代价是重写这几段核心路径。

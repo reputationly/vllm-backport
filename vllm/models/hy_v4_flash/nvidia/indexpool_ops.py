@@ -138,7 +138,10 @@ def _write_pool_impl(
     """Inner scatter; use `write_pool` (a custom op) from model code."""
     page_size = cache.shape[1]
     columns = (groups // page_size).clamp(0, table.shape[1] - 1)
-    base = table[owners, columns].long() * cache.stride(0)
+    safe_owners = owners.clamp(0, table.shape[0] - 1)
+    # Clamping the ids is enough: with valid owners/columns every offset below is
+    # a legitimate block address, so no separate bound check is needed.
+    base = table[safe_owners, columns].long() * cache.stride(0)
     row = groups % page_size
     if groups.numel() == 0:
         return

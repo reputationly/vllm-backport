@@ -340,7 +340,9 @@ def _prepare_groups_impl(keys, positions, tail, table, starts, lengths, tokens, 
     )
     slots = inv["slots"]
     old, src_ok, slot_live = inv["old"], inv["src_ok"], inv["slot_live"]
-    block = inv["block"]
+    # Padding rows in a captured graph can carry stale ids; clamp so a replay
+    # cannot index past the tail cache.
+    block = inv["block"].clamp(0, tail.shape[0] - 1)
 
     retained = tail[block[:, None], inv["member_sel"], :dim]
     current = _gather_rows(keys, inv["src_idx"]).reshape(slots, ratio, dim)
@@ -413,6 +415,7 @@ def _write_tails_impl(keys, positions, tail, table, starts, lengths) -> None:
     context = lengths - seg
     req = torch.arange(batch, device=device, dtype=torch.int64)
     block = table.reshape(-1)[req].to(torch.int64)
+    block = block.clamp(0, tail.shape[0] - 1)
 
     off = torch.arange(ring, device=device, dtype=torch.int64)
     token = lengths[:, None] - ring + off[None, :]
