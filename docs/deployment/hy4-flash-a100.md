@@ -1369,3 +1369,29 @@ TP4×PP2（2 节点 ×4 卡）, bf16 KV, block 64
 --reasoning-parser hy_v4 --enable-auto-tool-choice --tool-call-parser hy_v4
 KV 484,779 tokens；TTFT 地板 356 ms；TPOT 30 ms；c=16 235 tok/s；视觉 4/4
 ```
+
+## 39. 阶段 C（8/12 收尾）：穷尽所有图捕获组合后的矩阵
+
+| 组合 | 服务 | 数值 | TTFT 地板 | 备注 |
+|---|---|---|---|---|
+| eager（无装饰器） | ✅ | ✅ 基准 | 515 ms | 旧默认 |
+| compile + `FULL_DECODE_ONLY` | ✅ | ✅ 视觉 4/4、`seq` 逐字一致 | **356 ms** | **现默认（最优）** |
+| compile + `FULL` | ✅ | ✅ | 347–362 ms | 只捕获 uniform-decode，prefill 未捕获 |
+| compile + `PIECEWISE` | 起得来 | ❌ device assert（`graphs.replay` 内） | （曾测得 66 ms） | 被 padding 安全性挡住 |
+| compile + `PIECEWISE` + `VLLM_USE_BREAKABLE_CUDAGRAPH=1` + 5 个 op 加 `@eager_break_during_capture` | 起得来 | ❌ 同一 assert | — | 另修掉 `weak_ref_tensor` 不支持 CPU 张量（Engram host 表改闭包） |
+| compile + `FULL` + breakable CG | ✅ | ✅（`frac` 与 eager **逐字一致**） | 440 ms | 正确但更慢（每层 eager 断点） |
+| `mode=2`（DYNAMO_TRACE_ONCE）+ 无图 | ✅ | ✅ | 347 ms | decode 仅 3.4 tok/s，不可用 |
+| `cudagraph_mode=NONE` + `mode=3` | ✅ | ✅（= eager） | 515 ms | vLLM 降级为不编译 |
+
+**六种图捕获组合全部实测完毕**。唯一能同时"正确 + 显著更快"的是
+`compile + FULL_DECODE_ONLY`（已作为默认）；**66 ms 地板只在 piecewise 捕获 prefill 时出现**，
+而 piecewise 与我们 Python 编排的 indexer/attention/Engram 不兼容（回放期不跑 Python，
+捕获期尺寸被冻结，padding 行触发越界）。
+
+### 39.1 最终结论
+
+- **已达成**：torch.compile 正确运行（数值全过）、所有侧效应内核已封装、编译前后完整基线、
+  地板 515→356 ms（1.45×）、TPOT 37.4→30.0 ms（1.25×）、c=16 179→235 tok/s（1.31×）。
+- **未达成**：目标里的 "PIECEWISE + ~66 ms 地板"。它需要把 indexer/attention/Engram 的
+  Python 编排改写成 **padding-safe 的单 kernel / C++ op**（回放期零 Python），属于核心路径重写，
+  超出"包 custom op"的范畴，且已穷尽本 fork 提供的所有图捕获开关。
