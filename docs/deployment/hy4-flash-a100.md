@@ -1330,3 +1330,42 @@ TTFT ≈ 352 ms + 145.2 µs/token        （eager 是 596 ms + 91.6 µs/token）
 目标要求"PIECEWISE + 66 ms 地板"。要达成必须把 **indexer/attention/Engram 的 Python 编排
 改成 padding-safe 的单 kernel 或真正的 C++ op**（回放期不跑 Python）。这是核心路径重写，
 不是继续包 custom op 能解决的。
+
+## 38. 阶段 C（8/12）：更正"高并发变差"——编译版其实**全面优于 eager**
+
+§35/§37 里"并发变差"的结论来自**小配置**（`MAXSEQS=4`、`MAXBT=2048`），不能与 eager 的
+`MAXSEQS=16` 口径比较。按同口径（`MAXSEQS=16`、`MAXBT=8192`、32K 上下文）重测：
+
+| 指标 | eager（旧默认） | **编译版（现默认）** | 变化 |
+|---|---|---|---|
+| TTFT 地板（1 token 命中） | 515 ms | **347–357 ms** | **1.45×** |
+| TTFT @2K | 557 ms | 433–480 ms | 1.2× |
+| TPOT | 37.4 ms | **30.0–30.6 ms** | **1.25×** |
+| decode | 26.5 tok/s | **32.7 tok/s** | 1.23× |
+| prefill @8K | 4,746 tok/s | **5,263 tok/s** | 1.11× |
+| prefill @16K | — | 7,314 tok/s | — |
+| 并发 c=1 | 23.1 tok/s | **28.4–28.7** | 1.24× |
+| 并发 c=8 | 96.4 tok/s | **123.8** | 1.28× |
+| 并发 c=16 | 179.0 tok/s | **235.4** | **1.31×** |
+| TTFT p50 @c=16 | 1,225 ms | **789 ms** | **1.55×** |
+| 视觉 4/4 / 文本一致性 | ✅ / 基准 | ✅ / `seq` 逐字一致 | 通过 |
+| KV 容量 | 497,073 | 484,779 tokens | −2.5% |
+
+**结论更正**：在**同口径**下，编译版在 TTFT、TPOT、decode、prefill、单并发与高并发吞吐上
+**全部优于 eager**（唯一代价是 KV 少 2.5%，可用 fp8 KV 补回）。
+
+### 38.1 教训（写进文档避免再犯）
+
+比较吞吐类指标时，**必须保证 `max-num-seqs` / `max-num-batched-tokens` 完全一致**。
+c=16 在 `MAXSEQS=8` 下会被排队截断（聚合 123 tok/s、TTFT 6.7 s），看起来像"编译变差"，
+实际是并发上限不同。
+
+### 38.2 最终交付配置
+
+```
+TP4×PP2（2 节点 ×4 卡）, bf16 KV, block 64
+--compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY", "mode": 3, "max_cudagraph_capture_size": 32}'
+--max-model-len 32768  --max-num-seqs 16  --max-num-batched-tokens 8192
+--reasoning-parser hy_v4 --enable-auto-tool-choice --tool-call-parser hy_v4
+KV 484,779 tokens；TTFT 地板 356 ms；TPOT 30 ms；c=16 235 tok/s；视觉 4/4
+```
