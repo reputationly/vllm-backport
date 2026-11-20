@@ -1111,3 +1111,49 @@ IndexKernel.cu:111: Assertion `-sizes[i] <= index && index < sizes[i] && "index 
 ### 32.4 状态
 
 装饰器已撤回，服务恢复 eager（视觉 4/4 通过）。阶段 C 的 attention opaque op 保留。
+
+## 33. 阶段 C（3/12）：断言发生在 piecewise 图**回放**里；`prepare_groups` 已 opaque 仍崩
+
+### 33.1 本轮改动
+
+把 `prepare_groups` 的索引数学整体摘出编译图：新增 custom op
+`hy4_prepare_groups_into`（**预分配 9 个输出 + `mutates_args` 精确声明**），
+`prepare_groups(...)` 只负责按 `slots/tokens` 分配输出再调 op，索引数学在 eager 下用具体整数执行。
+
+（选择"预分配+就地写"而不是多返回值：本 fork 的 `direct_register_custom_op` 对 tuple 返回注解支持不确定。）
+
+### 33.2 结果：仍然 device-side assert，但定位到了**回放阶段**
+
+用 `CUDA_LAUNCH_BLOCKING=1` 抓完整栈，关键帧：
+
+```
+model.py:453 forward → decorators.py:522 __call__ → aot_compile.py:244 __call__
+  → model.py:200 forward → caching.py:225 __call__ → <string>:5 execution_fn
+  → cuda_graph.py:361 __call__ → torch/cuda/graphs.py:186 replay
+  → CUDA error: device-side assert triggered
+```
+
+即越界发生在 **`torch.cuda.graphs.replay()`**——**piecewise 捕获的图在回放时**踩了非法下标，
+而不是 eager 索引数学本身。这与"整块 attention/indexer 都是 Python 侧代码、只是被捕获进图"的行为一致：
+piecewise 捕获用的是 **padding 后的虚拟 batch**，回放时真实 batch 更小，我们 Op 内部 kernel 的
+下标计算（如 `table[owners, columns]`、`tail[block, member % ring]`）在回放上下文里越界。
+
+另外 **`FULL_DECODE_ONLY`（不做 piecewise 捕获）此前不崩、只是数值错**，进一步印证：
+- **崩溃** ← piecewise 捕获 + 我们的 Python 侧算子；
+- **数值错** ← `torch.compile` 语义（earlier 已排除 Engram 与图模式）。
+
+### 33.3 结论：两条路，需要决策
+
+| 方案 | 收益 | 代价 |
+|---|---|---|
+| A. 让整个 attention+indexer 成为**真正的单 kernel custom op**（不是 Python 函数体被捕获，而是自己管 launch 与 padding 语义） | 保住 piecewise（地板 63–66 ms） | 大改：要把 indexpool/attention 的 Python 编排压成一个 kernel 或 C++ op |
+| B. 只做 `torch.compile`、**不用 cudagraph**（`cudagraph_mode=NONE` 等价的 eager-compile） | 地板约 215 ms（仍 2.4× 优于当前 515 ms） | 仍需先修编译语义导致的数值错误 |
+
+目前证据表明：**B 的数值问题（与图无关）才是主矛盾**——因为 FULL_DECODE_ONLY 下也不崩但输出乱码。
+所以下一轮优先做 B：在"无 cudagraph 的纯编译"下逐 token 对比 eager 基线，把数值问题收敛掉；
+再决定是否为 piecewise 重写 op。
+
+### 33.4 状态
+
+装饰器撤回、服务恢复 eager 并验证视觉 4/4；
+`hy4_prepare_groups_into`、attention 段 op、三个 KV/Engram op 全部保留在分支中。

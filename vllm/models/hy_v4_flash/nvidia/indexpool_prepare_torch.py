@@ -14,6 +14,7 @@ Layouts follow the kernels exactly:
 from __future__ import annotations
 
 import torch
+from vllm.utils.torch_utils import direct_register_custom_op
 
 
 def _gather_rows(tensor, idx):
@@ -199,7 +200,134 @@ def _step_index_math(starts_raw, lengths_raw, table_raw, positions, tokens, rati
     return bundle
 
 
+def _prepare_groups_into(
+    keys: torch.Tensor,
+    positions: torch.Tensor,
+    tail: torch.Tensor,
+    table: torch.Tensor,
+    starts: torch.Tensor,
+    lengths: torch.Tensor,
+    tokens: int,
+    ratio: int,
+    raw: torch.Tensor,
+    group_positions: torch.Tensor,
+    requests: torch.Tensor,
+    groups: torch.Tensor,
+    group_live: torch.Tensor,
+    owner: torch.Tensor,
+    logical: torch.Tensor,
+    upper: torch.Tensor,
+    live: torch.Tensor,
+) -> None:
+    """Write the IndexPool index tensors into pre-allocated outputs.
+
+    Registered as a custom op (see `prepare_groups`): the index maths mixes
+    Python ints with `torch.searchsorted` and fancy indexing, which under
+    torch.compile turns into symbolic shapes and produces out-of-bounds gather
+    indices. Keeping it opaque makes it run eagerly on concrete integers.
+    """
+    (
+        r,
+        gp,
+        rq,
+        gr,
+        gl,
+        ow,
+        lg,
+        up,
+        lv,
+    ) = _prepare_groups_impl(keys, positions, tail, table, starts, lengths, tokens, ratio)
+    raw.copy_(r)
+    group_positions.copy_(gp)
+    requests.copy_(rq)
+    groups.copy_(gr)
+    group_live.copy_(gl)
+    owner.copy_(ow)
+    logical.copy_(lg)
+    upper.copy_(up)
+    live.copy_(lv)
+
+
+def _prepare_groups_into_fake(
+    keys: torch.Tensor,
+    positions: torch.Tensor,
+    tail: torch.Tensor,
+    table: torch.Tensor,
+    starts: torch.Tensor,
+    lengths: torch.Tensor,
+    tokens: int,
+    ratio: int,
+    raw: torch.Tensor,
+    group_positions: torch.Tensor,
+    requests: torch.Tensor,
+    groups: torch.Tensor,
+    group_live: torch.Tensor,
+    owner: torch.Tensor,
+    logical: torch.Tensor,
+    upper: torch.Tensor,
+    live: torch.Tensor,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="hy4_prepare_groups_into",
+    op_func=_prepare_groups_into,
+    mutates_args=[
+        "raw",
+        "group_positions",
+        "requests",
+        "groups",
+        "group_live",
+        "owner",
+        "logical",
+        "upper",
+        "live",
+    ],
+    fake_impl=_prepare_groups_into_fake,
+)
+
+
 def prepare_groups(keys, positions, tail, table, starts, lengths, tokens, ratio):
+    """Allocate the IndexPool index tensors and fill them through the custom op."""
+    device = keys.device
+    _dbg(
+        "prepare_groups_impl", keys=keys, positions=positions, tail=tail, table=table,
+        starts=starts, lengths=lengths, tokens=tokens, ratio=ratio,
+    )
+    slots = (tokens + lengths.numel() * (ratio - 1)) // ratio
+    dim = keys.shape[-1]
+    raw = keys.new_empty((slots, ratio, dim))
+    group_positions = torch.empty(
+        (3, slots) if positions.ndim == 2 else (slots,),
+        dtype=torch.float32,
+        device=device,
+    )
+    requests = torch.empty(slots, dtype=torch.int32, device=device)
+    groups = torch.empty(slots, dtype=torch.int64, device=device)
+    group_live = torch.empty(slots, dtype=torch.bool, device=device)
+    owner = torch.empty(tokens, dtype=torch.int32, device=device)
+    logical = torch.empty(tokens, dtype=torch.int64, device=device)
+    upper = torch.empty(tokens, dtype=torch.int32, device=device)
+    live = torch.empty(tokens, dtype=torch.bool, device=device)
+    torch.ops.vllm.hy4_prepare_groups_into(
+        keys, positions, tail, table, starts, lengths, tokens, ratio,
+        raw, group_positions, requests, groups, group_live, owner, logical, upper, live,
+    )
+    return (
+        raw,
+        group_positions,
+        requests,
+        groups,
+        group_live,
+        owner,
+        logical,
+        upper,
+        live,
+    )
+
+
+def _prepare_groups_impl(keys, positions, tail, table, starts, lengths, tokens, ratio):
     device = keys.device
     _dbg(
         "prepare_groups", keys=keys, positions=positions, tail=tail, table=table,
