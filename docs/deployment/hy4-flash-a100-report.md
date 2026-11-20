@@ -487,20 +487,53 @@ python3 tool_test.py                                          # 函数调用（�
 **结论：在 A100 上 FP8 权重严格优于 BF16**——速度持平（因为 sm80 上 FP8 权重本来也是按 bf16 计算），
 但 FP8 的 KV 多 47%、所需卡数只有一半。
 
-### 13.4 BF16 的唯一价值（DFly2）与它的拓扑死结
+### 13.4 DFly2 的 PP 约束（**此节曾写错，已更正**）
 
-BF16 的用途是**去掉 FP8 的 128×128 块约束**，从而解锁 DFly2 投机解码
-（见 §10.1：FP8 下草稿 MLA 输入维 1152 在 TP4 分片成 288，不是 128 的倍数）。
+**更正**：早先版本写"DFly2 硬性要求 `pipeline_parallel_size == 1`"——**这是错的**。
+`models/hy_v4/dfly_config.py::verify_target_parallel_config` 的注释与实现都明确允许 PP：
 
-但 DFly2 硬性要求 **`pipeline_parallel_size == 1`**（草稿要取目标层 25/29/33/37/41 的 hidden，
-PP4 下这些层横跨 stage 2/3，跨 stage 传 hidden 未实现）。而 BF16 至少需要 16 卡 ⇒ 只能是
-**TP16×PP1，跨 4 节点**：
+```python
+# Pipeline parallelism is allowed: the DFly draft attaches to a fixed set
+# of target layers (dfly_target_kv_layers) and works as long as they all
+# live on the last stage, which holds the draft and its KV.
+for field in ("data_parallel_size", "prefill_context_parallel_size",
+              "decode_context_parallel_size"):
+    if getattr(spec.target_parallel_config, field) != 1:
+        raise ValueError(...)
+```
 
-| 拓扑 | 实测 TPOT |
-|---|---|
-| TP4×PP2（节点内，FP8，图+编译） | **30.0 ms** |
-| TP8×EP（跨 2 节点，图） | 87 ms |
-| TP16×PP1（跨 4 节点，BF16+DFly2 的唯一形态） | 预期 ≥87 ms（未实测） |
+真正的约束是**层的位置**：草稿共享的 5 个目标层 `[25,29,33,37,41]` 必须全部位于**最后一个 PP stage**
+（草稿与它的 KV 都在那里）。按 `distributed/utils.py::get_pp_indices` 的实际规则（余数分给**前面的**
+stage）实算 42 层：
 
-即 **BF16 能解锁 DFly2，但只能在一个比现有最优慢 3 倍以上的拓扑里使用**，
-投机解码省下的步数补不回来。因此：**BF16 权重保留备用（换 H100/H200 或做 bf16 相关调试时可用），当前不上线。**
+| PP | 每 stage 层数 | 最后 stage 的层区间 | 5 个目标层是否齐全 | 结论 |
+|---|---|---|---|---|
+| **PP2** | 21 / 21 | **21–41** | ✅ 25/29/33/37/41 全在 | **架构可行** |
+| PP3 | 14 / 14 / 14 | 28–41 | ❌ 缺 25 | 不可行 |
+| PP4 | 11 / 11 / 11 / 10 | 33–42 | ❌ 缺 25、29 | 不可行 |
+
+### 13.5 为什么最终仍然放弃 DFly2：硬件账
+
+PP2 可行，但还有两道硬约束（均来自 `dfly_config.py`）：
+
+1. **草稿 TP 必须等于目标 TP**：
+   `if spec.draft_tensor_parallel_size not in (None, parallel.tensor_parallel_size): raise ValueError("DFly draft and target must use the same TP size")`
+   → "草稿单独用 TP1 绕开 128 整除"这条路被明确禁掉。FP8 检查点下草稿 MLA 输入维 1152
+   要求 **TP ∈ {1,3,9}**（1152 才能被 128 整除），220B 模型不可行 ⇒ **DFly2 只能用 BF16 权重**
+   （`DFly supports only unquantized targets...`）。
+2. **BF16 的显存账**：卡上权重 ≈313 GB（Engram 127 GB 在主机内存）
+   - TP4×PP2 = 8 卡 → **39.2 GB/卡**，超出 40 GB 预算（还需 KV 与激活）→ 装不下；
+   - 只能 TP8×PP2 = 16 卡 → **TP8 跨节点**，实测 TPOT **87 ms**（节点内 TP4 是 30 ms）。
+
+因果链：
+
+```
+DFly2 → 目标层 25..41 必须在最后 stage → 只能 PP2（PP3/PP4 切分不满足）
+      → 不能用 FP8（草稿 TP 必须同目标 TP；1152/4 非 128 倍数）
+      → 必须 BF16 → 卡上权重 313 GB → 8 卡装不下 → 16 卡
+      → 16 卡 + PP2 = TP8×PP2 → TP8 跨节点 → TPOT 30 ms → ~87 ms
+```
+
+**要真正吃到 DFly2，需要"PP2 + TP4 + BF16 装得下"，即每卡显存 ≥48 GB（A100 80G / H100 / H200）**：
+那时 8 卡 TP4×PP2 即可跑 BF16 + DFly2，不必跨节点。
+
