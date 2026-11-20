@@ -1,3 +1,7 @@
+> **📌 结论与排障请看 [`hy4-flash-a100-report.md`](./hy4-flash-a100-report.md)**（按主题组织的结论型报告：
+> 适配清单、问题台账、性能基线、与现网三模型对比、torch.compile 专题、路线图）。
+> 本文是按时间顺序的实验流水账，保留供追溯细节。
+
 # Hy4-flash (HYV4Flash) 在 A100/sm80 上的移植
 
 > 分支：`hy4-flash-a100`　日期：2026-11-18　硬件：4×A100-PCIE-40GB（dev gpu10，aarch64）
