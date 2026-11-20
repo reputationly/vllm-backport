@@ -1157,3 +1157,40 @@ piecewise 捕获用的是 **padding 后的虚拟 batch**，回放时真实 batch
 
 装饰器撤回、服务恢复 eager 并验证视觉 4/4；
 `hy4_prepare_groups_into`、attention 段 op、三个 KV/Engram op 全部保留在分支中。
+
+## 34. 阶段 C（4/12）：一个必须更正的结论——"mode=2 正确"其实是**没在编译**
+
+### 34.1 本轮做了什么
+
+1. 摸清了"只编译、不上图"的开关：`CompilationConfig` 里 `mode` 与 `cudagraph_mode` 是**两个独立字段**
+   （`CompilationMode`: NONE=0 / STOCK_TORCH_COMPILE=1 / DYNAMO_TRACE_ONCE=2 / VLLM_COMPILE=3）；
+2. 脚本里加了 `COMPILE_MODE` 注入，实测三种组合：
+   - `cudagraph_mode=NONE + mode=3` → 日志里 **`Compiling a graph` = 0**（被降级成不编译）；
+   - `cudagraph_mode=NONE + mode=2` → 输出**看起来正确**、地板 **527 ms**（和 eager 515 ms 一样）；
+   - `cudagraph_mode=PIECEWISE + mode=3`（关 Engram）→ 直接报
+     `piecewise CUDA graphs unavailable, model is not torch-compiled`。
+
+### 34.2 更正：mode=2 那次"正确"是假象
+
+复查 overlay 发现 **`@support_torch_compile` 装饰器当时并不在代码里**（阶段 C 结束后被撤回，
+本轮忘了重新加）。所以那 12 条 `compil|dynamo` 日志其实是 vLLM 的告警：
+
+> `torch.compile is turned on, but the model ... does not support it`
+
+**结论：`mode=2` 那次跑的仍是纯 eager**（因此正确、也自然没有加速）。
+本轮唯一新增的有效信息是：`mode`/`cudagraph_mode` 两个开关可独立注入，且
+`cudagraph_mode=NONE + mode=3` 会被 vLLM 降级（不编译）。
+
+### 34.3 下一轮的正确做法
+
+1. **先加装饰器**，再分别测：
+   - `mode=2`（DYNAMO_TRACE_ONCE）+ `cudagraph_mode=NONE`：验证"纯 dynamo 追踪"是否
+     数值正确、地板能否下降（这是本轮本想验证的东西）；
+   - `mode=3` + `cudagraph_mode=NONE`：预期被降级，跳过；
+2. 每次实验前用 `grep -c support_torch_compile` 断言装饰器在位（本轮教训）；
+3. 数值验收固定用 `baseline.py eager`（已存 `/tmp/baseline_eager.json`）做对照。
+
+### 34.4 状态
+
+服务恢复 eager（eager 基线输出已存档：`frac=' Paris. What is the capital of the "Piedmont"…'`、
+`seq=' 6, 7, 8, 9, 10, '`），装饰器不在代码里，所有 custom op 保留。
