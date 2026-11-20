@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from vllm.model_executor.layers.rotary_embedding.mrope import apply_interleaved_rope
 from vllm.triton_utils import tl, triton
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 
 INDEX_DIM = 128
 FP8_MAX = 448.0
@@ -126,6 +127,7 @@ def _scatter_rows(
         tl.store(Dst + offset + columns, value, columns < WIDTH)
 
 
+@eager_break_during_capture
 def _write_pool_impl(
     cache: torch.Tensor,
     table: torch.Tensor,

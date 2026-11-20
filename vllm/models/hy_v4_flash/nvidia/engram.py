@@ -24,6 +24,7 @@ from vllm.triton_utils import triton
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+import regex as re
 
 logger = init_logger(__name__)
 
@@ -285,53 +286,47 @@ class FlashNgramHashState(NgramHashState):
         return hashes.permute(1, 0, 2).contiguous()
 
 
-def _hy4_engram_pinned_lookup(
-    weight: torch.Tensor,
-    indices: torch.Tensor,
-    out: torch.Tensor,
-    row_bytes: int,
-    vocab_start: int,
-    vocab_end: int,
-    block_d: int,
-    cpu_offload: bool,
-) -> None:
-    """Gather rows of a (optionally host-pinned) Engram table into `out`.
+@eager_break_during_capture
+def _register_engram_lookup_op(module, tag: str):
+    """Register the pinned-table gather for one FlashEmbedding instance.
 
-    Registered as a custom op so torch.compile can trace the Engram path: the
-    pinned table is read through a CUDA view of host memory
-    (``get_accelerator_view_from_cpu_tensor``), an op without a fake kernel.
+    The table itself lives in host memory and cannot cross a custom-op boundary
+    (the breakable-cudagraph capture calls weak_ref_tensor, which has no CPU
+    implementation), so the op closes over the module and only takes CUDA tensors.
     """
-    view = get_accelerator_view_from_cpu_tensor(weight) if cpu_offload else weight
-    _lookup_ple_embedding_from_pinned_kernel[(indices.numel(),)](
-        view.view(torch.uint8),
-        indices,
-        out.view(torch.uint8),
-        row_bytes,
-        vocab_start,
-        vocab_end,
-        BLOCK_D=block_d,
+
+    def _op(
+        indices: torch.Tensor,
+        out: torch.Tensor,
+        row_bytes: int,
+        vocab_start: int,
+        vocab_end: int,
+        block_d: int,
+        use_scale: bool,
+    ) -> None:
+        module._lookup_into(indices, out, row_bytes, vocab_start, vocab_end, block_d,
+                            use_scale)
+
+    def _fake(
+        indices: torch.Tensor,
+        out: torch.Tensor,
+        row_bytes: int,
+        vocab_start: int,
+        vocab_end: int,
+        block_d: int,
+        use_scale: bool,
+    ) -> None:
+        return None
+
+    name = "hy4_engram_lookup_" + re.sub(r"[^0-9a-zA-Z_]", "_", tag)
+    direct_register_custom_op(
+        op_name=name,
+        op_func=_op,
+        mutates_args=["out"],
+        fake_impl=_fake,
     )
+    return getattr(torch.ops.vllm, name)
 
-
-def _hy4_engram_pinned_lookup_fake(
-    weight: torch.Tensor,
-    indices: torch.Tensor,
-    out: torch.Tensor,
-    row_bytes: int,
-    vocab_start: int,
-    vocab_end: int,
-    block_d: int,
-    cpu_offload: bool,
-) -> None:
-    return None
-
-
-direct_register_custom_op(
-    op_name="hy4_engram_pinned_lookup",
-    op_func=_hy4_engram_pinned_lookup,
-    mutates_args=["out"],
-    fake_impl=_hy4_engram_pinned_lookup_fake,
-)
 
 class FlashEmbedding(nn.Module):
     def __init__(self, sizes, dim, dtype, cpu_offload):
@@ -360,6 +355,9 @@ class FlashEmbedding(nn.Module):
             requires_grad=False,
         )
         self.fp8 = dtype == torch.float8_e4m3fn
+        self._lookup_op = _register_engram_lookup_op(
+            self, f"emb_{self.vocab_start}_{self.vocab_end}_{id(self):x}"
+        )
         self.embedding.register_parameter("weight_scale_inv", None)
         if self.fp8:
             self.embedding.weight_scale_inv = nn.Parameter(
@@ -430,17 +428,38 @@ class FlashEmbedding(nn.Module):
         self._uva_weight = None
         self._uva_scale = None
 
+    def _lookup_into(self, indices, out, row_bytes, vocab_start, vocab_end, block_d,
+                     use_scale):
+        parameter = self.embedding.weight_scale_inv if use_scale else self.embedding.weight
+        view_name = "_uva_scale" if use_scale else "_uva_weight"
+        view = getattr(self, view_name)
+        if view is None:
+            view = (
+                get_accelerator_view_from_cpu_tensor(parameter)
+                if self.cpu_offload
+                else parameter
+            )
+            setattr(self, view_name, view)
+        _lookup_ple_embedding_from_pinned_kernel[(indices.numel(),)](
+            view.view(torch.uint8),
+            indices,
+            out.view(torch.uint8),
+            row_bytes,
+            vocab_start,
+            vocab_end,
+            BLOCK_D=block_d,
+        )
+
     def _lookup(self, parameter, indices, out, *, scale=False):
         row_bytes = parameter.element_size() * (1 if scale else self.dim)
-        torch.ops.vllm.hy4_engram_pinned_lookup(
-            parameter,
+        self._lookup_op(
             indices,
             out,
             row_bytes,
             self.vocab_start,
             self.vocab_end,
             triton.next_power_of_2(row_bytes),
-            self.cpu_offload,
+            bool(scale),
         )
 
     def forward(self, hashes):

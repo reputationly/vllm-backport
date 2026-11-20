@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import torch
 from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 
 
 def _gather_rows(tensor, idx):
@@ -327,6 +328,7 @@ def prepare_groups(keys, positions, tail, table, starts, lengths, tokens, ratio)
     )
 
 
+@eager_break_during_capture
 def _prepare_groups_impl(keys, positions, tail, table, starts, lengths, tokens, ratio):
     device = keys.device
     _dbg(
@@ -392,6 +394,7 @@ def write_tails(keys, positions, tail, table, starts, lengths) -> None:
     return _timed("write_tails", _write_tails_impl, keys, positions, tail, table, starts, lengths)
 
 
+@eager_break_during_capture
 def _write_tails_impl(keys, positions, tail, table, starts, lengths) -> None:
     _count("write_tails")
     """Refresh the per-request key/position ring, vectorised (no Python loop).

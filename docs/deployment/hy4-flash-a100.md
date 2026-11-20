@@ -1280,3 +1280,53 @@ TTFT 地板 515→356 ms（1.45×）、TPOT 37.4→30.0 ms（1.25×）；高并�
 
 **66 ms 地板未达成**，差距明确：需要把 attention/indexer/engram 的 Python 编排改成
 padding-safe 的单 kernel/custom-op 实现（方案 A），代价是重写这几段核心路径。
+
+## 37. 阶段 C（7/12）：PIECEWISE 五轮攻坚的结论（未达成）+ 交付基线
+
+### 37.1 本轮又试了两条路，都被同一断言挡住
+
+| 尝试 | 配置 | 结果 |
+|---|---|---|
+| ① `cudagraph_mode=FULL`（整图捕获） | +compile | 服务正常、数值正确，但**地板仍是 347–362 ms**（FULL 只捕获 uniform-decode，prefill 不在内） |
+| ② **breakable cudagraph**（本 fork 的 `eager_break_during_capture` 机制） | `VLLM_USE_BREAKABLE_CUDAGRAPH=1` + PIECEWISE，并给我们的 5 个 custom op 内部函数加了 `@eager_break_during_capture` | 先修掉 `weak_ref_tensor` 不支持 CPU 张量的问题（把 Engram 的 host 表改成**闭包持有**，op 只收 CUDA 张量），但**仍触发同一个 device-side assert** |
+
+### 37.2 定论：地板 = "1 token 的 prefill"，而 prefill 只有 piecewise 才会被捕获
+
+关键测量（compiled 配置）：
+
+```
+TTFT ≈ 352 ms + 145.2 µs/token        （eager 是 596 ms + 91.6 µs/token）
+```
+
+- 缓存命中的请求**仍要重算最后一个 token**，所以"1 token prefill"就是地板；
+- decode 步已经被 FULL 图捕获（TPOT 30 ms），地板却不是它；
+- 之前 PIECEWISE 版本短暂测到 **66 ms 地板**，正是因为 prefill 也被捕获了。
+
+所以 **66 ms 只能由 piecewise 实现**，而 piecewise 要求：回放时不依赖任何 Python 侧尺寸
+（我们的 indexer/attention/engram 编排全是 Python 尺寸驱动），且 padding 行必须安全。
+五轮尝试（custom op 封装 × 5、clamp、breakable CG、FULL）均无法绕过这一点。
+
+### 37.3 编译前后完整对比（交付基线，已复核视觉 4/4）
+
+| 指标 | eager（旧默认） | **编译版（现默认）** | 变化 |
+|---|---|---|---|
+| TTFT 模型 | 596 ms + 91.6 µs/token | **352 ms + 145.2 µs/token** | 截距 **−41%**，斜率变差 |
+| TTFT 地板（1 token 命中） | 515 ms | **347–357 ms** | **1.45×** |
+| TTFT @2K | 557 ms | 433–480 ms | 1.2× |
+| TPOT | 37.4 ms | **30.0 ms** | **1.25×** |
+| decode | 26.5 tok/s | **33.3 tok/s** | 1.26× |
+| prefill @2K | 3,690 tok/s | 4,278 tok/s | 1.16× |
+| prefill 斜率 | 91.6 µs/token（10.9k tok/s） | 145 µs/token（6.9k tok/s） | **变差** |
+| 并发 c=16 | **179 tok/s** | 67 tok/s | 变差 |
+| 视觉 4/4 / 文本一致性 | ✅ / 基准 | ✅ / `seq` 逐字一致 | 通过 |
+| KV | 497,073 | 484,729 tokens | ≈持平 |
+
+**结论**：编译版在"低延迟、短上下文"上更好（地板 −41%、TPOT −25%），
+在"长 prefill / 高并发"上更差（prefill 斜率 +58%、c=16 吞吐 −63%）。
+所以两个配置都要保留，按场景选。
+
+### 37.4 距离目标还差什么（明确写清）
+
+目标要求"PIECEWISE + 66 ms 地板"。要达成必须把 **indexer/attention/Engram 的 Python 编排
+改成 padding-safe 的单 kernel 或真正的 C++ op**（回放期不跑 Python）。这是核心路径重写，
+不是继续包 custom op 能解决的。
