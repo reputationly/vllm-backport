@@ -22,6 +22,7 @@ from vllm.models.hy_v4.nvidia.model import (
     HYV4Model,
 )
 from vllm.models.hy_v4_flash.configs import HYV4FlashConfig
+from vllm.compilation.decorators import support_torch_compile
 from vllm.distributed import get_pp_group
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -145,6 +146,15 @@ def _pp_split() -> bool:
     except Exception:  # noqa: BLE001 - distributed not initialised
         return False
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+        "lookback_token_ids": 0,
+    }
+)
 class HYV4FlashModel(HYV4Model):
     decoder_layer_cls = HYV4FlashDecoderLayer
     supports_ihc_sequence_parallel = False
@@ -220,7 +230,7 @@ class HYV4FlashModel(HYV4Model):
             ),
             dtype=torch.int32,
         )
-        self.engram_hash.prepare_hashes_with_output(
+        self.engram_hash.prepare_hashes_op(
             input_ids,
             lookback_token_ids,
             self.layers[self._owned_engram_layers[0] - 1].self_attn.mla_attn.layer_name,

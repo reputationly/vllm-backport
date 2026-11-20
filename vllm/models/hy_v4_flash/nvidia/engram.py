@@ -97,6 +97,16 @@ def head_range(sizes, tp, rank):
     return boundaries[rank], boundaries[rank + 1]
 
 
+class _HashMetadata:
+    """Minimal stand-in for the attention metadata `prepare_hashes` reads."""
+
+    __slots__ = ("num_actual_tokens", "query_start_loc", "seq_lens")
+
+    def __init__(self, num_actual_tokens, query_start_loc, seq_lens):
+        self.num_actual_tokens = num_actual_tokens
+        self.query_start_loc = query_start_loc
+        self.seq_lens = seq_lens
+
 class FlashNgramHashState(NgramHashState):
     def __init__(self, config, *, dummy=False):
         nn.Module.__init__(self)
@@ -104,6 +114,10 @@ class FlashNgramHashState(NgramHashState):
         self.layout: FlashEngramLayout = layout  # type: ignore[assignment]
         self.lookback_depth = self.layout.max_ngram_size - 1
         self.block_size = 1
+        self._hashes_op = None
+        # Register eagerly: doing it on first use would run torch.library schema
+        # inference inside the traced forward, which dynamo refuses.
+        self._register_hashes_op()
         self.use_slot_cache = False
         self._cache = None
         self.pad_id = 0
@@ -147,6 +161,70 @@ class FlashNgramHashState(NgramHashState):
             self.pad_id = self.layout.token_map[self.layout.pad_token_id]
 
     @eager_break_during_capture
+    def _register_hashes_op(self) -> None:
+        """Expose the n-gram hash preparation as one opaque custom op.
+
+        `prepare_hashes` mixes a host token map with a Triton kernel that reads
+        it through UVA, which torch.compile cannot trace faithfully, so it must
+        stay opaque like the Engram gather.
+        """
+
+        def _op(
+            input_ids: torch.Tensor,
+            lookback: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            seq_lens: torch.Tensor,
+            num_actual_tokens: int,
+            output: torch.Tensor,
+        ) -> None:
+            metadata = _HashMetadata(
+                num_actual_tokens, query_start_loc, seq_lens
+            )
+            output.copy_(
+                self.prepare_hashes(
+                    input_ids,
+                    None if lookback.numel() == 0 else lookback,
+                    metadata,
+                )
+            )
+
+        def _fake(
+            input_ids: torch.Tensor,
+            lookback: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            seq_lens: torch.Tensor,
+            num_actual_tokens: int,
+            output: torch.Tensor,
+        ) -> None:
+            return None
+
+        direct_register_custom_op(
+            op_name="hy4_engram_prepare_hashes",
+            op_func=_op,
+            mutates_args=["output"],
+            fake_impl=_fake,
+        )
+        self._hashes_op = torch.ops.vllm.hy4_engram_prepare_hashes
+
+    def prepare_hashes_op(self, input_ids, lookback, layer_name, output) -> None:
+        """Opaque replacement for `prepare_hashes_with_output`."""
+        if self._hashes_op is None:
+            self._register_hashes_op()
+        metadata = get_forward_context().attn_metadata
+        meta = metadata[layer_name] if isinstance(metadata, dict) else None
+        if meta is None:
+            self.prepare_hashes_with_output(input_ids, lookback, layer_name, output)
+            return
+        empty = input_ids.new_empty(0)
+        self._hashes_op(
+            input_ids,
+            empty if lookback is None else lookback,
+            meta.query_start_loc,
+            meta.seq_lens,
+            int(meta.num_actual_tokens),
+            output,
+        )
+
     def prepare_hashes_with_output(self, input_ids, lookback, layer_name, output):
         metadata = get_forward_context().attn_metadata
         output.copy_(

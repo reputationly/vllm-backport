@@ -1194,3 +1194,51 @@ piecewise 捕获用的是 **padding 后的虚拟 batch**，回放时真实 batch
 
 服务恢复 eager（eager 基线输出已存档：`frac=' Paris. What is the capital of the "Piedmont"…'`、
 `seq=' 6, 7, 8, 9, 10, '`），装饰器不在代码里，所有 custom op 保留。
+
+## 35. 阶段 C（5/12）：torch.compile 通了——**正确 + 更快**（FULL_DECODE_ONLY，非 piecewise）
+
+### 35.1 决定性突破：Engram 的 n-gram 哈希是 inductor 唯一的不兼容点
+
+依次排除后（attention 段、indexer prep、KV 写入都已 opaque），仍有两个问题。本轮把最后一块补上：
+
+- 新增 custom op **`hy4_engram_prepare_hashes`**（`mutates_args=["output"]`），
+  把 `prepare_hashes`（读 host token_map + Triton 哈希内核）整体摘出编译图；
+- 踩到一个坑：**不能在 forward 里懒注册**——`direct_register_custom_op` 内部调用
+  `torch.library.infer_schema`，而 dynamo 把它列入 MOD_SKIPLIST，报
+  `Unsupported: Attempted to call function marked as skipped`。改为在 `__init__` 里**立即注册**。
+
+### 35.2 结果：编译 + Engram 开启 → 数值全绿
+
+| 验收项 | 结果 |
+|---|---|
+| 视觉 4/4 | ✅ **4/4**（数字 7 / 5 个圆 / 读出 VISION OK 42 / 蓝绿红） |
+| 文本 §与 eager 逐字对比 | `seq`：`' 6, 7, 8, 9, 10, '` **与 eager 完全一致** |
+| 中文连贯性 | ✅ 完整通顺的 MoE 解释 |
+| 英文 | ✅ `' Paris. The Eiffel Tower is located in Paris…'` |
+
+### 35.3 性能：全面优于 eager
+
+| 指标 | eager（旧默认） | **编译 + FULL_DECODE_ONLY** | 变化 |
+|---|---|---|---|
+| TTFT 地板（缓存命中 1 token） | 515 ms | **353–357 ms** | **1.45×** |
+| TTFT @2K | 557 ms | **480 ms** | 1.16× |
+| TPOT | 37.4 ms | **30.0 ms** | **1.25×** |
+| decode | 26.5 tok/s | **33.3 tok/s** | 1.26× |
+| prefill @2K | 3,690 tok/s | **4,278 tok/s** | 1.16× |
+| 并发 c=1 | 23.1 tok/s | **29.5 tok/s** | 1.28× |
+| 并发 c=8/16 | 96.4 / 179.0 tok/s | 66.9 / 67.3 tok/s | **变差**（TTFT 6.2 s / 17.5 s） |
+| KV | 497,073 | 484,729 tokens | ≈持平 |
+
+结论：**单请求场景全面变快，但高并发变差**（编译路径在 batch 维度上 recompile/排队），
+因此"默认"要按场景选：单请求/低并发用编译版；高吞吐用 eager 版。
+
+### 35.4 PIECEWISE 仍然崩
+
+同一份代码把 `cudagraph_mode` 换成 `PIECEWISE`（其余不变），服务能起、但**第一个请求即 device-side assert**
+（`torch.cuda.graphs.replay()` 内），与 §33 的定位一致：piecewise 捕获的 padding batch 语义与我们的
+Python 侧算子冲突。**66 ms 地板的路线仍需重写 op（方案 A）**，本轮未推进。
+
+### 35.5 当前部署
+
+默认已切到**编译版**：`TP4×PP2 / bf16 KV / FULL_DECODE_ONLY + mode=3 / KV 484,729 tokens`，
+实测 TTFT 地板 356 ms、TPOT 30.0 ms、视觉 4/4。高并发场景可退回到 `CGMODE` 不变、把装饰器撤掉（eager）。
