@@ -537,3 +537,74 @@ DFly2 → 目标层 25..41 必须在最后 stage → 只能 PP2（PP3/PP4 切分
 **要真正吃到 DFly2，需要"PP2 + TP4 + BF16 装得下"，即每卡显存 ≥48 GB（A100 80G / H100 / H200）**：
 那时 8 卡 TP4×PP2 即可跑 BF16 + DFly2，不必跨节点。
 
+---
+
+## 14. 生产部署最优配置（推荐 / 定稿）
+
+### 14.1 结论
+
+| 项 | 选择 | 依据 |
+|---|---|---|
+| 权重 | **FP8**（`/root/Models/Hy4-flash-FP8`，268 GB） | 与 BF16 速度相同（A100 无 fp8 张量核，FP8 亦按 bf16 计算），但 KV 多 47%、所需卡数只有一半（见 §13.3） |
+| 节点数 | **2 节点（8 卡）** | 单副本延迟/吞吐最优；16 卡 TP4×PP4 的 TPOT/prefill/并发都更差，只多出 KV（见 §14.3） |
+| 拓扑 | **TP4×PP2**（TP 收在节点内、节点间只走 p2p） | 跨节点 TP 会把 TPOT 从 30 ms 拉到 87 ms（§7.3） |
+| KV | `bfloat16` | `fp8` 在 A100 只增容量不提速，且 DFly 无关（§7.4） |
+| 图/编译 | `cudagraph_mode=FULL_DECODE_ONLY` + `mode=3`（torch.compile） | 地板 515→347 ms、TPOT 37.4→30.0 ms（§7.1） |
+
+### 14.2 启动命令（每个节点执行，`NODE_RANK` 0/1）
+
+```bash
+vllm serve /root/Models/Hy4-flash-FP8 \
+  --served-model-name hy4-flash \
+  --tensor-parallel-size 4 --pipeline-parallel-size 2 \
+  --distributed-executor-backend mp --nnodes 2 --node-rank $NODE_RANK \
+  --master-addr $MASTER_IP --master-port 40091 \
+  --distributed-timeout-seconds 3600 --cpu-distributed-timeout-seconds 3600 \
+  --block-size 64 --kv-cache-dtype bfloat16 \
+  --engram-config '{"cpu_offload": true}' \
+  --max-model-len 32768 --max-num-seqs 16 --max-num-batched-tokens 8192 \
+  --gpu-memory-utilization 0.90 \
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":32,"mode":3}' \
+  --limit-mm-per-prompt '{"image":1,"video":0}' \
+  --disable-custom-all-reduce \
+  --reasoning-parser hy_v4 --enable-auto-tool-choice --tool-call-parser hy_v4 \
+  --chat-template /root/Models/Hy4-flash-FP8/chat_template.jinja \
+  --enable-prefix-caching --max-num-queued-tokens 1750000 --max-num-queued-reqs 48 \
+  --long-prefill-token-threshold 8192 --trust-remote-code
+# 非 0 号节点额外加 --headless
+```
+
+封装脚本：`docs/deployment/hy4-flash-a100/serve_compiled.sh`（env: `MODEL/TP/PP/MAX_LEN/MAXSEQS/MAXBT/KVDTYPE/CGMODE/COMPILE_MODE/NNODES/MASTER`）。
+**去掉 `mode:3`（或去掉 `@support_torch_compile`）即退回 eager：TPOT 37.4 ms、地板 515 ms。**
+
+### 14.3 实测指标（8 卡 TP4×PP2，编译版）
+
+| 指标 | 值 |
+|---|---|
+| TPOT | **30.0–30.6 ms** |
+| decode | 32.7 tok/s |
+| TTFT 地板（1 token 命中） | **347 ms** |
+| TTFT 拟合 | 352 ms + 145 µs/token |
+| prefill @8K | 5,263 tok/s |
+| 并发 c=1 / c=8 / c=16 | 28.4 / 123.8 / **235.4 tok/s** |
+| TTFT p50 @c=16 | 789 ms |
+| KV | 484,779 tokens |
+| 视觉 / 文本 | 4/4；`seq` 输出与 eager 逐字一致 |
+
+### 14.4 扩容：复制副本，不要放大实例
+
+| 需求 | 做法 |
+|---|---|
+| 更大吞吐 / 更大总 KV | **横向复制 8 卡副本**（DP2=16 卡、DP4=32 卡），聚合吞吐近线性，单请求延迟不变 |
+| 长上下文 262K | 同拓扑改 `--max-model-len 262144 --max-num-batched-tokens 16384 --max-num-seqs 4` |
+| 1M 上下文 | 16 卡 TP4×PP4 + `--kv-cache-dtype fp8`（KV 1,347,995），接受 TPOT 31→38 ms、prefill −9% |
+| 极限容量 | `--kv-cache-dtype fp8`：KV +48%，prefill −9%、TPOT +2% |
+| 高并发优先 | 退回 eager（吞吐更稳、无编译抖动） |
+
+### 14.5 已知局限（上线前必须对齐预期）
+
+1. **短上下文 TTFT 落后 MiniMax-M3.1 约 5×**（8K：1,666 vs 328 ms；地板 347 vs 282 ms）——
+   根因是每请求 ~350 ms 的固定开销（1 token 也要走完 42 层 Python launch）；
+2. 消除它只有一条路：把 indexer/attention/Engram 改成 **padding-safe 的单 kernel / C++ op**，
+   让 PIECEWISE 图能捕获 prefill（§8.4）。加机器、换权重（BF16）、调拓扑均无效；
+3. DFly2 投机解码当前不可用（§13.4/§13.5）；BF16 权重已备好，等每卡 ≥48 GB 的机器。
